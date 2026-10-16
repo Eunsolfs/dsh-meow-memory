@@ -334,18 +334,29 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   dbR.insert({ level: 'fact', content: '恢复后要整理的记忆', project: 'dsh', source_session: widR, created_at: 100 })
   const steered = []
   const resumedAgent = { session: { header: { id: widR } }, steer: (m) => steered.push(m) }
-  // mock 对齐现行契约：resume 在 agents service 本体（service.resume(options)），
-  // factory 槽是 { target } 包装、其上无 resume（src/dream.ts resumeAndDream 实证）。
-  const ctxR = { get: (name) => (name === 'agents' ? { resume: async () => resumedAgent } : undefined) }
+  // Resolve through the ordinary-session owner, never the raw Agent factory.
+  let rawResumes = 0
+  let resolvedId
+  const ctxR = { get: (name) => {
+    if (name === 'agents') return { resume: async () => { rawResumes++; throw new Error('raw resume must not run') } }
+    if (name === 'sessionController') return { resolveAgent: async (id) => { resolvedId = id; return { agent: resumedAgent } } }
+    return undefined
+  } }
   await resumeAndDream(ctxR, widR, wsR, '.dsh-meow', undefined, cfgR)
   check('resume: agent restored → dream started (steered + lease)', steered.length === 1 && dbR.getDreamLease(widR) !== null)
+  check('resume: ordinary-session owner receives the exact id', resolvedId === widR)
+  check('resume: raw factory is never called', rawResumes === 0)
+  const unavailableId = 'win-resume-no-owner'
+  dbR.touchWindow(unavailableId, wsR, Date.now() - 4 * 3600_000)
+  await resumeAndDream({ get: (name) => name === 'agents' ? { resume: async () => { rawResumes++ } } : undefined }, unavailableId, wsR, '.dsh-meow', undefined, cfgR)
+  check('resume: missing session owner does not fall back to raw factory', rawResumes === 0 && dbR.getDreamLease(unavailableId) === null)
 
   const wsR2 = mkdtempSync(join(tmpdir(), 'mm-resume-fail-'))
   const dbR2 = getDb(wsR2, '.dsh-meow')
   const widR2 = 'win-resume-2'
   dbR2.touchWindow(widR2, wsR2, Date.now() - 4 * 3600_000)
   dbR2.insert({ level: 'fact', content: '恢复失败窗口的记忆', project: 'dsh', source_session: widR2, created_at: 100 })
-  const ctxR2 = { get: (name) => (name === 'agents' ? { resume: async () => { throw new Error('session file gone') } } : undefined) }
+  const ctxR2 = { get: (name) => (name === 'sessionController' ? { resolveAgent: async () => ({ error: { message: 'session file gone' } }) } : undefined) }
   await resumeAndDream(ctxR2, widR2, wsR2, '.dsh-meow', undefined, cfgR)
   check('resume: failure degrades silently (no lease, no throw)', dbR2.getDreamLease(widR2) === null)
 
@@ -357,7 +368,7 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   let resumeCalls = 0
   let releaseResume
   const gate = new Promise((r) => { releaseResume = r })
-  const ctxR3 = { get: (name) => (name === 'agents' ? { resume: async () => { resumeCalls++; await gate; return resumedAgent } } : undefined) }
+  const ctxR3 = { get: (name) => (name === 'sessionController' ? { resolveAgent: async () => { resumeCalls++; await gate; return { agent: resumedAgent } } } : undefined) }
   const p1 = resumeAndDream(ctxR3, widR3, wsR3, '.dsh-meow', undefined, cfgR)
   const p2 = resumeAndDream(ctxR3, widR3, wsR3, '.dsh-meow', undefined, cfgR)
   releaseResume()
@@ -371,7 +382,7 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   dbR4.touchWindow(widR4, wsR4, Date.now() - 4 * 3600_000)
   dbR4.insert({ level: 'fact', content: 'not-found 退避窗口的记忆', project: 'dsh', source_session: widR4, created_at: 100 })
   let resumeCalls4 = 0
-  const ctxR4 = { get: (name) => (name === 'agents' ? { resume: async () => { resumeCalls4++; throw new Error('session "win-resume-backoff-1" not found') } } : undefined) }
+  const ctxR4 = { get: (name) => (name === 'sessionController' ? { resolveAgent: async () => { resumeCalls4++; return { error: { message: 'session "win-resume-backoff-1" not found' } } } } : undefined) }
   await resumeAndDream(ctxR4, widR4, wsR4, '.dsh-meow', undefined, cfgR)
   check('resume: not-found degrades silently (no lease)', dbR4.getDreamLease(widR4) === null && resumeCalls4 === 1)
   await resumeAndDream(ctxR4, widR4, wsR4, '.dsh-meow', undefined, cfgR)
@@ -428,8 +439,7 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   rmSync(wsF, { recursive: true, force: true })
 }
 
-// issue #36 根因：resume 组装 agentOptions（agentDefaultModel 回退源）；mock 未提供该
-// 服务且无会话日志时走裸 resume——旧测试路径行为逐字节不变（上面 v0.23.1 块即回归）。
+// The ordinary-session owner, not the memory plugin, resolves the model and preset.
 {
   const cfgR2 = { enabled: true, idleMinutes: 180, checkMinutes: 15, suppressWindows: [], suppressLeadMinutes: 15, timeZone: 'Asia/Shanghai', rulesReviewDays: 2 }
   const wsS2 = mkdtempSync(join(tmpdir(), 'mm-resume-route-'))
@@ -440,16 +450,14 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   const resumedWith = []
   const agentS2 = { session: { header: { id: widS2 } }, steer: () => {} }
   const ctxS2 = {
-    get: (name) => name === 'agents'
-      ? { resume: async (opts) => { resumedWith.push(opts); return agentS2 } }
+    get: (name) => name === 'sessionController'
+      ? { resolveAgent: async (id) => { resumedWith.push(id); return { agent: agentS2 } } }
       : name === 'agentDefaultModel'
-        ? { currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-flash' }) }
+        ? { currentSelection: () => { throw new Error('Model selection belongs to the session owner') } }
         : undefined,
   }
   await resumeAndDream(ctxS2, widS2, wsS2, '.dsh-meow', undefined, cfgR2)
-  check('resume: agentOptions from default selection', resumedWith.length === 1 &&
-    resumedWith[0].resumeSessionId === widS2 &&
-    resumedWith[0].agentOptions?.provider === 'deepseek-official' && resumedWith[0].agentOptions?.model === 'deepseek-flash')
+  check('resume: model selection delegated to the ordinary-session owner', resumedWith.length === 1 && resumedWith[0] === widS2)
   check('resume: dream started with route', dbS2.getDreamLease(widS2) !== null)
   dbS2.close()
   rmSync(wsS2, { recursive: true, force: true })
@@ -543,7 +551,7 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   const widS2 = 'win-subagent-2'
   dbS.touchWindow(widS2, wsS, Date.now() - 4 * 3600_000)
   dbS.insert({ level: 'fact', content: '子代理恢复窗口的记忆', project: 'dsh', source_session: widS2, created_at: 100 })
-  const ctxS2 = { get: (name) => (name === 'agents' ? { resume: async () => ({ session: { header: { id: widS2, origin: 'subagent' } } }) } : undefined) }
+  const ctxS2 = { get: (name) => (name === 'sessionController' ? { resolveAgent: async () => ({ agent: { session: { header: { id: widS2, origin: 'subagent' } } } }) } : undefined) }
   await resumeAndDream(ctxS2, widS2, wsS, '.dsh-meow', undefined, cfgS)
   check('resume: subagent restored but not dreamed (no lease)', dbS.getDreamLease(widS2) === null)
 
@@ -553,7 +561,7 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   dbS.touchWindow(widS2b, wsS, Date.now() - 4 * 3600_000)
   dbS.insert({ level: 'fact', content: '不可恢复句柄窗口的记忆', project: 'dsh', source_session: widS2b, created_at: 100 })
   let resumeCalls2b = 0
-  const ctxS2b = { get: (name) => (name === 'agents' ? { resume: async () => { resumeCalls2b++; return undefined } } : undefined) }
+  const ctxS2b = { get: (name) => (name === 'sessionController' ? { resolveAgent: async () => { resumeCalls2b++; return { agent: undefined } } } : undefined) }
   await resumeAndDream(ctxS2b, widS2b, wsS, '.dsh-meow', undefined, cfgS)
   check('resume: unusable agent not dreamed (no lease)', dbS.getDreamLease(widS2b) === null)
   const winIndexS2b = new Map([[widS2b, wsS]])
@@ -1793,6 +1801,14 @@ check('parseModelSpec blank → undefined', parseModelSpec('') === undefined && 
 
 // ── 设置页数据层：mergeConfigLayer（user 层字段级覆盖+子对象浅合并）/ validateConfigUserLayer ──
 {
+  let rootValue = { promptLang: 'en', hitTopK: 2 }
+  const rootRef = { get() { return rootValue } }
+  check('settings merge: native root reference preserves prompt language', mergeConfigLayer(rootRef, undefined).promptLang === 'en')
+  check('settings merge: native user reference is unwrapped', mergeConfigLayer({}, { get: () => ({ promptLang: 'en' }) }).promptLang === 'en')
+  const readRoot = liveConfigReader(rootRef, () => undefined, 0)
+  check('liveConfig: native root reference preserves language', readRoot().promptLang === 'en')
+  rootValue = { promptLang: 'en', hitTopK: 9 }
+  check('liveConfig: native root updates invalidate cached settings', readRoot().hitTopK === 9)
   const patch = { enabled: true, hitTopK: 2, dream: { enabled: true, idleMinutes: 180, timeZone: 'UTC' }, delegate: { model: '' } }
   const merged = mergeConfigLayer(patch, { hitTopK: 5, dream: { idleMinutes: 60 } })
   check('settings merge: top-level field overridden', merged.hitTopK === 5 && merged.enabled === true)

@@ -88,7 +88,10 @@ frozen at the last conversation timestamp.
   `suppressWindows` (default 09:00–12:00 & 14:00–18:00, API peak-tariff hours) nor within
   `suppressLeadMinutes` (default 15) before each window — it fires on the next check cycle
   after the peak ends; a dream already in progress is never interrupted. Old windows (no live
-  agent, >24h) and archived sessions are left alone.
+  agent, >24h) and archived sessions are left alone. Cold sessions resume through DSH's
+  ordinary-session controller so their recorded model selection, preset and tools are restored.
+  Without that controller, automatic consolidation skips cold sessions rather than creating
+  an agent without its configuration; live-session consolidation remains available.
 - **`/dream` command**: no need to wait for the idle trigger — type `/dream` in the composer
   to start consolidating this window's memories right away (same semantics as the
   `memory_dream` tool, immune to peak-hour suppression). Executed by the dsh command plane,

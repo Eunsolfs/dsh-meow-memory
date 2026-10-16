@@ -31,11 +31,9 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
-import { appendFileSync, existsSync, readdirSync, readFileSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { appendFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { getDb, projectList, type Level, type MemoryRow } from './db.js'
-import { decompressAllFrames } from './migrate-v0.js'
 import { fillTemplate, keyedValue, resolveSlotText } from './prompt-loader.js'
 import { readSeen, readWritten } from './inject.js'
 import { workspaceOf } from './tools.js'
@@ -728,91 +726,9 @@ export function isDreamSuppressed(cfg: DreamConfig, date = new Date()): boolean 
   return false
 }
 
-// ── resume 路由恢复（issue #36 根因修复）────────────────────────────────────
-// agents.resume() 不传 agentOptions 时宿主按 {} 处理（dsh-agent-loop resumeWith:
-// options.agentOptions ?? {} → setupAndPublish → prepare）——复活出来的 agent 没有
-// provider/model：人设段的 {{model}} 严格插值直接抛错（dsh-system-prompt renderPrompt
-// 对 undefined 引用即抛，standard/ptc/cordis 预设人设 prefix 都引用 {{model}}），
-// prepareRequest 的空 route 还会二次抛（"has no provider/model"）。GUI 打开的窗口
-// 不受影响——模型是打开时由 GUI 传入的；只有重启后 agent-missing 窗口的自动 resume
-// 走空 options（#36 的「凭空失败轮」即此，宿主逐版本实证 0.1.5-rc.1 起行为一致）。
-// 修法：resume 前把路由组装好——优先恢复该会话日志里最近一次 request/header 的原
-// 路由（dream 轮延续原会话上下文，同模型才命中 prompt cache 前缀），取不到再回退
-// 部署默认选择（与宿主新建会话 dsh-api-session-controller agentOptions() 同源，只
-// 传 provider+model），仍取不到才按旧行为裸 resume（失败由 turn-failed 处理兜底）。
-
-/** 读会话持久化日志里最近一次 request/header 的路由。物理层与
- *  dsh-session-persistence-jsonl 同构（多帧 zstd 容器，逐帧解压），复用 migrate-v0
- *  的逐帧解压器；文件缺失/损坏/字段不合一律返回 null，绝不抛（调用方在 sweep 链上）。 */
-function readLastRouteFromSessionLog(sessionId: string): { provider: string; model: string } | null {
-  if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) return null // sid 拼路径前的防御（来自 windows 表，正常恒过）
-  const home = process.env.DSH_HOME || join(homedir(), '.dsh')
-  for (const rootName of ['sessions', 'archived-sessions']) {
-    const root = join(home, rootName)
-    let projDirs: string[]
-    try {
-      if (!existsSync(root)) continue
-      projDirs = readdirSync(root)
-    } catch {
-      continue
-    }
-    for (const proj of projDirs) {
-      // 两代文件名并存（v4 现行 / v0 旧名），与 migrate-v0 listSessionFiles 同款兼容
-      for (const file of [join(root, proj, sessionId, 'session.v4.jsonl.zstd'), join(root, proj, sessionId, 'session.jsonl.zstd')]) {
-        if (!existsSync(file)) continue
-        try {
-          const lines = decompressAllFrames(readFileSync(file)).toString('utf8').split('\n')
-          for (let i = lines.length - 1; i >= 0; i--) {
-            const line = lines[i]
-            if (!line.includes('"request/header"')) continue
-            let ev: { data?: { header?: { config?: { provider?: unknown; model?: unknown } } } }
-            try {
-              ev = JSON.parse(line) as typeof ev
-            } catch {
-              continue
-            }
-            const cfg = ev?.data?.header?.config
-            if (
-              cfg !== undefined && cfg !== null &&
-              typeof cfg.provider === 'string' && cfg.provider.length > 0 &&
-              typeof cfg.model === 'string' && cfg.model.length > 0
-            ) return { provider: cfg.provider, model: cfg.model }
-          }
-        } catch {
-          /* 单文件损坏/解压失败：试下一个候选 */
-        }
-      }
-    }
-  }
-  return null
-}
-
-/** resume 前解析该会话应使用的路由：原会话路由（会话日志）→ 部署默认选择 → null。 */
-function resolveResumeRoute(ctx: Context, sessionId: string): { provider: string; model: string; source: 'session-log' | 'default-selection' } | null {
-  const fromLog = readLastRouteFromSessionLog(sessionId)
-  if (fromLog !== null) return { ...fromLog, source: 'session-log' }
-  try {
-    const svc = (ctx as { get?: (name: string) => unknown }).get?.('agentDefaultModel') as
-      | { currentSelection?: () => { provider?: unknown; model?: unknown } }
-      | undefined
-    const sel = typeof svc?.currentSelection === 'function' ? svc.currentSelection() : null
-    if (
-      sel !== null && sel !== undefined &&
-      typeof sel.provider === 'string' && sel.provider.length > 0 &&
-      typeof sel.model === 'string' && sel.model.length > 0
-    ) return { provider: sel.provider, model: sel.model, source: 'default-selection' }
-  } catch {
-    /* 默认模型服务不可用/读失败：落到裸 resume（turn-failed 处理兜底） */
-  }
-  return null
-}
-
-/** 进程重启后 liveAgents 清空：对满足 dream 条件的窗口按需恢复 agent。
- *  factory.resume 从 session persistence（jsonl 后端）把已有会话恢复成 live agent，
- *  与 GUI 打开会话同路径；恢复后重验全部条件再 startWindowDream（恢复耗时期间
- *  窗口状态可能已变）。失败只记日志静默降级——绝不 create 新建会话（窗口必然
- *  已有会话文件，恢复失败说明环境异常，宁可本轮不 dream 也不能造空会话）。
- *  resumeInFlight 防重入：恢复是异步的，耗时若跨过检查周期，避免重复 resume。 */
+/** Restore eligible cold sessions through the ordinary-session owner, then recheck
+ *  dream eligibility. Never create a replacement session on restoration failure.
+ *  The in-flight set prevents overlapping checks from restoring the same id twice. */
 const resumeInFlight = new Set<string>()
 
 /** resume 永久失败退避（进程级）：'session not found' 的窗口短期不会复活——会话文件
@@ -865,36 +781,22 @@ export async function resumeAndDream(ctx: Context, sessionId: string, workspace:
   if (resumeBackoffActive(sessionId)) return // not-found 退避期内：静默跳过
   resumeInFlight.add(sessionId)
   try {
-    // ⚠️ resume 在 agents service 本体上（service.resume(options) 内部注入 ownerCtx
-    // 并委托 factory.target.resume）——factory 槽是 { target } 包装、其上无 resume
-    // 方法（dsh-agent lib/index.js 529-561 实证）。首版写 factory.resume 恒 undefined
-    // → 全部 agent-missing 窗口 resume 静默失败（真机踩坑 2026-09-04，日志
-    // 'agent-resume-unavailable factory=yes'），重启后自动 dream 从未真正恢复过。
-    const agentsSvc = (ctx as { get?: (name: string) => unknown }).get?.('agents') as
-      | { resume?: (options: { resumeSessionId: string; agentOptions?: { provider: string; model: string } }) => Promise<unknown> }
+    // The ordinary-session owner restores model selection, the preset and its tools.
+    // Raw factory resume, even with a model, omits the preset and scoped tools.
+    const sessionsSvc = (ctx as { get?: (name: string) => unknown }).get?.('sessionController') as
+      | { resolveAgent?: (id: string) => Promise<{ agent: unknown } | { error: { message: string } }> }
       | undefined
-    if (agentsSvc === undefined || typeof agentsSvc.resume !== 'function') {
-      log(`check agent-resume-unavailable sid=${sid} service=${agentsSvc ? 'yes' : 'no'}`)
+    if (sessionsSvc === undefined || typeof sessionsSvc.resolveAgent !== 'function') {
+      log(`check agent-resume-unavailable sid=${sid} session-controller=${sessionsSvc ? 'yes' : 'no'}`)
       return
     }
-    // issue #36：空 options 的 resume 必然产生装配失败轮（{{model}} 严格插值抛错 +
-    // prepareRequest 空 route 抛）——resume 前把路由组装好；取不到才裸 resume
-    //（失败由 handleMemoryTurnFailure 释放重试兜底，不再静默盖章丢记忆）。
-    const route = resolveResumeRoute(ctx, sessionId)
-    if (route === null) log(`check resume no-route sid=${sid} -> resume without agentOptions (turn-failed 兜底)`)
-    else log(`check resume route sid=${sid} provider=${route.provider} model=${route.model} source=${route.source}`)
-    const resumed = await agentsSvc.resume({
-      resumeSessionId: sessionId,
-      ...(route === null ? {} : { agentOptions: { provider: route.provider, model: route.model } }),
-    })
-    // dsh 的 agents.resume() 返回 handle { agent, dispose }，不是 agent 本身
-    const agent = (resumed as { agent?: unknown })?.agent ?? resumed
+    const resolved = await sessionsSvc.resolveAgent(sessionId)
+    if ('error' in resolved) throw new Error(resolved.error.message)
+    const agent = resolved.agent
     const header = (agent as { session?: { header?: { id?: unknown; origin?: unknown; delegationDepth?: unknown } } })
       ?.session?.header
     if (header === undefined || header === null || typeof header.id !== 'string' || header.id.length === 0) {
-      // resume resolve 但 agent 无可用 header——实测=子代理会话（dsh 对 fork 子代理的
-      // resume 返回不可用句柄）。注意主会话返回的同样是 handle，已在上面解包 .agent，
-      // 解包后仍无 header 才落到这里。标缓存：后续周期 sweep 直接跳过，不再反复 resume。
+      // An unusable identity must not start a dream or be retried by every sweep.
       autoDreamSkipWindows.add(sessionId)
       log(`check resume unusable-agent sid=${sid} -> skip`)
       return
