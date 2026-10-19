@@ -31,9 +31,11 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
-import { appendFileSync } from 'node:fs'
+import { appendFileSync, existsSync, readdirSync, readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { getDb, projectList, type Level, type MemoryRow } from './db.js'
+import { decompressAllFrames } from './migrate-v0.js'
 import { fillTemplate, keyedValue, resolveSlotText } from './prompt-loader.js'
 import { readSeen, readWritten } from './inject.js'
 import { workspaceOf } from './tools.js'
@@ -726,9 +728,76 @@ export function isDreamSuppressed(cfg: DreamConfig, date = new Date()): boolean 
   return false
 }
 
-/** Restore eligible cold sessions through the ordinary-session owner, then recheck
- *  dream eligibility. Never create a replacement session on restoration failure.
- *  The in-flight set prevents overlapping checks from restoring the same id twice. */
+/** 读会话持久化日志里最近一次 request/header 的路由。物理层与
+ *  dsh-session-persistence-jsonl 同构（多帧 zstd 容器，逐帧解压），复用 migrate-v0
+ *  的逐帧解压器；文件缺失/损坏/字段不合一律返回 null，绝不抛（调用方在 sweep 链上）。 */
+function readLastRouteFromSessionLog(sessionId: string): { provider: string; model: string } | null {
+  if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) return null // sid 拼路径前的防御（来自 windows 表，正常恒过）
+  const home = process.env.DSH_HOME || join(homedir(), '.dsh')
+  for (const rootName of ['sessions', 'archived-sessions']) {
+    const root = join(home, rootName)
+    let projDirs: string[]
+    try {
+      if (!existsSync(root)) continue
+      projDirs = readdirSync(root)
+    } catch {
+      continue
+    }
+    for (const proj of projDirs) {
+      // 两代文件名并存（v4 现行 / v0 旧名），与 migrate-v0 listSessionFiles 同款兼容
+      for (const file of [join(root, proj, sessionId, 'session.v4.jsonl.zstd'), join(root, proj, sessionId, 'session.jsonl.zstd')]) {
+        if (!existsSync(file)) continue
+        try {
+          const lines = decompressAllFrames(readFileSync(file)).toString('utf8').split('\n')
+          for (let i = lines.length - 1; i >= 0; i--) {
+            const line = lines[i]
+            if (!line.includes('"request/header"')) continue
+            let ev: { data?: { header?: { config?: { provider?: unknown; model?: unknown } } } }
+            try {
+              ev = JSON.parse(line) as typeof ev
+            } catch {
+              continue
+            }
+            const cfg = ev?.data?.header?.config
+            if (
+              cfg !== undefined && cfg !== null &&
+              typeof cfg.provider === 'string' && cfg.provider.length > 0 &&
+              typeof cfg.model === 'string' && cfg.model.length > 0
+            ) return { provider: cfg.provider, model: cfg.model }
+          }
+        } catch {
+          /* 单文件损坏/解压失败：试下一个候选 */
+        }
+      }
+    }
+  }
+  return null
+}
+
+/** resume 前解析该会话应使用的路由：原会话路由（会话日志）→ 部署默认选择 → null。 */
+function resolveResumeRoute(ctx: Context, sessionId: string): { provider: string; model: string; source: 'session-log' | 'default-selection' } | null {
+  const fromLog = readLastRouteFromSessionLog(sessionId)
+  if (fromLog !== null) return { ...fromLog, source: 'session-log' }
+  try {
+    const svc = (ctx as { get?: (name: string) => unknown }).get?.('agentDefaultModel') as
+      | { currentSelection?: () => { provider?: unknown; model?: unknown } }
+      | undefined
+    const sel = typeof svc?.currentSelection === 'function' ? svc.currentSelection() : null
+    if (
+      sel !== null && sel !== undefined &&
+      typeof sel.provider === 'string' && sel.provider.length > 0 &&
+      typeof sel.model === 'string' && sel.model.length > 0
+    ) return { provider: sel.provider, model: sel.model, source: 'default-selection' }
+  } catch {
+    /* 默认模型服务不可用/读失败：落到裸 resume（turn-failed 处理兜底） */
+  }
+  return null
+}
+
+/** Restore cold sessions through the ordinary-session owner when available, or
+ *  the route-aware agents service on legacy Hosts, then recheck dream eligibility.
+ *  Never create a replacement session on failure. The in-flight set prevents
+ *  overlapping checks from restoring the same id twice. */
 const resumeInFlight = new Set<string>()
 
 /** resume 永久失败退避（进程级）：'session not found' 的窗口短期不会复活——会话文件
@@ -786,13 +855,29 @@ export async function resumeAndDream(ctx: Context, sessionId: string, workspace:
     const sessionsSvc = (ctx as { get?: (name: string) => unknown }).get?.('sessionController') as
       | { resolveAgent?: (id: string) => Promise<{ agent: unknown } | { error: { message: string } }> }
       | undefined
-    if (sessionsSvc === undefined || typeof sessionsSvc.resolveAgent !== 'function') {
-      log(`check agent-resume-unavailable sid=${sid} session-controller=${sessionsSvc ? 'yes' : 'no'}`)
-      return
+    let agent: unknown
+    if (sessionsSvc !== undefined && typeof sessionsSvc.resolveAgent === 'function') {
+      const resolved = await sessionsSvc.resolveAgent(sessionId)
+      if ('error' in resolved) throw new Error(resolved.error.message)
+      agent = resolved.agent
+    } else {
+      // Legacy Hosts do not expose the ordinary-session controller as a service.
+      const agentsSvc = (ctx as { get?: (name: string) => unknown }).get?.('agents') as
+        | { resume?: (options: { resumeSessionId: string; agentOptions?: { provider: string; model: string } }) => Promise<unknown> }
+        | undefined
+      if (agentsSvc === undefined || typeof agentsSvc.resume !== 'function') {
+        log(`check agent-resume-unavailable sid=${sid} service=${agentsSvc ? 'yes' : 'no'}`)
+        return
+      }
+      const route = resolveResumeRoute(ctx, sessionId)
+      if (route === null) log(`check resume no-route sid=${sid} -> resume without agentOptions (turn-failed 兜底)`)
+      else log(`check resume route sid=${sid} provider=${route.provider} model=${route.model} source=${route.source}`)
+      const resumed = await agentsSvc.resume({
+        resumeSessionId: sessionId,
+        ...(route === null ? {} : { agentOptions: { provider: route.provider, model: route.model } }),
+      })
+      agent = (resumed as { agent?: unknown })?.agent ?? resumed
     }
-    const resolved = await sessionsSvc.resolveAgent(sessionId)
-    if ('error' in resolved) throw new Error(resolved.error.message)
-    const agent = resolved.agent
     const header = (agent as { session?: { header?: { id?: unknown; origin?: unknown; delegationDepth?: unknown } } })
       ?.session?.header
     if (header === undefined || header === null || typeof header.id !== 'string' || header.id.length === 0) {

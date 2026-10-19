@@ -90,8 +90,11 @@ frozen at the last conversation timestamp.
   after the peak ends; a dream already in progress is never interrupted. Old windows (no live
   agent, >24h) and archived sessions are left alone. Cold sessions resume through DSH's
   ordinary-session controller so their recorded model selection, preset and tools are restored.
-  Without that controller, automatic consolidation skips cold sessions rather than creating
-  an agent without its configuration; live-session consolidation remains available.
+  On legacy Hosts without that controller, cold sessions use `agents.resume()` with the last
+  recorded provider/model, falling back to the deployment's default model selection. This
+  preserves legacy automatic consolidation but does not restore preset-scoped tools. A failure
+  from an available controller is not retried through the legacy path; live-session consolidation
+  remains unchanged.
 - **`/dream` command**: no need to wait for the idle trigger — type `/dream` in the composer
   to start consolidating this window's memories right away (same semantics as the
   `memory_dream` tool, immune to peak-hour suppression). Executed by the dsh command plane,

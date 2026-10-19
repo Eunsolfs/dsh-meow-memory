@@ -348,8 +348,8 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   check('resume: raw factory is never called', rawResumes === 0)
   const unavailableId = 'win-resume-no-owner'
   dbR.touchWindow(unavailableId, wsR, Date.now() - 4 * 3600_000)
-  await resumeAndDream({ get: (name) => name === 'agents' ? { resume: async () => { rawResumes++ } } : undefined }, unavailableId, wsR, '.dsh-meow', undefined, cfgR)
-  check('resume: missing session owner does not fall back to raw factory', rawResumes === 0 && dbR.getDreamLease(unavailableId) === null)
+  await resumeAndDream({ get: () => undefined }, unavailableId, wsR, '.dsh-meow', undefined, cfgR)
+  check('resume: missing controller and agents service skips safely', rawResumes === 0 && dbR.getDreamLease(unavailableId) === null)
 
   const wsR2 = mkdtempSync(join(tmpdir(), 'mm-resume-fail-'))
   const dbR2 = getDb(wsR2, '.dsh-meow')
@@ -389,6 +389,90 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   check('resume: not-found backed off (no retry within window)', resumeCalls4 === 1)
   dbR4.close()
   rmSync(wsR4, { recursive: true, force: true })
+}
+
+// Legacy Hosts expose agents.resume but no ordinary-session controller.
+{
+  const ws = mkdtempSync(join(tmpdir(), 'mm-legacy-resume-'))
+  const savedHome = process.env.DSH_HOME
+  process.env.DSH_HOME = join(ws, 'host-home')
+  const db = getDb(ws, '.dsh-meow')
+  const cfg = { enabled: true, idleMinutes: 180, checkMinutes: 15, suppressWindows: [], suppressLeadMinutes: 15, timeZone: 'UTC', rulesReviewDays: 2 }
+  const options = []
+  const steered = []
+  const agent = id => ({ session: { header: { id } }, steer: message => steered.push(message) })
+  const window = id => {
+    db.touchWindow(id, ws, Date.now() - 4 * 3600_000)
+    db.insert({ level: 'fact', content: 'legacy resume memory', project: 'legacy', source_session: id, created_at: 100 })
+  }
+  const legacyCtx = (resume, selection) => ({ get: name => name === 'agents' ? { resume } : name === 'agentDefaultModel' && selection ? { currentSelection: selection } : undefined })
+  try {
+    const defaultId = 'legacy-default-route'
+    window(defaultId)
+    await resumeAndDream(legacyCtx(async value => { options.push(value); return { agent: agent(defaultId), dispose() {} } }, () => ({ provider: 'deepseek-official', model: 'deepseek-flash' })), defaultId, ws, '.dsh-meow', undefined, cfg)
+    check('legacy resume: exact session id and default route passed to agents service', options[0].resumeSessionId === defaultId && options[0].agentOptions?.provider === 'deepseek-official' && options[0].agentOptions?.model === 'deepseek-flash')
+    check('legacy resume: handle unwrapped and cold dream started', steered.length === 1 && db.getDreamLease(defaultId) !== null)
+
+    const { zstdCompressSync } = await import('node:zlib')
+    for (const [root, filename] of [['sessions', 'session.v4.jsonl.zstd'], ['archived-sessions', 'session.jsonl.zstd']]) {
+      const id = root === 'sessions' ? 'legacy-log-route' : 'legacy-archive-route'
+      window(id)
+      const folder = join(process.env.DSH_HOME, root, 'project', id)
+      mkdirSync(folder, { recursive: true })
+      const event = model => JSON.stringify({ type: 'request/header', data: { header: { config: { provider: 'recorded-provider', model } } } }) + '\n'
+      // Separate zstd frames match the persisted append-only session container.
+      writeFileSync(join(folder, filename), Buffer.concat([zstdCompressSync(event('older-model')), zstdCompressSync(event('latest-model') + '{"type":"request/header"}\n')]))
+      let received
+      await resumeAndDream(legacyCtx(async value => { received = value; return agent(id) }, () => { throw new Error('default selection must not run for a recorded route') }), id, ws, '.dsh-meow', undefined, cfg)
+      check(`legacy resume: ${root} uses last valid recorded route before defaults`, received?.agentOptions?.provider === 'recorded-provider' && received?.agentOptions?.model === 'latest-model')
+      check(`legacy resume: ${root} direct agent starts dream`, db.getDreamLease(id) !== null)
+    }
+
+    const noRouteId = 'legacy-no-route'
+    window(noRouteId)
+    let noRouteOptions
+    await resumeAndDream(legacyCtx(async value => { noRouteOptions = value; return agent(noRouteId) }), noRouteId, ws, '.dsh-meow', undefined, cfg)
+    check('legacy resume: no route preserves prior bare resume behavior', noRouteOptions?.resumeSessionId === noRouteId && !('agentOptions' in noRouteOptions) && db.getDreamLease(noRouteId) !== null)
+
+    const failedId = 'legacy-not-found'
+    window(failedId)
+    let failedCalls = 0
+    const failingCtx = legacyCtx(async () => { failedCalls++; throw new Error('session not found') })
+    await resumeAndDream(failingCtx, failedId, ws, '.dsh-meow', undefined, cfg)
+    await resumeAndDream(failingCtx, failedId, ws, '.dsh-meow', undefined, cfg)
+    check('legacy resume: not-found keeps backoff and no dream lease', failedCalls === 1 && db.getDreamLease(failedId) === null)
+
+    const dedupId = 'legacy-inflight'
+    window(dedupId)
+    let release
+    const gate = new Promise(resolve => { release = resolve })
+    let calls = 0
+    const dedupCtx = legacyCtx(async () => { calls++; await gate; return agent(dedupId) })
+    const first = resumeAndDream(dedupCtx, dedupId, ws, '.dsh-meow', undefined, cfg)
+    const second = resumeAndDream(dedupCtx, dedupId, ws, '.dsh-meow', undefined, cfg)
+    release()
+    await Promise.all([first, second])
+    check('legacy resume: in-flight dedup preserves one resume and dream', calls === 1 && db.getDreamLease(dedupId) !== null)
+
+    const subagentId = 'legacy-subagent'
+    window(subagentId)
+    await resumeAndDream(legacyCtx(async () => ({ agent: { session: { header: { id: subagentId, origin: 'subagent' } } } })), subagentId, ws, '.dsh-meow', undefined, cfg)
+    check('legacy resume: subagents remain excluded from automatic dream', db.getDreamLease(subagentId) === null)
+
+    for (const throws of [false, true]) {
+      const id = `controller-error-${throws}`
+      window(id)
+      let fallbacks = 0
+      const ctx = { get: name => name === 'sessionController' ? { resolveAgent: async () => { if (throws) throw new Error('owner unavailable'); return { error: { message: 'owner unavailable' } } } } : name === 'agents' ? { resume: async () => { fallbacks++; return agent(id) } } : undefined }
+      await resumeAndDream(ctx, id, ws, '.dsh-meow', undefined, cfg)
+      check(`resume: controller ${throws ? 'throw' : 'error result'} never invokes legacy fallback`, fallbacks === 0 && db.getDreamLease(id) === null)
+    }
+  } finally {
+    if (savedHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = savedHome
+    closeAllDbs()
+    rmSync(ws, { recursive: true, force: true })
+  }
 }
 
 // ── issue #36：dream 失败处理——零进展中断不静默封存、连续上限才止损、turn-failed 即时处理 ──
