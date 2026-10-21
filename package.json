@@ -47,6 +47,9 @@
     "check-lang": "node scripts/check-lang.mjs",
     "link-workspace": "powershell -ExecutionPolicy Bypass -File scripts/link-workspace.ps1"
   },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
   "devDependencies": {
     "@deepseek-ai/dsh-llm": "^0.1.1-rc.2",
     "@deepseek-ai/dsh-settings": "^0.1.1-rc.2",

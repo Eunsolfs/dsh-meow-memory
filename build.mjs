@@ -28,6 +28,8 @@ const hostOptions = {
   entryPoints: ['src/index.ts'],
   bundle: true,
   platform: 'node',
+  // Config must use the same schema constructor as the running DSH Host.
+  external: ['@deepseek-ai/schemastery'],
   format: 'esm',
   target: 'node22',
   nodePaths,

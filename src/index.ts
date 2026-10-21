@@ -275,10 +275,9 @@ const config = z.object({
     .default({}),
 })
 
-// 0.1.7 设置服务只收录 meta.volatile 的 Config（dsh-settings volatileForm 根检查）：
-// 不标记则「喵记忆」标签页永远 unavailable（提示文案会误导性地怪回环连接）。仓内
-// schemastery@3.18.1 的解析不含 volatile 逻辑——meta 只是宿主侧标记，config 值保持
-// 裸形状（官方新版 .volatile() 会把值包成 .get() 引用），消费端零改动；升级依赖须重验。
+// DSH settings requires a volatile root schema. Legacy parsers return a plain
+// object; current Hosts provide a get() reference. Config merging and the live
+// reader accept both shapes and track replacement values behind the reference.
 Object.assign(config.meta, { volatile: true })
 
 export { config as Config }
@@ -369,11 +368,19 @@ export function validateConfigUserLayer(value: unknown): void {
   }
 }
 
+/** Read a legacy config object or the current Host's root volatile reference. */
+function readConfigRoot(value: unknown): unknown {
+  const ref = value as { get?: () => unknown } | null | undefined
+  return ref !== null && typeof ref === 'object' && typeof ref.get === 'function' ? ref.get() : value
+}
+
 /**
  * 设置页 user 层字段级覆盖 patch config（装配配置=基线）。
  * dream/delegate 子对象做浅合并：用户只改一个子字段不丢 patch 里的其余键。
  */
 export function mergeConfigLayer(patch: unknown, user: Record<string, unknown> | undefined): unknown {
+  patch = readConfigRoot(patch)
+  user = readConfigRoot(user) as Record<string, unknown> | undefined
   // user === null：YAML 里写成空段（`meow-memory:` 后面没内容）会解析成 null，而
   // typeof null === 'object' 会漏过下面这行，随后 Object.entries(null) 抛 TypeError
   // 直接崩掉 applyInner（插件整块不启动）。防御式直通 patch 层。
@@ -667,6 +674,7 @@ export function workspaceDisabledMatch(list: readonly string[], ws: string): boo
  *  其余读取返回同一缓存对象（引用稳定，调用方可做 identity 比较）。导出供测试直调。 */
 export function liveConfigReader(patch: unknown, getSource: () => Record<string, unknown> | undefined, minIntervalMs: number): () => ResolvedConfig {
   let lastSource: Record<string, unknown> | undefined
+  let lastPatch: unknown
   let lastAt = Number.NEGATIVE_INFINITY
   let cached: ResolvedConfig | undefined
   return (): ResolvedConfig => {
@@ -674,13 +682,15 @@ export function liveConfigReader(patch: unknown, getSource: () => Record<string,
     if (cached !== undefined && now - lastAt < minIntervalMs) return cached
     let source: Record<string, unknown> | undefined
     try {
-      source = getSource()
+      source = readConfigRoot(getSource()) as Record<string, unknown> | undefined
     } catch {
       source = undefined // 源读失败按「无 user 层」处理（patch 层兜底），绝不抛进事件链
     }
-    if (cached === undefined || source !== lastSource) {
+    const currentPatch = readConfigRoot(patch)
+    if (cached === undefined || source !== lastSource || currentPatch !== lastPatch) {
       lastSource = source
-      cached = resolveConfig(mergeConfigLayer(patch, source))
+      lastPatch = currentPatch
+      cached = resolveConfig(mergeConfigLayer(currentPatch, source))
     }
     lastAt = now
     return cached

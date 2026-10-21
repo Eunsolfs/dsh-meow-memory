@@ -83,6 +83,8 @@ Check in order:
 
 A dream already in progress is never interrupted.
 
+Cold sessions resume through DSH's ordinary-session controller when available, restoring their recorded model selection, preset and tools. Legacy Hosts without that controller API use `agents.resume()` with the last valid recorded provider/model, then the deployment's default selection; if neither is available, they retain the prior bare-resume behavior. The legacy path does not restore preset-scoped tools. Errors from an available controller never fall back to a second raw resume. Live-session consolidation is unchanged.
+
 ### How do I consolidate right now instead of waiting?
 
 Type `/dream` in the composer to start consolidating this window immediately (same semantics as the `memory_dream` tool, **immune to peak-hour suppression**). It is executed by the dsh command plane, never sent to the model, and shows up in the `/` autocomplete menu. A consolidation already in progress is reported clearly instead of being started twice.
