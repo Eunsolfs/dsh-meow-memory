@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.31.1 (2026-10-21)
+
+### 修复：检索 / 项目视图 / 命中注入三处口径（#68 #61 #67）
+
+- `memory_search` 的 `status: "all"` 名副其实：archived 也可见（此前 listSearchable 在 db 层只出 active+todo-stale，"all=不过滤"名不符实）。
+- `memory_project` 项目视图改按名单语义匹配：`project` 写多项目名（`dsh,femo`）的条目在任一名单项目的视图都可见（此前 SQL 精确等值两边都漏）；全局/未标记仍不进具体项目视图。
+- 关键词命中注入先排除已注入、再按 `hitTopK` 截断：top-K 被旧命中占满时本轮补位下一名，不再颗粒无收。
+
+### 修复：写路径短 id 歧义拒绝（#62）
+
+- `memory_update` 传 8 位短 id 命中多条时（同毫秒 id 同前缀），报错并列出候选，不再 findById 取首条静默改错条目（旧路径拿首条全 id 去 update，恰好绕过 db.update 的 LIKE 歧义守卫）。只读工具（memory_read / memory_find_similar）维持首条语义不变。
+
+### 修复：会话 id 含 Windows 非法文件名字符（#56）
+
+- sessions/*.json 文件名对会话 id 做百分号编码（`lark-link:dm:…:0` 的冒号等）：确定性编码、跨重启同 id 同文件、安全字符原样（既有会话文件不失效），读写不再 ENOENT。
+
+### 修复：memory_home 切换跨重启持久（#70）
+
+- 切换成功时在稳定位置 `$DSH_HOME/storages/meow-memory-home.json` 落指针，启动时读回（显式 `homeDir` 配置与 `MEOW_MEMORY_HOME` env 仍优先）。指针缺失/损坏/目标已删一律静默回平台默认，绝不影响启动。
+
+### 修复：dream 定时器不再拖住宿主进程（#60）
+
+- dream 心跳（setInterval）与后台调度自调度链（setTimeout）补 unref：桌面端 graceful teardown 不再因插件定时器失败。
+
+### 修复：热重载 i18n 重复注册黄字（#54 附带）
+
+- cordis 热重载起新模块实例后重放注册，「already registered」按幂等成功处理，不再每轮刷 4 条告警；「被别的包占用」仍照常告警。
+
+### 加固：#59 冷启动恢复的返回形状守卫
+
+- `sessionController.resolveAgent` 返回不认识的形状时：记一次日志、本周期跳过、下个 sweep 重试——不再落进 unusable-agent 分支被永久跳过（误标会把窗口的 auto-dream 静默禁用到进程重启且现场无从排查）。控制器路径补 `via sessionController` 日志，现场确认恢复路径用（#49/#48 验证看这条）。顺带：`resolveAgent` 返回 null 不再 TypeError。
+
+### 文档
+
+- troubleshooting / 常见问题补 `@deepseek-ai/schemastery` peer 依赖说明（#59 跟进）与目录切换持久化说明；memory_home 工具描述（三语）补持久化语义。
+
+### 测试
+
+- host 539→561（#68 / #67 / #62 / #56 / #61 / #70 / 形状守卫各一批）；client-i18n 66→69（热重载幂等）。顺带修掉测试里 DSH_HOME 还原未守卫 undefined 的暗坑（undefined 被存成字符串 "undefined"，此前无人读所以无感，#70 指针把它放大成了 CWD 下的杂散目录）。全量 exit=0。
+
 ## v0.31.0 (2026-10-07)
 
 ### 新增：窗口级「记忆参与」门控（#38）+ 工作区停用名单（#28）

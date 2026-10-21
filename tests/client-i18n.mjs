@@ -210,6 +210,21 @@ const brokenRet = broken.installI18n({ get: () => brokenService }, (m) => broken
 check('语言占用只告警', brokenWarnings.length === 1 && brokenWarnings[0].includes('pt-br'), JSON.stringify(brokenWarnings))
 check('语言占用仍注册字典', brokenService.calls.register.length === 3, JSON.stringify(brokenService.calls.register.map((c) => c.locale)))
 
+// #54 热重载：宿主侧语言/字典仍在，新模块实例重放注册 → 「already registered」按幂等
+// 成功处理、不刷黄字（与「被别的包占用」区分——那种仍告警）。
+const hotService = makeFakeService()
+hotService.addLanguage = () => {
+  throw new Error('locale "pt-br" is already registered')
+}
+hotService.register = () => {
+  throw new Error('locale namespace "meow-memory" already has locale "zh"')
+}
+const hotWarnings = []
+const hot = await bundleSrc('src/i18n/index.ts')
+const hotRet = hot.installI18n({ get: () => hotService }, (m) => hotWarnings.push(m))
+check('热重载 already-registered 幂等成功不告警 (#54)', hotWarnings.length === 0, JSON.stringify(hotWarnings))
+check('热重载 pt-br 计入完成列表 (#54)', hotRet.includes('pt-br'), JSON.stringify(hotRet))
+
 // ── 5. 各模块的多语言输出 ───────────────────────────────────────────────────
 console.log('=== 5. 模块文案（foldLabel / participationLabel / notice / clock） ===')
 const fold = await bundleSrc('src/client-fold.ts')

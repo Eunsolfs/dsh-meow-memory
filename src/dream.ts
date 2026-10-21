@@ -354,6 +354,9 @@ function armDreamHeartbeat(sessionId: string, workspace: string, dir: string): v
       stopDreamHeartbeat(sessionId) // 库已关（热重载 dispose）/瞬时锁错误：心跳退役，绝不带崩宿主
     }
   }, DREAM_HEARTBEAT_MS)
+  // #60：心跳只为续租，不拖住宿主进程生命周期——未 unref 的定时器会让桌面端
+  // graceful teardown 失败、进程退不出去。
+  if (typeof timer === 'object' && timer !== null && typeof timer.unref === 'function') timer.unref()
   dreamHeartbeats.set(sessionId, { timer, startedAt })
 }
 
@@ -843,6 +846,9 @@ export function isSubagentAgent(agent: unknown): boolean {
  *  进程重启清零：每窗口最多多 resume 一次，无害。 */
 const autoDreamSkipWindows = new Set<string>()
 
+/** resolveAgent 返回形状告警去重（进程级）：形状不认识的宿主每个窗口只记一次日志。 */
+const resumeShapeWarned = new Set<string>()
+
 export async function resumeAndDream(ctx: Context, sessionId: string, workspace: string, dir: string, onDreamState: DreamStateCallback | undefined, cfg: DreamConfig): Promise<void> {
   const log = (msg: string): void => dreamLog(workspace, dir, msg)
   const sid = shortSessionId(sessionId)
@@ -857,9 +863,23 @@ export async function resumeAndDream(ctx: Context, sessionId: string, workspace:
       | undefined
     let agent: unknown
     if (sessionsSvc !== undefined && typeof sessionsSvc.resolveAgent === 'function') {
-      const resolved = await sessionsSvc.resolveAgent(sessionId)
-      if ('error' in resolved) throw new Error(resolved.error.message)
-      agent = resolved.agent
+      log(`check resume owner sid=${sid} via sessionController`)
+      const resolved = await sessionsSvc.resolveAgent(sessionId) as unknown
+      const r = resolved as Record<string, unknown> | null
+      // 形状守卫：认识的返回只有 {agent} / {error} 两种。宿主版本差异给出别的形状
+      // 时绝不能落到下面 unusable-agent 分支——那会进 autoDreamSkipWindows 永久跳过，
+      // 窗口的 auto-dream 被静默禁用到进程重启且现场无从排查。记一次日志、本周期
+      // 跳过、下个 sweep 重试（不进任何缓存表）。
+      if (r === null || typeof r !== 'object' || (!('agent' in r) && !('error' in r))) {
+        if (!resumeShapeWarned.has(sessionId)) {
+          resumeShapeWarned.add(sessionId)
+          const keys = r !== null && typeof r === 'object' ? Object.keys(r).join(',') : String(r)
+          log(`check resume owner sid=${sid} 未识别的 resolveAgent 返回形状（keys=${keys}）-> 本周期跳过，不记永久跳过`)
+        }
+        return
+      }
+      if ('error' in r) throw new Error(String((r as { error?: { message?: string } }).error?.message ?? 'resolveAgent error'))
+      agent = (r as { agent?: unknown }).agent
     } else {
       // Legacy Hosts do not expose the ordinary-session controller as a service.
       const agentsSvc = (ctx as { get?: (name: string) => unknown }).get?.('agents') as
@@ -1023,7 +1043,10 @@ export function scheduleDream(ctx: Context, cfg: DreamConfig | (() => DreamConfi
   let stopped = false
   let lastEnabled: boolean | undefined
   const arm = (minutes: number): void => {
-    if (!stopped) timer = setTimeout(tick, minutes * 60_000)
+    if (stopped) return
+    timer = setTimeout(tick, minutes * 60_000)
+    // #60：自调度链同样不阻宿主退出（dispose 仍 clearTimeout，停止语义不变）。
+    if (typeof timer === 'object' && timer !== null && typeof timer.unref === 'function') timer.unref()
   }
   const tick = (): void => {
     let c: DreamConfig | undefined

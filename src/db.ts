@@ -381,6 +381,20 @@ export class MemoryDb {
     return undefined
   }
 
+  /** 短 id 全量解析（#62）：返回全部前缀命中（跨表）。findById 首条语义只配只读展示；
+   *  写路径必须走这里做歧义拒绝——findById 首条 + 拿解析出的全 id 去 update，会绕过
+   *  update 内部的 LIKE 歧义守卫，静默改错条目。 */
+  findByIdAll(id: string): Array<{ row: MemoryRow; level: Level }> {
+    const prefix = id.length < 36
+    const out: Array<{ row: MemoryRow; level: Level }> = []
+    for (const level of LEVELS) {
+      const sql = prefix ? `SELECT * FROM ${level} WHERE id LIKE ?` : `SELECT * FROM ${level} WHERE id = ?`
+      const rows = this.db.prepare(sql).all(prefix ? `${id}%` : id) as Record<string, unknown>[]
+      for (const r of rows) out.push({ row: this.fromRow(level, r), level })
+    }
+    return out
+  }
+
   update(level: Level, id: string, patch: MemoryPatch): boolean {
     const sets: string[] = []
     const args: unknown[] = []

@@ -57,7 +57,10 @@ import {
   markWritten,
   releaseSeen,
   readSeen,
+  readInjected,
   readWritten,
+  sessionsFile,
+  buildProjectSectionText,
   getCurrentProject,
   setCurrentProject,
   backupMemoryDb,
@@ -467,6 +470,41 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
       await resumeAndDream(ctx, id, ws, '.dsh-meow', undefined, cfg)
       check(`resume: controller ${throws ? 'throw' : 'error result'} never invokes legacy fallback`, fallbacks === 0 && db.getDreamLease(id) === null)
     }
+  } finally {
+    if (savedHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = savedHome
+    closeAllDbs()
+    rmSync(ws, { recursive: true, force: true })
+  }
+}
+
+// ── #59 跟进：resolveAgent 返回形状守卫——不认识的形状本周期跳过、不进永久跳过表
+//（下个 sweep 重试）；认识但不可用（{agent:undefined}）仍安全无租约 ──
+{
+  const ws = mkdtempSync(join(tmpdir(), 'mm-shape-'))
+  const savedHome = process.env.DSH_HOME
+  process.env.DSH_HOME = join(ws, 'host-home')
+  const db = getDb(ws, '.dsh-meow')
+  const cfg = { enabled: true, idleMinutes: 180, checkMinutes: 15, suppressWindows: [], suppressLeadMinutes: 15, timeZone: 'UTC', rulesReviewDays: 2 }
+  const window = (id) => {
+    db.touchWindow(id, ws, Date.now() - 4 * 3600_000)
+    db.insert({ level: 'fact', content: 'shape guard memory', project: 'dsh', source_session: id, created_at: 100 })
+  }
+  try {
+    const junkId = 'win-shape-junk'
+    window(junkId)
+    let junkCalls = 0
+    const junkCtx = { get: (name) => (name === 'sessionController' ? { resolveAgent: async () => { junkCalls++; return { totally: 'unknown' } } } : undefined) }
+    await resumeAndDream(junkCtx, junkId, ws, '.dsh-meow', undefined, cfg)
+    await resumeAndDream(junkCtx, junkId, ws, '.dsh-meow', undefined, cfg)
+    check('unrecognized shape: no lease, no dream', db.getDreamLease(junkId) === null)
+    check('unrecognized shape: retried next sweep (not permanently skipped)', junkCalls === 2, `calls=${junkCalls}`)
+
+    const undefId = 'win-shape-undef'
+    window(undefId)
+    const undefCtx = { get: (name) => (name === 'sessionController' ? { resolveAgent: async () => ({ agent: undefined }) } : undefined) }
+    await resumeAndDream(undefCtx, undefId, ws, '.dsh-meow', undefined, cfg)
+    check('recognized unusable agent: no lease', db.getDreamLease(undefId) === null)
   } finally {
     if (savedHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = savedHome
@@ -1016,6 +1054,32 @@ check('dedup same session', inj2 === null || !inj2.text.includes('3081 端口是
 setCurrentProject(ws2, 'test-session-2', 'dsh', '.dsh-meow')
 const inj3 = buildHitInjection(db2, ws2, 'test-session-2', '3081 又怎么了？', { hitTopK: 3 }, '.dsh-meow')
 check('new session gets hits', inj3 !== null && inj3.text.includes('3081 端口是喵版 dsh'))
+// #67：已注入先排除再截断——top-K 被旧命中占满时本轮补位下一名，而不是颗粒无收
+{
+  const wsH = mkdtempSync(join(tmpdir(), 'mm-hitorder-'))
+  const dbH = new MemoryDb(memoryDbPath(wsH))
+  dbH.insert({ level: 'fact', content: '喵版端口约定 3080 甲', project: null, created_at: Date.now() })
+  dbH.insert({ level: 'fact', content: '喵版端口约定 3081 乙', project: null, created_at: Date.now() })
+  const h1 = buildHitInjection(dbH, wsH, 's-hit', '喵版端口是多少', { hitTopK: 1 }, '.dsh-meow')
+  check('hit truncation: first round top-1', h1 !== null && h1.injectedIds.length === 1, JSON.stringify(h1))
+  const h2 = buildHitInjection(dbH, wsH, 's-hit', '喵版端口是多少', { hitTopK: 1 }, '.dsh-meow')
+  check('hit truncation: second round fills next candidate (#67)', h2 !== null && h2.injectedIds.length === 1 && h2.injectedIds[0] !== h1.injectedIds[0], JSON.stringify(h2))
+  const h3 = buildHitInjection(dbH, wsH, 's-hit', '喵版端口是多少', { hitTopK: 1 }, '.dsh-meow')
+  check('hit truncation: exhausted → null', h3 === null)
+  dbH.close()
+  rmSync(wsH, { recursive: true, force: true })
+}
+// #56：会话 id 含冒号（Windows 非法文件名字符）→ 文件名百分号编码，seen 读写不再 ENOENT
+{
+  const wsC = mkdtempSync(join(tmpdir(), 'mm-colon-'))
+  const colonSid = 'lark-link:dm:8ab:0'
+  const colonFile = sessionsFile(wsC, colonSid, '.dsh-meow')
+  const colonBase = colonFile.split(/[\\/]/).pop()
+  check('sessionsFile: colon id sanitized (#56)', !colonBase.includes(':') && colonBase.includes('%3A'), colonFile)
+  markInjected(wsC, colonSid, ['cid-1'], '.dsh-meow')
+  check('seen file colon id roundtrip (#56)', readInjected(wsC, colonSid, '.dsh-meow').includes('cid-1'))
+  rmSync(wsC, { recursive: true, force: true })
+}
 // reflect 消息（独立库：topic 归 dream，反思不含 topic 规则）
 const ws3 = mkdtempSync(join(tmpdir(), 'mm-reflect-'))
 const db3 = new MemoryDb(memoryDbPath(ws3))
@@ -1055,11 +1119,15 @@ check('eight tools registered', tools.length === 8 && ['memory_remember', 'memor
   .every((name) => tools.some((t) => t.name === name)), `got ${tools.map((t) => t.name).join(',')}`)
 
 // memory_home 工具：查询 / 非法 target 防误切 / 合法切换（走 switchHomeDir 真链路）
+// DSH_HOME 整块隔离（#70 起切换会写 $DSH_HOME/storages 指针，不许污染真实宿主目录）
 {
   const home = tools.find((t) => t.name === 'memory_home')
   const saved = activeHomeDir()
   const tmpH = mkdtempSync(join(tmpdir(), 'meow-home-tool-'))
   const savedReal = activeHomeDir()
+  const savedDshHome = process.env.DSH_HOME
+  process.env.DSH_HOME = join(tmpH, 'dsh-home')
+  mkdirSync(process.env.DSH_HOME, { recursive: true })
 
   const r1 = await home.execute({})
   check('memory_home: 查询模式返回当前目录与预设', String(r1.note).includes('当前全局数据目录') && String(r1.note).includes('dsh-storage'))
@@ -1077,6 +1145,20 @@ check('eight tools registered', tools.length === 8 && ['memory_remember', 'memor
   const r4 = await home.execute({ target: 'dsh-storage' })
   check('memory_home: 预设标记解析并切换', typeof r4.note === 'string' && r4.note.length > 0)
 
+  // #70：切换持久化——稳定位置指针写盘；无 env/配置时启动回落链读到它
+  setActiveHomeDir(join(tmpH, 'from3'))
+  mkdirSync(join(tmpH, 'from3'), { recursive: true })
+  writeFileSync(join(tmpH, 'from3', 'seed.txt'), 'x')
+  const r5 = await home.execute({ target: join(tmpH, 'persist-home') })
+  const pointerPath = join(tmpH, 'dsh-home', 'storages', 'meow-memory-home.json')
+  check('memory_home: 切换写稳定位置指针 (#70)', existsSync(pointerPath), r5.note)
+  check('memory_home: 指针指向新目录', JSON.parse(readFileSync(pointerPath, 'utf8')).homeDir === join(tmpH, 'persist-home'))
+  check('resolveHomeDir 回落链读到指针（env 缺省时）', resolveHomeDir(undefined) === join(tmpH, 'persist-home'))
+  rmSync(join(tmpH, 'persist-home'), { recursive: true, force: true })
+  check('指针目标已删 → 静默回平台默认', resolveHomeDir(undefined) === DEFAULT_HOME_DIR)
+
+  if (savedDshHome === undefined) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = savedDshHome
   setActiveHomeDir(savedReal)
   rmSync(tmpH, { recursive: true, force: true })
 }
@@ -1109,12 +1191,20 @@ check('search hits carry real updated_at', searchResult.hits.every((h) => h.upda
 // search project/status 逗号多选（OR 语义）
 db.insert({ level: 'fact', content: '多选测试甲 独特内容', project: 'dsh', created_at: Date.now() })
 db.insert({ level: 'fact', content: '多选测试乙 独特内容', project: 'femo', created_at: Date.now() })
+const archivedRow = db.insert({ level: 'fact', content: '多选测试丙 已归档 独特内容', project: 'dsh', created_at: Date.now() })
+db.update('fact', archivedRow.id, { status: 'archived' })
 const sMulti = await searchTool.execute({ query: '多选测试', project: 'dsh,femo' }, execCtx)
 check('search project multi-select OR', sMulti.hits.some((h) => h.project === 'dsh') && sMulti.hits.some((h) => h.project === 'femo'))
 const sSingle = await searchTool.execute({ query: '多选测试', project: 'dsh' }, execCtx)
 check('search project single filter', sSingle.hits.every((h) => h.project === 'dsh' || h.project === '全局' || h.project === null || h.project === ''))
 const sStatus = await searchTool.execute({ query: '多选测试', status: 'archived,stale' }, execCtx)
 check('search status multi-select no throw', Array.isArray(sStatus.hits))
+check('search status multi-select finds archived', sStatus.hits.some((h) => h.id === archivedRow.id))
+// #68：'all' = 不过滤——archived 也可见（listSearchable 只出 active+todo-stale，archived 曾在 db 层被漏掉）
+const sAll = await searchTool.execute({ query: '多选测试', status: 'all' }, execCtx)
+check('search status=all sees archived (#68)', sAll.hits.some((h) => h.id === archivedRow.id))
+const sArch = await searchTool.execute({ query: '多选测试', status: 'archived' }, execCtx)
+check('search status=archived single filter (#68)', sArch.hits.length >= 1 && sArch.hits.some((h) => h.id === archivedRow.id) && sArch.hits.every((h) => h.id === archivedRow.id))
 const searchRender = searchTool.output.render({}, { note: '', hits: [{ level: 'fact', id: '0msum4ifx-bf3a-0000000000000000000000', project: 'dsh', content: 'x', keywords: ['dream', '机制'], updated_at: Date.now() - 2 * 86_400_000 }] })
 check('search shows keywords + relative time, no content', searchRender.some((b) => b.text.includes('[dsh : fact]') && b.text.includes('关于：dream, 机制') && b.text.includes('2 天前') && !b.text.includes('记忆时间戳')))
 
@@ -1168,10 +1258,44 @@ check('update keywords [] keeps unchanged', upEmpty.ok === true && JSON.stringif
 const up5 = await updateTool.execute({ id: kwId.slice(0, 8), importance: 5 }, updCtx)
 check('update importance unbounded (no clamp)', up5.ok === true && db.findById(kwId).row.importance === 5)
 
+// #62：短 id 歧义——写路径必须拒绝并列出候选，不能 findById 首条静默改错条目
+{
+  const wsA = mkdtempSync(join(tmpdir(), 'mm-ambig-'))
+  const dbA = getDb(wsA, '.dsh-meow')
+  const T = 1_700_000_000_000
+  const a1 = dbA.insert({ level: 'fact', content: '歧义条目甲 唯一内容甲', project: 'dsh', id: newId(T) }).id
+  const a2 = dbA.insert({ level: 'fact', content: '歧义条目乙 唯一内容乙', project: 'dsh', id: newId(T) }).id
+  check('ambig fixture: same-ms ids share 8-char prefix', a1.slice(0, 8) === a2.slice(0, 8) && a1 !== a2)
+  const ambigCtx = { agent: { session: { header: { cwd: wsA, id: 't-ambig' } } } }
+  const ambigErr = await updateTool.execute({ id: a1.slice(0, 8), status: 'archived' }, ambigCtx).then(() => null, (e) => String(e.message))
+  check('update ambiguous short id rejects with candidates (#62)', ambigErr !== null && ambigErr.includes('完整 id'), ambigErr)
+  check('update ambiguous leaves both untouched', dbA.findById(a1).row.status === 'active' && dbA.findById(a2).row.status === 'active')
+  const updFull = await updateTool.execute({ id: a2, status: 'archived' }, ambigCtx)
+  check('update full id unaffected by ambiguity guard', updFull.ok === true && dbA.findById(a2).row.status === 'archived')
+  dbA.close()
+  rmSync(wsA, { recursive: true, force: true })
+}
+
 // project 多值（逗号分隔）：包含判断 / 显示标签
 check('projectCovers multi-value includes', projectCovers('dsh,femo', 'femo') === true && projectCovers('dsh,femo', 'meow-eyes') === false)
 check('projectCovers global/null covers all', projectCovers('全局', 'dsh') === true && projectCovers(null, 'dsh') === true)
 check('projectLabel multi-value/global/unmarked', projectLabel('dsh,femo') === 'dsh/femo' && projectLabel('全局') === '全局' && projectLabel(null) === '未标记')
+
+// #61：project 视图按名单语义——多项目名条目在任一名单项目的视图都可见
+{
+  const wsP = mkdtempSync(join(tmpdir(), 'mm-projview-'))
+  const dbP = new MemoryDb(memoryDbPath(wsP))
+  dbP.insert({ level: 'project', content: '共享条目 内容', project: 'alpha,beta', subcategory: 'overview', created_at: Date.now() })
+  dbP.insert({ level: 'rules', content: '共享规则 内容', project: 'alpha,beta', created_at: Date.now() })
+  const tA = buildProjectSectionText(dbP, wsP, 'alpha', '.dsh-meow')
+  const tB = buildProjectSectionText(dbP, wsP, 'beta', '.dsh-meow')
+  const tC = buildProjectSectionText(dbP, wsP, 'gamma', '.dsh-meow')
+  check('project view multi-value visible from alpha (#61)', tA !== null && tA.includes('共享条目') && tA.includes('共享规则'), tA)
+  check('project view multi-value visible from beta (#61)', tB !== null && tB.includes('共享条目'))
+  check('project view not leaked to unrelated project', tC === null)
+  dbP.close()
+  rmSync(wsP, { recursive: true, force: true })
+}
 
 // 全局标记随语言包（labels.md 的 project.global）：英文包里模型写的是 "global"
 // 2026-09-19 口径修复（用户拍板）：全局 / global / null 三者都算全局——zh 包下也认 "global"
@@ -2228,7 +2352,9 @@ rmSync(wsNoDb, { recursive: true, force: true })
   const savedEnv = process.env.DSH_HOME
   process.env.DSH_HOME = join(tmp, 'dshhome')
   check('resolveHomeDir: dsh-storage 预设=DSH_HOME/storages/meow-memory', resolveHomeDir('dsh-storage') === join(tmp, 'dshhome', 'storages', 'meow-memory'))
-  process.env.DSH_HOME = savedEnv
+  // 直接赋 undefined 会存成字符串 "undefined"（#70 起 dshHomeDir 会把它当真值读走）
+  if (savedEnv === undefined) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = savedEnv
   check('resolveHomeDir: plugin-root 预设=插件根/storage（绝对路径）', resolveHomeDir('plugin-root') === homeDirPresets()['plugin-root'] && resolve(resolveHomeDir('plugin-root')) === resolveHomeDir('plugin-root'))
   check('resolveHomeDir: 相对路径非法回落默认', resolveHomeDir('relative/path') === DEFAULT_HOME_DIR)
   check('resolveHomeDir: 用户主目录本身非法回落默认', resolveHomeDir(homedir()) === DEFAULT_HOME_DIR)
