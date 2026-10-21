@@ -25,11 +25,13 @@
 - memory_search.param.days: 只看最近 N 天创建的条目（按创建时间）。
 - memory_search.param.k: 返回条数上限。
 - memory_search.param.content_max: 每条内容截断长度，0=全文。
+- memory_search.param.explain: 可解释检索开关（默认关）。开=true 时每条命中附带分项得分 explain（bm25 关键词分、importance、recencyWeight 艾宾浩斯权重、status），用于排查"为什么没召回/为什么召回它"，不改排序。
 - memory_search.out.note: 冲突提示。
 - memory_search.out.hits.id: 完整记忆 id（可传给 memory_read/memory_update/memory_find_similar）。
 - memory_search.out.hits.keywords: 记忆关键词列表（LLM 提取或自动 bigram）。
 - memory_search.out.hits.project: 项目归属；""=未标记；全局信息为"全局"。
 - memory_search.out.hits.updated_at: 记忆时间戳（最后更新时间，毫秒）。
+- memory_search.out.hits.explain: bm25 关键词原始分（importance/recencyWeight/status 随行返回，不单独描述）。
 
 ### memory_find_similar
 

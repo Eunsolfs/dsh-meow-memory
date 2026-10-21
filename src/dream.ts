@@ -388,6 +388,10 @@ export function startWindowDream(ctx: Context, agent: { session?: { header?: { i
   // claimDream 的 INSERT OR IGNORE 会给新窗口行造出 last_event_time=0 哨兵，这里兜底 0
   const T = win && win.last_event_time > 0 ? win.last_event_time : Date.now()
   if (!db.claimDream(sessionId, newDreamOwner(), T, DREAM_LEASE_MS)) return false // 别处活跃租约未过期
+  // 轮次计划快照（#69）：group_idx 是纯位置下标，advance 每轮重算 collectDreamRounds
+  // 会让「整理中新建的记忆」改变 rounds 长度/顺序——索引漂移 = 重复 topic、跳过 atomic。
+  // 快照后每条目标条目恰好被访问一次；整理中新建的记忆留给下一次 dream。
+  db.setDreamMeta(`dreamplan:${sessionId}`, JSON.stringify(rounds))
   onDreamState?.(sessionId, 'dreaming')
   const msg = buildDreamMessage(db, sessionId, T, rounds, 0)
   if (!sendMemoryTurn(agent, msg, workspace, dir, `dream start sid=${shortSessionId(sessionId)}`)) {
@@ -428,7 +432,12 @@ export function advanceDream(agent: unknown, dir = '.dsh-meow', onDreamState?: D
     return
   }
 
-  const rounds = collectDreamRounds(db, sessionId, ws, dir, rulesReviewDays) // 重查：前序轮 archive/merge 已落地
+  // 轮次计划 = start 时快照（#69）：不重算。快照缺失（升级瞬间旧 dream 在途 / meta
+  // 丢失）回退重算，行为同旧版；正常路径下快照随 start 写入、随 finish/release 清理。
+  const storedPlan = db.getDreamMeta(`dreamplan:${sessionId}`)
+  const rounds: DreamRound[] = storedPlan !== undefined
+    ? JSON.parse(storedPlan) as DreamRound[]
+    : collectDreamRounds(db, sessionId, ws, dir, rulesReviewDays)
   const nextIdx = lease.group_idx + 1
   if (nextIdx < rounds.length) {
     // CAS 推进：多实例同收 turn-stopping 时只有一个成功，其余跳过

@@ -53,6 +53,7 @@ import { migrateLegacy } from './migrate.js'
 import { buildReflectMessage, consecutiveToolSteps, PLUGIN_SOURCE, REFLECT_MARKER, scanTurn } from './reflect.js'
 import { isMeowSource } from './source.js'
 import { registerMemoryTools, setMemoryToolGate } from './tools.js'
+import { authGate, connectionAuthOf } from './auth-gate.js'
 import { resolveSlotText, setPromptLang } from './prompt-loader.js'
 
 /** 首次欢迎引导的 seen 记账 id（accessed 通道，非真实记忆 id；releaseSeen 不清除）。 */
@@ -1669,6 +1670,13 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       | { register?: (route: { kind: 'exact'; path: string; handler: (req: unknown, res: unknown) => void }) => () => void }
       | undefined
     if (ws !== undefined && typeof ws.register === 'function') {
+      // #57：动态路由全部过鉴权闸（与官方 /api 同闸）——webServer.register 不经过
+      // dsh-client-connection 的鉴权层，裸注册曾跨站可读可写。连接服务整个缺失时
+      // 保守 503（鉴权不可用就宁可不可用）。静态资源型路由（本插件无）保持开放。
+      const connection = connectionAuthOf(ctx)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const gated = (handler: (req: any, res: any) => void): ((req: unknown, res: unknown) => void) =>
+        authGate(connection, handler) as (req: unknown, res: unknown) => void
       const registerOne = (route: { kind: 'exact'; path: string; handler: (req: unknown, res: unknown) => void }): void => {
         try {
           routeDisposers.push(ctx.effect(() => ws.register(route)))
@@ -1679,7 +1687,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       registerOne({
         kind: 'exact',
         path: '/meow-memory/dreamed-sessions',
-        handler: (_req, res) => {
+        handler: gated((_req, res) => {
           void (async () => {
             try {
               const sessionPersistence = (ctx as { get?: (name: string) => unknown }).get?.('sessionPersistence') as
@@ -1692,12 +1700,12 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
               writeJson(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) })
             }
           })()
-        },
+        }),
       })
       registerOne({
         kind: 'exact',
         path: '/meow-memory/dream-events',
-        handler: (req, res) => broadcast.handle(req as never, res as never),
+        handler: gated((req, res) => broadcast.handle(req as never, res as never)),
       })
       // 记忆参与门控（v0.16.0 跳过 dream → v0.30.0 三档门控，issue #38 的数据面）：
       //    - GET  /meow-memory/skip-dreams → { sessionIds, scopes }（全部已知工作区
@@ -1709,7 +1717,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       registerOne({
         kind: 'exact',
         path: '/meow-memory/skip-dreams',
-        handler: (req, res) => {
+        handler: gated((req, res) => {
           void (async () => {
             try {
               if ((req as { method?: string }).method === 'POST') {
@@ -1757,9 +1765,9 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
               writeJson(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) })
             }
           })()
-        },
+        }),
       })
-      ctx.logger.info('meow-memory: dreamed-sessions snapshot + dream-events SSE + skip-dreams routes registered')
+      ctx.logger.info('meow-memory: dreamed-sessions snapshot + dream-events SSE + skip-dreams routes registered (behind auth gate)')
       return
     }
     if (attempt < 20) {
@@ -1970,4 +1978,5 @@ export { tokenize, stemEn, search, findSimilar, topicDrift, recencyWeight } from
 export { fillTemplate, keyedValue, resolveSlotText, setPromptLang, getPromptLang, DEFAULT_LANG, SLOTS } from './prompt-loader.js'
 export { DEFAULT_HOME_DIR, activeHomeDir, setActiveHomeDir, dshHomeDir, pluginRootDir, homeDirPresets, resolveHomeDir, switchHomeDir, type HomeDirSwitch } from './home-dir.js'
 export { setMemoryToolGate, registerMemoryTools } from './tools.js'
+export { authGate, connectionAuthOf } from './auth-gate.js'
 export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, handleMemoryTurnFailure, dreamSweepTick, dreamCommandDefinition, isSubagentAgent, dreamSweepOnce, type DreamConfig } from './dream.js'

@@ -32,13 +32,27 @@
 
 - `sessionController.resolveAgent` 返回不认识的形状时：记一次日志、本周期跳过、下个 sweep 重试——不再落进 unusable-agent 分支被永久跳过（误标会把窗口的 auto-dream 静默禁用到进程重启且现场无从排查）。控制器路径补 `via sessionController` 日志，现场确认恢复路径用（#49/#48 验证看这条）。顺带：`resolveAgent` 返回 null 不再 TypeError。
 
+### 安全：webServer 直注册路由接入鉴权闸（#57）
+
+- `/meow-memory/dreamed-sessions`、`/dream-events`、`/skip-dreams` 三条路由此前经 `webServer.register` 裸注册、不经过 dsh-client-connection 的鉴权层——跨站可读会话元数据、可写参与门控（同机接了栅栏的插件为 401/403，本插件 200）。
+- 现在与官方 /api 同闸：dsh ≥0.1.5 走 `connection.requestRejection`；≤0.1.2 逐语义复刻旧版 Host fence（loopback/trustedHosts/sec-fetch-site/Origin 同源）；connection 服务整个缺失时保守 503（鉴权不可用宁可不可用）。实现与 dsh-meow-smooth 的 auth-gate 同源（其真机验证过的版本）。
+
+### 修复：dream 轮次计划漂移（#69）
+
+- `group_idx` 是纯位置下标，而 advance 每轮重算 `collectDreamRounds()`——整理中新建记忆会改变 rounds 长度/顺序，索引漂移 = 重复 topic、跳过 atomic，且日志看起来正常（groups 数对得上）。
+- 现在 start 时把轮次计划快照进 `dream_meta`（`dreamplan:<sid>`），advance 按快照推进：每条目标条目恰好被访问一次；整理中新建的记忆留给下一次 dream。快照随 finish/release 清理；升级瞬间旧 dream 在途 / meta 丢失时回退重算（行为同旧版）。
+
+### 新增：memory_search 可解释检索（#51）
+
+- 新增 `explain` 参数（默认关）：开=true 时每条命中附带分项得分 `explain`——bm25 关键词原始分、importance、recencyWeight（艾宾浩斯权重，importance≥3 或分数贴近榜首时恒 1）、status（状态过滤是检索前二值过滤，不进打分，在此补齐）。只加字段不改排序，平时返回不变胖。
+
 ### 文档
 
 - troubleshooting / 常见问题补 `@deepseek-ai/schemastery` peer 依赖说明（#59 跟进）与目录切换持久化说明；memory_home 工具描述（三语）补持久化语义。
 
 ### 测试
 
-- host 539→561（#68 / #67 / #62 / #56 / #61 / #70 / 形状守卫各一批）；client-i18n 66→69（热重载幂等）。顺带修掉测试里 DSH_HOME 还原未守卫 undefined 的暗坑（undefined 被存成字符串 "undefined"，此前无人读所以无感，#70 指针把它放大成了 CWD 下的杂散目录）。全量 exit=0。
+- host 539→579（#68 / #67 / #62 / #56 / #61 / #70 / 形状守卫 / #57 鉴权闸 12 条 / #69 计划快照 / #51 explain 各一批）；client-i18n 66→69（热重载幂等）。顺带修掉测试里 DSH_HOME 还原未守卫 undefined 的暗坑（undefined 被存成字符串 "undefined"，此前无人读所以无感，#70 指针把它放大成了 CWD 下的杂散目录）。全量 exit=0。
 
 ## v0.31.0 (2026-10-07)
 
