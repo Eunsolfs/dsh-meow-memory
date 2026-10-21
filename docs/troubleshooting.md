@@ -31,6 +31,10 @@ This package compiles itself through a `prepare` script (`node build.mjs`) on in
 
 3. Restart `dsh web`. New sessions pick up the plugin automatically.
 
+### A note on the `@deepseek-ai/schemastery` peer dependency
+
+The plugin declares `@deepseek-ai/schemastery` as a **peerDependency** and keeps it external at build time: the config schema must be built by the same constructor the running DSH Host uses, so volatile root references behave identically on both sides. When installed through the dsh plugin channel / profile bundles, the Host resolves it — nothing to do. When installed standalone via npm, npm 7+ auto-installs a second copy for the peer; schema validation then runs against the plugin's own copy. If the settings page and the plugin ever disagree about schema behavior, prefer the dsh plugin channel install.
+
 ### Remove
 
 ```sh
@@ -120,6 +124,8 @@ List it in `disabledWorkspaces`: cwd is matched exactly (path normalisation: uni
 ### How do I switch the global data directory?
 
 Just tell the AI (the `memory_home` tool) — no code and no restart. Or set a preset marker / absolute path in the settings page or the `homeDir` field.
+
+A switch persists across restarts: on success the tool writes a pointer file at `$DSH_HOME/storages/meow-memory-home.json`, which startup reads back (explicit `homeDir` config and the `MEOW_MEMORY_HOME` env still take precedence). A missing/corrupt pointer or a deleted target silently falls back to the platform default.
 
 A switch = same-volume move / cross-volume copy; **the old directory is never deleted automatically**; if the target already holds content it is enabled as-is without overwriting; an invalid `target` never switches by mistake (it reports clearly and keeps the current directory); a failure leaves data untouched and can be retried later.
 

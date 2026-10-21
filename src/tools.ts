@@ -432,8 +432,11 @@ function searchTool(dir: string): ToolDefinition {
         ? parsed.level.split(',').map((s) => s.trim()).filter((s): s is Level => (LEVELS as readonly string[]).includes(s))
         : (['fact', 'lesson', 'topic', 'rules'] as Level[])
       const rows = levels.flatMap((lv) => {
-        // 单一非默认 status → db 层过滤；多选 → 全量取出后 filterSearchable 过滤；默认 active（+todo stale）。
-        if (statusList.length === 1 && statusList[0] !== 'active' && statusList[0] !== 'all') return db.list(lv, { status: statusList[0] as MemoryRow['status'] })
+        // 'all' = 不过滤 → 全量直出（#68：listSearchable 只出 active+todo-stale，
+        // archived 在 db 层就被滤掉，"all" 名不符实）。单一非默认 status → db 层过滤；
+        // 多选 → 全量取出后 filterSearchable 过滤；默认 active（+todo stale）。
+        if (statusList.includes('all')) return db.list(lv)
+        if (statusList.length === 1 && statusList[0] !== 'active') return db.list(lv, { status: statusList[0] as MemoryRow['status'] })
         if (statusList.length > 1) return db.list(lv)
         return db.listSearchable(lv)
       })
@@ -707,7 +710,16 @@ function updateTool(dir: string): ToolDefinition {
       if (!workspace) throw new Error('memory_update: 无法确定工作区（会话无 cwd）')
       const db = getDb(workspace, dir)
       const sessionId = sessionIdOf(exec)
-      const found = db.findById(id)
+      // 写路径必须歧义拒绝（#62）：findById 取首条 + 拿解析出的全 id 去 update，
+      // 会绕过 db.update 内部的 LIKE 歧义守卫、静默改错条目。多命中 → 报错列候选。
+      const matches = db.findByIdAll(id)
+      if (matches.length > 1) {
+        const list = matches
+          .map((m) => `${m.level}:${m.row.id.slice(0, 8)} ${m.row.title || m.row.content.slice(0, 40)}`)
+          .join('；')
+        throw new Error(`memory_update: 短 id "${id}" 命中 ${matches.length} 条（${list}），请改用完整 id`)
+      }
+      const found = matches[0]
       if (!found) return { ok: false, id, level: '' }
       const patch: MemoryPatch = {}
       if (typeof parsed.content === 'string' && parsed.content.trim()) patch.content = parsed.content.trim()

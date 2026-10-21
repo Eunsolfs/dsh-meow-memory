@@ -13,7 +13,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { Doc } from './bm25.js'
 import { keywordHitScore, search, tokenize } from './bm25.js'
-import { isGlobalProject, isGlobalScope, memoryDbPath, projectCovers, projectLabel, relativeTime, PROJECT_SUBCATEGORIES, type MemoryDb, type MemoryRow, type ProjectSubcategory } from './db.js'
+import { isGlobalProject, isGlobalScope, memoryDbPath, projectCovers, projectLabel, projectList, relativeTime, PROJECT_SUBCATEGORIES, type MemoryDb, type MemoryRow, type ProjectSubcategory } from './db.js'
 import { fillTemplate, keyedValue } from './prompt-loader.js'
 
 export interface InjectOptions {
@@ -26,7 +26,11 @@ export interface InjectOptions {
 const DEFAULT_OPTS: InjectOptions = { hitTopK: 2, titleMax: 40 }
 
 export function sessionsFile(workspace: string, sessionId: string, dir = '.dsh-meow'): string {
-  return join(workspace, dir, 'sessions', `${sessionId}.json`)
+  // 会话 id 可能含 Windows 文件名非法字符（#56：飞书桥 lark-link:dm:…:0 的冒号）——
+  // 读写全部 ENOENT。非安全字符做百分号编码：确定性（跨重启同 id 同文件）、无碰撞
+  // （% 编码与原字符不重叠）、安全字符原样（既有会话文件不失效）。
+  const safe = sessionId.replace(/[^A-Za-z0-9._-]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0')}`)
+  return join(workspace, dir, 'sessions', `${safe}.json`)
 }
 
 /** 会话记忆可见集：injected=注入过的，searched=search/find_similar 返回过的，
@@ -345,7 +349,10 @@ function fmtProjectRow(r: MemoryRow): string {
  */
 /** 内部构造：段落文本 + 段内出现过的全部条目 id（压缩重注入第三块按此去重，防同块重复展示）。 */
 function buildProjectSection(db: MemoryDb, workspace: string, project: string, dir: string): { text: string; ids: string[] } | null {
-  const rows = db.list('project', { project }).filter((r) => r.project === project)
+  // 项目视图按名单语义匹配（#61）：project 字段写多项目名（'dsh,femo'）的条目，
+  // 在任一名单项目的视图都该可见——SQL 精确等值会把两边都漏掉。全局标记/未标记
+  // projectList 为空、不命中任何具体项目名，保持「全局内容走快照层」的原语义。
+  const rows = db.list('project').filter((r) => projectList(r.project).includes(project))
   const ids: string[] = []
   const render = (list: MemoryRow[]): string => {
     for (const r of list) ids.push(r.id)
@@ -369,7 +376,7 @@ function buildProjectSection(db: MemoryDb, workspace: string, project: string, d
   const sections: string[] = []
   // 项目设计原则（rules，project 特定）：放最前——规则优先于事实。
   const projectRules = sortByUpdatedAt(
-    db.list('rules', { project }).filter((r) => r.project === project && r.status === 'active'),
+    db.list('rules').filter((r) => projectList(r.project).includes(project) && r.status === 'active'),
   )
   if (projectRules.length > 0) {
     sections.push(`${lbl('inject.rules')}\n${render(projectRules)}`)
@@ -532,7 +539,8 @@ function hitQuery(
   o: InjectOptions,
   dir: string,
 ): Array<{ id: string; level: string; content: string; updated_at: number | null }> {
-  const currentProject = readSeenFile(workspace, sessionId, dir).currentProject
+  const seenState = readSeenFile(workspace, sessionId, dir)
+  const currentProject = seenState.currentProject
   const hitRows = [
     ...db.list('fact', { status: 'active' }),
     ...db.list('lesson', { status: 'active' }),
@@ -540,8 +548,9 @@ function hitQuery(
     ...db.list('topic', { status: 'active' }),
   ].filter((r) =>
     (isGlobalScope(r.project) || (currentProject !== null && projectCovers(r.project, currentProject)))
-    && r.source_session !== sessionId, // 本 session 建立的记忆在上下文里，不命中
-  )
+    && r.source_session !== sessionId // 本 session 建立的记忆在上下文里，不命中
+    && !seenState.injected.includes(r.id), // 已注入先排除再截断（#67）：先 hitTopK 后过滤，
+  ) // top-K 被旧命中占满时本轮会颗粒无收，注入数恒低于上限
   if (hitRows.length === 0) return []
   const query = userText.slice(0, 500)
   const docs = toDocs(hitRows).map((d) => ({
@@ -553,8 +562,8 @@ function hitQuery(
   const hits = keywordHitScore(query, docs, { k: o.hitTopK })
   const byId = new Map(hitRows.map((r) => [r.id, r]))
   // 展示/注入用原文 content（docs 的 content 只是 keywords 匹配面，不能当正文）。
+  // 已注入的进入本函数前就排掉了（#67），这里不再二次过滤。
   return hits
-    .filter((h) => !readInjected(workspace, sessionId, dir).includes(h.id))
     .map((h) => {
       const row = byId.get(h.id)
       return { id: h.id, level: h.level, content: row?.content ?? h.content, project: row?.project ?? null, updated_at: row?.updated_at ?? null }

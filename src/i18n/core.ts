@@ -243,6 +243,13 @@ export function installI18n(ctx: LocaleHostContext, warn: (message: string) => v
       registeredLocales.add(locale.id)
       done.push(locale.id)
     } catch (error) {
+      // 热重载（cordis _reload）起新模块实例：上面的幂等集随模块重置，而宿主侧语言
+      // 目录仍在——「已注册」按幂等成功处理（#54），只告警真正的失败，不再每轮刷黄字。
+      if (String(error).includes('already')) {
+        registeredLocales.add(locale.id)
+        done.push(locale.id)
+        continue
+      }
       warn(`[meow-memory] 语言 "${locale.id}" 注册失败（UI 退回英文/中文）：${String(error)}`)
     }
   }
@@ -254,6 +261,11 @@ export function installI18n(ctx: LocaleHostContext, warn: (message: string) => v
       svc.register(NS, locale.id, { ...dict })
       registeredDicts.add(locale.id)
     } catch (error) {
+      // 同上（#54）：热重载后宿主侧字典仍在，「已注册」按幂等成功处理。
+      if (String(error).includes('already')) {
+        registeredDicts.add(locale.id)
+        continue
+      }
       warn(`[meow-memory] 界面字典 "${locale.id}" 注册失败（该语言退回英文）：${String(error)}`)
     }
   }

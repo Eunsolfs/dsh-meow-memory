@@ -13,7 +13,7 @@
  * - 目标目录非空时绝不覆盖（视为已迁过/有意为之，直接启用）；
  * - 任何一步失败留在原目录照常跑，绝不影响插件启动。
  */
-import { cpSync, existsSync, mkdirSync, readdirSync, renameSync, rmdirSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -33,7 +33,33 @@ function envHomeDir(): string | undefined {
   return r
 }
 
-let active = envHomeDir() ?? DEFAULT_HOME_DIR
+/** home-dir 指针（#70）：memory_home 切换只改进程内 active，重启即回退——切换成功时
+ *  在稳定位置（$DSH_HOME/storages/，不随目录搬走）落一份指针，启动时读回。
+ *  优先级：显式配置 > MEOW_MEMORY_HOME env > 指针 > 平台默认——env 是显式部署意图，
+ *  压过指针；指针只兜「工具切过、无配置」的常规路径。文件缺失/损坏/目标已删/非法
+ *  路径一律静默回退，绝不影响启动。 */
+function homePointerFile(): string {
+  return join(dshHomeDir(), 'storages', 'meow-memory-home.json')
+}
+
+function readHomePointer(): string | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(homePointerFile(), 'utf8')) as { homeDir?: unknown }
+    if (typeof parsed.homeDir !== 'string') return undefined
+    const r = resolve(parsed.homeDir.trim())
+    if (!isAbsolute(r) || r === dirname(r) || r === resolve(homedir()) || !existsSync(r)) return undefined
+    return r
+  } catch {
+    return undefined
+  }
+}
+
+/** 无显式配置时的回落链：env > 稳定位置指针 > 平台默认。 */
+function fallbackHomeDir(): string {
+  return envHomeDir() ?? readHomePointer() ?? DEFAULT_HOME_DIR
+}
+
+let active = fallbackHomeDir()
 
 /** 当前生效的全局目录（所有消费方唯一取值口）。 */
 export function activeHomeDir(): string {
@@ -71,14 +97,14 @@ export function homeDirPresets(): Record<string, string> {
  *  非法自定义（空、相对路径、盘根、用户主目录本身）一律回落——迁移动作会把文件
  *  搬进目标，指向根级目录太危险，宁可不切。 */
 export function resolveHomeDir(value: unknown): string {
-  if (typeof value !== 'string') return envHomeDir() ?? DEFAULT_HOME_DIR
+  if (typeof value !== 'string') return fallbackHomeDir()
   const v = value.trim()
-  if (v === '' || v === 'default') return envHomeDir() ?? DEFAULT_HOME_DIR
+  if (v === '' || v === 'default') return fallbackHomeDir()
   if (v === 'dsh-storage' || v === 'plugin-root') return homeDirPresets()[v]
-  if (!isAbsolute(v)) return envHomeDir() ?? DEFAULT_HOME_DIR
+  if (!isAbsolute(v)) return fallbackHomeDir()
   const r = resolve(v)
-  if (r === dirname(r)) return envHomeDir() ?? DEFAULT_HOME_DIR // 盘根（dirname(盘根)==盘根）
-  if (r === resolve(homedir())) return envHomeDir() ?? DEFAULT_HOME_DIR // 用户主目录本身
+  if (r === dirname(r)) return fallbackHomeDir() // 盘根（dirname(盘根)==盘根）
+  if (r === resolve(homedir())) return fallbackHomeDir() // 用户主目录本身
   return r
 }
 
@@ -151,6 +177,21 @@ export function switchHomeDir(target: string, now = new Date().toISOString()): H
       cpSync(from, to, { recursive: true, force: false, errorOnExist: false })
     }
     active = to
+    // 稳定位置指针（#70）：跨重启持久化本次切换。基址非绝对路径（env 被污染成垃圾值）
+    // 或写失败都不影响切换本身。
+    try {
+      const ptr = homePointerFile()
+      if (isAbsolute(ptr)) {
+        mkdirSync(dirname(ptr), { recursive: true })
+        writeFileSync(
+          ptr,
+          JSON.stringify({ homeDir: to, migratedFrom: from, migratedAt: now, mode, files }, null, 1),
+          'utf8',
+        )
+      }
+    } catch {
+      /* 指针失败不影响切换 */
+    }
     try {
       writeFileSync(
         join(to, 'home-dir.json'),
