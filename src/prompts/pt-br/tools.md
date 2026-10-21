@@ -25,11 +25,13 @@
 - memory_search.param.days: Apenas entradas criadas nos últimos N dias (por tempo de criação).
 - memory_search.param.k: Número máximo de resultados.
 - memory_search.param.content_max: Trunca o content de cada entrada neste comprimento, 0=texto completo.
+- memory_search.param.explain: Interruptor de recuperação explicável (padrão desativado). Com true, cada hit traz uma decomposição de pontuação em explain (pontuação bm25 de palavras-chave, importance, peso recencyWeight de Ebbinghaus, status), para depurar "por que não foi recuperado / por que foi recuperado"; a ordem não muda.
 - memory_search.out.note: Nota de conflito.
 - memory_search.out.hits.id: id completo da memória (passe-o para memory_read/memory_update/memory_find_similar).
 - memory_search.out.hits.keywords: As palavras-chave da entrada (extraídas por um LLM ou automaticamente).
 - memory_search.out.hits.project: Projeto ao qual a entrada pertence; ""=sem rótulo; entradas aplicáveis globalmente mostram "global".
 - memory_search.out.hits.updated_at: Timestamp da memória (última atualização, em milissegundos).
+- memory_search.out.hits.explain: Pontuação bruta BM25 de palavras-chave (importance/recencyWeight/status voltam juntos no mesmo objeto).
 
 ### memory_find_similar
 

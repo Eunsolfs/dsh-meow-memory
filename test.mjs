@@ -82,6 +82,8 @@ import {
   homeDirPresets,
   resolveHomeDir,
   switchHomeDir,
+  authGate,
+  connectionAuthOf,
 } from './lib/index.js'
 
 let passed = 0
@@ -890,6 +892,29 @@ advanceDream(agent2, '.dsh-meow')
 check('advanceDream finalizes after last round', dbOrphan.getDreamLease('win-orphan') === null)
 dbOrphan.close()
 
+// #69：轮次计划 start 快照——整理中新建记忆不再让位置索引漂移（重复 topic / 跳过 atomic）
+{
+  const wsPlan = mkdtempSync(join(tmpdir(), 'mm-plan-'))
+  const dbPlan = new MemoryDb(memoryDbPath(wsPlan))
+  dbPlan.touchWindow('win-plan', wsPlan, Date.now())
+  dbPlan.insert({ level: 'topic', content: '计划漂移话题', title: '漂移T', source_session: 'win-plan' })
+  // start 时 atomic 为空 → 计划 = [topic]
+  const steeredPlan = []
+  const agentPlan = { session: { header: { id: 'win-plan', cwd: wsPlan } }, steer: (m) => steeredPlan.push(m) }
+  check('plan: startWindowDream starts', startWindowDream({}, agentPlan, wsPlan, '.dsh-meow') === true)
+  check('plan: rounds snapshot stored at start (#69)', typeof dbPlan.getDreamMeta('dreamplan:win-plan') === 'string' && JSON.parse(dbPlan.getDreamMeta('dreamplan:win-plan')).length === 1)
+  // dream 进行中新建 atomic 记忆：旧代码下轮重算会把计划撑长、group_idx 漂移 → 重复 topic
+  // （steeredPlan[0] 是 start 时第 0 轮本身——sendMemoryTurn 经 steer 下发）
+  dbPlan.insert({ level: 'fact', content: '整理中新建的原子记忆', source_session: 'win-plan' })
+  advanceDream(agentPlan, '.dsh-meow')
+  check('plan: no index drift — finishes instead of duplicating a round (#69)',
+    dbPlan.getDreamLease('win-plan') === null && steeredPlan.length === 1, `steered=${steeredPlan.length}`)
+  check('plan: snapshot cleaned on finish (#69)', dbPlan.getDreamMeta('dreamplan:win-plan') === undefined)
+  dbPlan.close()
+  closeAllDbs() // startWindowDream/advanceDream 内部 getDb 的缓存实例还开着（Windows 文件锁）
+  rmSync(wsPlan, { recursive: true, force: true })
+}
+
 
 // ── recall 增强：find_similar / seen 排除 ───────────────────────────────────
 const wsR = mkdtempSync(join(tmpdir(), 'mm-recall-'))
@@ -1205,6 +1230,26 @@ const sAll = await searchTool.execute({ query: '多选测试', status: 'all' }, 
 check('search status=all sees archived (#68)', sAll.hits.some((h) => h.id === archivedRow.id))
 const sArch = await searchTool.execute({ query: '多选测试', status: 'archived' }, execCtx)
 check('search status=archived single filter (#68)', sArch.hits.length >= 1 && sArch.hits.some((h) => h.id === archivedRow.id) && sArch.hits.every((h) => h.id === archivedRow.id))
+
+// #51：可解释检索——explain=true 时每条命中带分项得分；默认不带
+{
+  const wsE = mkdtempSync(join(tmpdir(), 'mm-explain-'))
+  const dbE = getDb(wsE, '.dsh-meow')
+  dbE.insert({ level: 'fact', content: '解释检索测试 独特词源', project: 'dsh', created_at: Date.now() })
+  const execE = { agent: { session: { header: { cwd: wsE, id: 't-explain' } } } }
+  const withE = await searchTool.execute({ query: '解释检索测试', explain: true }, execE)
+  const hitE = withE.hits[0]
+  check('search explain=true carries breakdown (#51)', hitE !== undefined && hitE.explain !== undefined &&
+    typeof hitE.explain.bm25 === 'number' && hitE.explain.bm25 > 0 &&
+    hitE.explain.status === 'active' && hitE.explain.recencyWeight > 0, JSON.stringify(hitE))
+  check('search explain breakdown: score ≈ bm25 × recencyWeight (#51)',
+    Math.abs(hitE.explain.bm25 * hitE.explain.recencyWeight - hitE.score) < 0.02,
+    JSON.stringify({ bm25: hitE.explain.bm25, rw: hitE.explain.recencyWeight, score: hitE.score }))
+  const noE = await searchTool.execute({ query: '解释检索测试' }, execE)
+  check('search default: no explain field (#51)', noE.hits[0] !== undefined && noE.hits[0].explain === undefined)
+  dbE.close()
+  rmSync(wsE, { recursive: true, force: true })
+}
 const searchRender = searchTool.output.render({}, { note: '', hits: [{ level: 'fact', id: '0msum4ifx-bf3a-0000000000000000000000', project: 'dsh', content: 'x', keywords: ['dream', '机制'], updated_at: Date.now() - 2 * 86_400_000 }] })
 check('search shows keywords + relative time, no content', searchRender.some((b) => b.text.includes('[dsh : fact]') && b.text.includes('关于：dream, 机制') && b.text.includes('2 天前') && !b.text.includes('记忆时间戳')))
 
@@ -2415,6 +2460,51 @@ rmSync(wsNoDb, { recursive: true, force: true })
 
   setActiveHomeDir(savedReal)
   rmSync(tmp, { recursive: true, force: true })
+}
+
+// ── #57：webServer 直注册路由的鉴权闸（与官方 /api 同闸；smooth auth-gate 同源实现）──
+{
+  const makeRes = () => {
+    const state = { code: null, body: '' }
+    return {
+      get statusCode() { return state.code },
+      get bodyText() { return state.body },
+      writeHead(c) { state.code = c },
+      end(b) { state.body = b ?? '' },
+    }
+  }
+  const mustNotRun = () => { throw new Error('handler must not run') }
+
+  // 0.1.5+：requestRejection 语义——403/401 原样短路，undefined 放行
+  const g403 = makeRes()
+  authGate({ requestRejection: () => 403 }, mustNotRun)({}, g403)
+  check('authGate: requestRejection 403 short-circuits (#57)', g403.statusCode === 403)
+  const g401 = makeRes()
+  authGate({ requestRejection: () => 401 }, mustNotRun)({}, g401)
+  check('authGate: requestRejection 401 short-circuits (#57)', g401.statusCode === 401)
+  let ran = false
+  authGate({ requestRejection: () => undefined }, () => { ran = true })({}, makeRes())
+  check('authGate: passes through when not rejected (#57)', ran)
+  const g503 = makeRes()
+  authGate(undefined, mustNotRun)({}, g503)
+  check('authGate: missing connection service → conservative 503 (#57)', g503.statusCode === 503)
+
+  // 旧宿主（≤0.1.2）Host fence：loopback 放行；cross-site / 非 loopback 不在名单 / 异源 Origin 403
+  const legacy = (headers) => {
+    const r = makeRes()
+    let passed = false
+    authGate({ trustedHosts: ['192.168.1.10'] }, () => { passed = true })({ headers }, r)
+    return { passed, code: r.statusCode }
+  }
+  check('authGate legacy: loopback passes (#57)', legacy({ host: '127.0.0.1:19387' }).passed)
+  check('authGate legacy: cross-site 403 (#57)', legacy({ host: '127.0.0.1:19387', 'sec-fetch-site': 'cross-site', origin: 'https://evil.example' }).code === 403)
+  check('authGate legacy: non-loopback host not in list 403 (#57)', legacy({ host: 'evil.example:80' }).code === 403)
+  check('authGate legacy: trustedHosts entry passes (#57)', legacy({ host: '192.168.1.10:19387' }).passed)
+  check('authGate legacy: cross-origin origin header 403 (#57)', legacy({ host: '127.0.0.1:19387', origin: 'https://evil.example' }).code === 403)
+
+  // connectionAuthOf：属性访问优先，ctx.get 回退
+  check('connectionAuthOf: property access (#57)', connectionAuthOf({ connection: { requestRejection: () => undefined } }) !== undefined)
+  check('connectionAuthOf: ctx.get fallback (#57)', connectionAuthOf({ get: (n) => (n === 'connection' ? { requestRejection: () => 403 } : undefined) }) !== undefined)
 }
 
 console.log(`\n${passed} passed, ${failed} failed`)

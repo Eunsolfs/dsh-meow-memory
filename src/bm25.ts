@@ -228,12 +228,19 @@ export interface RankedHit {
   importance: number
   updated_at: number
   score: number
+  /** 分项得分（#51，explain=true 时才有）：bm25=关键词原始分、importance=条目重要度、
+   *  recencyWeight=艾宾浩斯权重（importance≥3 或分数贴近榜首时不衰减，恒 1）、
+   *  score=最终分（bm25 × recencyWeight）。状态过滤（active/stale）是检索前的二值
+   *  过滤、不进打分，工具层在 explain 里补 status 字段。 */
+  explain?: { bm25: number; importance: number; recencyWeight: number; score: number }
 }
 
 export interface SearchOptions {
   k?: number
   /** 相对当前时间；null 表示不衰减（测试/手动检索可关）。 */
   now?: number | null
+  /** 附带每条命中的分项得分（#51 可解释检索）：只加字段，不改排序。 */
+  explain?: boolean
 }
 
 /**
@@ -295,6 +302,9 @@ export function search(query: string, docs: Doc[], opts: SearchOptions = {}): Ra
       importance: docs[di].importance,
       updated_at: docs[di].updated_at,
       score: raw[di] * w,
+      ...(opts.explain === true
+        ? { explain: { bm25: Math.round(raw[di] * 1000) / 1000, importance: docs[di].importance, recencyWeight: Math.round(w * 1000) / 1000, score: Math.round(raw[di] * w * 1000) / 1000 } }
+        : {}),
     })
   }
   hits.sort((a, b) => b.score - a.score)

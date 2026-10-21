@@ -356,6 +356,7 @@ function searchTool(dir: string): ToolDefinition {
         days: { type: 'integer', minimum: 1, maximum: 3650, description: T('memory_search.param.days') },
         k: { type: 'integer', minimum: 1, maximum: 50, default: 10, description: T('memory_search.param.k') },
         content_max: { type: 'integer', minimum: 0, maximum: 5000, default: 300, description: T('memory_search.param.content_max') },
+        explain: { type: 'boolean', default: false, description: T('memory_search.param.explain') },
       },
     },
     output: {
@@ -380,6 +381,17 @@ function searchTool(dir: string): ToolDefinition {
                 project: { type: 'string', description: T('memory_search.out.hits.project') },
                 score: { type: 'number' },
                 updated_at: { type: 'number', description: T('memory_search.out.hits.updated_at') },
+                explain: {
+                  type: 'object',
+                  additionalProperties: false,
+                  required: ['bm25', 'importance', 'recencyWeight', 'status'],
+                  properties: {
+                    bm25: { type: 'number', description: T('memory_search.out.hits.explain') },
+                    importance: { type: 'number' },
+                    recencyWeight: { type: 'number' },
+                    status: { type: 'string' },
+                  },
+                },
               },
             },
           },
@@ -402,7 +414,8 @@ function searchTool(dir: string): ToolDefinition {
     },
     async execute(args: unknown, exec: ToolRunContext) {
       refuseOrThrow('read', exec)
-      const parsed = args as { query?: unknown; level?: unknown; project?: unknown; status?: unknown; days?: unknown; k?: unknown; content_max?: unknown }
+      const parsed = args as { query?: unknown; level?: unknown; project?: unknown; status?: unknown; days?: unknown; k?: unknown; content_max?: unknown; explain?: unknown }
+      const explain = parsed.explain === true
       const query = typeof parsed.query === 'string' ? parsed.query.trim() : ''
       if (!query) throw new Error('memory_search: query 必填且不能为空（例：{"query": "关键词"}）；浏览项目全貌请用 memory_project')
       const workspace = workspaceOf(exec)
@@ -456,7 +469,7 @@ function searchTool(dir: string): ToolDefinition {
       // 全量排名（分高到低）后分段选取（用户拍板 2026-08-19）：
       //   前 5 条无脑取（不排除任何记忆，含已见/本 session 建立的）；
       //   第 6 名起逐个往下，绕开已见（injected+searched）的记忆补足，保证新信息。
-      const ranked = search(query, docs, { k: docs.length })
+      const ranked = search(query, docs, { k: docs.length, explain })
       const blindCount = Math.min(5, k)
       const blind = ranked.slice(0, blindCount)
       const fresh: RankedHit[] = []
@@ -483,6 +496,18 @@ function searchTool(dir: string): ToolDefinition {
             project: row?.project ?? '',
             score: Math.round(h.score * 100) / 100,
             updated_at: h.updated_at ?? 0,
+            // 可解释检索（#51）：explain=true 时附分项得分。状态过滤是检索前的二值
+            // 过滤、不进打分——这里补 status 字段让分解完整。
+            ...(explain
+              ? {
+                  explain: {
+                    bm25: h.explain?.bm25 ?? 0,
+                    importance: row?.importance ?? 0,
+                    recencyWeight: h.explain?.recencyWeight ?? 1,
+                    status: row?.status ?? 'active',
+                  },
+                }
+              : {}),
           }
         }),
       }

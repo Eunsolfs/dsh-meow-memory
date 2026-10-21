@@ -25,11 +25,13 @@
 - memory_search.param.days: Only entries created in the last N days (by creation time).
 - memory_search.param.k: Maximum number of results.
 - memory_search.param.content_max: Truncate each entry's content to this length, 0=full text.
+- memory_search.param.explain: Explainable-retrieval switch (default off). With true, each hit carries a per-component score breakdown in explain (bm25 keyword score, importance, recencyWeight Ebbinghaus weight, status) to debug "why wasn't this recalled / why was this recalled"; ordering is unchanged.
 - memory_search.out.note: Conflict note.
 - memory_search.out.hits.id: Full memory id (pass it to memory_read/memory_update/memory_find_similar).
 - memory_search.out.hits.keywords: The entry's keywords (extracted by an LLM or automatically).
 - memory_search.out.hits.project: Project the entry belongs to; ""=unlabeled; globally applicable entries read "global".
 - memory_search.out.hits.updated_at: Memory timestamp (last update, in milliseconds).
+- memory_search.out.hits.explain: Raw BM25 keyword score (importance/recencyWeight/status are returned alongside in the same object).
 
 ### memory_find_similar
 
