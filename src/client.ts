@@ -157,6 +157,24 @@ function anchorOf(container: HTMLElement, id: string): HTMLElement | null {
   return container.querySelector<HTMLElement>(`[${ANCHOR_ATTR}="${CSS.escape(id)}"]`)
 }
 
+/** 折叠横条的落点行（#53/#58/#72）：锚点节点在 0.2.x 上可能不渲染——旧格式
+ *  meow 注入 context 被 chat-visibility 排除出可见流，没有自己的行。回退链：
+ *  组内第一个有 DOM 的节点行 → 该 turn 的第一行（宿主原生 turn-trigger 卡或
+ *  用户消息所在行）。找到的都是"往它前面插横条"，不隐藏。 */
+function foldAnchorRow(container: HTMLElement, group: FoldGroup): HTMLElement | null {
+  const exact = flowRow(container, group.id)
+  if (exact !== null) return exact
+  for (const key of group.keys) {
+    const row = flowRow(container, key)
+    if (row !== null) return row
+  }
+  if (typeof group.turn === 'number') {
+    const turnRow = container.querySelector<HTMLElement>(`[data-chat-turn="${group.turn}"]`)
+    if (turnRow !== null) return turnRow
+  }
+  return null
+}
+
 /** 构建/更新一个折叠组的锚点（细条 bar + 展开卡片 body）。
  *  幂等：元素只创建一次，文本仅在变化时写入——重建/反复写文本会触发
  *  MutationObserver → 自我循环（横条被反复替换，点击必然丢失）。 */
@@ -168,7 +186,7 @@ function ensureAnchor(
 ): void {
   let anchor = anchorOf(container, group.id)
   if (anchor === null) {
-    const startRow = flowRow(container, group.id)
+    const startRow = foldAnchorRow(container, group)
     if (startRow === null || startRow.parentElement === null) return
     anchor = document.createElement('div')
     anchor.setAttribute(ANCHOR_ATTR, group.id)
@@ -344,6 +362,23 @@ async function copyInjectionText(button: HTMLButtonElement, text: string): Promi
   }, 1000)
 }
 
+/** 注入横条的落点行（#53/#58/#72）。旧宿主把注入块渲染成独立行 → 直接用节点
+ *  自身的行；dsh 0.2.x 起注入 context 不再单独成行（被 chat-visibility 排除出
+ *  可见流，宿主把内容合并进用户消息）——回退为该 turn 的第一行，横条落在用户
+ *  消息上方，展开仍显示注入全文（全文来自快照，不依赖 DOM 行）。 */
+function injectionRow(
+  container: HTMLElement,
+  group: { id: string; turn?: number },
+): { row: HTMLElement; exact: boolean } | null {
+  const exact = flowRow(container, group.id)
+  if (exact !== null) return { row: exact, exact: true }
+  if (typeof group.turn === 'number') {
+    const turnRow = container.querySelector<HTMLElement>(`[data-chat-turn="${group.turn}"]`)
+    if (turnRow !== null) return { row: turnRow, exact: false }
+  }
+  return null
+}
+
 /** 应用一次注入折叠（首轮长期记忆/关键词命中）：原行隐藏，原位插入
  *  「已注入记忆」横条（点开显示注入全文）+ 用户 prompt 气泡 + 操作行
  *  （复制按钮写 userText 原文 + hover 显隐时钟），样式与本体 UserStyleBubble
@@ -361,14 +396,17 @@ function applyInjectionFold(
       if (!liveIds.has(stale.getAttribute(INJ_ANCHOR_ATTR) ?? '')) stale.remove()
     }
     for (const group of groups) {
-      const startRow = flowRow(container, group.id)
-      if (startRow === null || startRow.parentElement === null) continue
-      startRow.setAttribute(FOLDED_ATTR, 'true') // 原行隐藏
+      const start = injectionRow(container, group)
+      if (start === null || start.row.parentElement === null) continue
+      // 原行隐藏仅限"注入块自己的行"（旧宿主独立行）。0.2.x 回退行是用户消息/
+      // turn 首行——绝不能藏，否则用户消息会整行消失（#72 描述与实现的矛盾处修正）。
+      if (start.exact) start.row.setAttribute(FOLDED_ATTR, 'true')
+      const anchorSlot = start.row
       let anchor = container.querySelector<HTMLElement>(`[${INJ_ANCHOR_ATTR}="${CSS.escape(group.id)}"]`)
       if (anchor === null) {
         anchor = document.createElement('div')
         anchor.setAttribute(INJ_ANCHOR_ATTR, group.id)
-        startRow.parentElement.insertBefore(anchor, startRow)
+        anchorSlot.parentElement.insertBefore(anchor, anchorSlot)
       }
       let bar = anchor.querySelector<HTMLButtonElement>(':scope > button')
       if (bar === null) {

@@ -52,7 +52,7 @@ function snapshot(order, nodes, getTurn) {
   return {
     chat: {
       order,
-      nodes: { get: (k) => nodes.get(k) },
+      nodes: { get: (k) => nodes.get(k), values: () => nodes.values() },
       locations: { getTurn: (t) => getTurn(t) ?? [] },
     },
   }
@@ -100,13 +100,14 @@ console.log('=== 1. 反思轮识别/范围/计数 ===')
 console.log('=== 2. 排除 user/steering、只取起点之后 ===')
 {
   const nodes = new Map([
-    ['user-0', userNode('user-0', turnLoc(4))],
+    ['user-0', userNode('user-0', turnLoc(5))],
     ['ctx-1', contextNode('ctx-1', REFLECT, turnLoc(5))],
     ['asst-1', assistantNode('asst-1', turnLoc(5), 'settled')],
     ['steer-1', steeringNode('steer-1', turnLoc(5))],
     ['tail-1', { key: 'tail-1', kind: 'turn-tail', location: turnLoc(5), data: { turn: 5 } }],
   ])
-  // getTurn(5) 把 user-0 也算进去（异常数据），应被"起点之后"切片排除
+  // 真共享轮：user 消息与反思 prompt 同在 turn 5、且在 prompt 之前——0.2.x 键序
+  // 扫描按节点真实 location 归轮（比旧 getTurn 更准），切片从锚点起、排除 user/steering。
   const s = snapshot(
     ['user-0', 'ctx-1', 'asst-1', 'steer-1', 'tail-1'],
     nodes,
@@ -438,6 +439,66 @@ console.log('=== 12. turn-trigger 形态 ===')
   const other = mk('turn-trigger')
   other.chat.nodes.get('ctx-1').data = { ...other.chat.nodes.get('ctx-1').data, source: { kind: 'plugin', plugin: 'other' } }
   check('turn-trigger + 别的插件 source 不误判', computeFoldGroups(other).length === 0)
+}
+
+// ---- 6. 0.2.x：order 漏节点 / getTurn 键集失配（#53/#58/#72） ----
+console.log('=== 6. 0.2.x：order 缺节点、getTurn 失配 ===')
+{
+  const nodes = new Map([
+    ['user-0', userNode('user-0', turnLoc(3))],
+    ['asst-0', assistantNode('asst-0', turnLoc(3), 'settled')],
+    ['ctx-1', contextNode('ctx-1', REFLECT, turnLoc(4))],
+    ['tool-1', toolNode('tool-1', turnLoc(4), 'memory_remember')],
+    ['tail-1', { key: 'tail-1', kind: 'turn-tail', location: turnLoc(4), data: { turn: 4 } }],
+  ])
+  // 0.2.x 实况（探针实证）：注入的 context 节点被 chat-visibility 排除，不在
+  // order 里；locations.getTurn 从 order 重建、给出的键集与节点 key 对不上。
+  const s = snapshot(['user-0', 'asst-0'], nodes, () => ['turn-4'])
+  const groups = computeFoldGroups(s)
+  check('order 缺节点时仍能找到反思轮锚点', groups.length === 1 && groups[0].variant === 'reflect')
+  check('getTurn 失配时范围仍覆盖本轮（含 memory_remember 计数）',
+    groups.length === 1 && groups[0].rememberCount === 1 && groups[0].keys.includes('ctx-1'))
+  check('组带 turn（DOM 侧回退落横条用）', groups.length === 1 && groups[0].turn === 4)
+  const turns = memoryTurnNumbers(s)
+  check('memoryTurnNumbers 也认不在 order 里的节点', turns.size === 1 && turns.has(4))
+
+  const injNodes = new Map([
+    ['ctx-hit', {
+      key: 'ctx-hit', kind: 'context', location: turnLoc(2),
+      data: {
+        source: {
+          kind: 'plugin', plugin: 'meow-memory', form: 'snapshot',
+          sections: [{ name: '__meta__', text: JSON.stringify({ kind: 'hit', ids: [] }) }],
+        },
+        content: [{ type: 'text', text: '可能相关的记忆，仅供参考：\n- 一条事实' }],
+      },
+    }],
+  ])
+  const s2 = snapshot([], injNodes, () => [])
+  const inj = computeInjectionGroups(s2)
+  check('注入块不在 order 里也能成组', inj.length === 1)
+  check('注入组带 turn（0.2.x DOM 侧按 turn 找落点）', inj.length === 1 && inj[0].turn === 2)
+}
+
+// ---- 7. 旧宿主 store 无 values()：键序只按 order，行为不变 ----
+console.log('=== 7. 旧宿主（nodes 无 values）回归 ===')
+{
+  const nodes = new Map([
+    ['ctx-1', contextNode('ctx-1', REFLECT, turnLoc(5))],
+    ['asst-1', assistantNode('asst-1', turnLoc(5), 'settled')],
+    ['tool-1', toolNode('tool-1', turnLoc(5), 'memory_remember')],
+    ['tail-1', { key: 'tail-1', kind: 'turn-tail', location: turnLoc(5), data: { turn: 5 } }],
+  ])
+  const s = {
+    chat: {
+      order: ['ctx-1', 'asst-1', 'tool-1', 'tail-1'],
+      nodes: { get: (k) => nodes.get(k) }, // 无 values（0.1.x 旧 store 形状）
+      locations: { getTurn: (t) => t === 5 ? ['ctx-1', 'asst-1', 'tool-1', 'tail-1'] : [] },
+    },
+  }
+  const groups = computeFoldGroups(s)
+  check('旧宿主：照常识别与计数', groups.length === 1 && groups[0].rememberCount === 1 && groups[0].keys.length === 4)
+  check('旧宿主：范围与 getTurn 一致', JSON.stringify(groups[0].keys) === JSON.stringify(['ctx-1', 'asst-1', 'tool-1', 'tail-1']))
 }
 
 console.log(failures === 0 ? '\nALL CLIENT-FOLD TESTS PASSED ✅' : `\n${failures} FAILURES ❌`)
