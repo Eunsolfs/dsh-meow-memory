@@ -56,6 +56,9 @@ export interface FoldGroup {
   /** memory_update 调用次数。 */
   readonly updateCount: number
   readonly status: FoldStatus
+  /** 该组所在 turn 号（#53/#58/#72）：0.2.x 上锚点节点可能不渲染（被排除出可见
+   *  流的旧格式 context），DOM 侧按 turn 回退落横条。 */
+  readonly turn?: number
 }
 
 interface ContextLike {
@@ -130,6 +133,38 @@ function toolNameOf(node: ChatNode): string | undefined {
   return root.call?.name // ToolResultNode（窗口截断时 call 可能为 null）
 }
 
+/** 会话键序（0.2.x 兼容，#53/#58/#72）：order 为准，再补齐未进 order 的节点。
+ *  宿主 0.2.x 起「无工具变更的普通 context」不进可见 order（chat-visibility.ts）——
+ *  0.1.x 时代写入的 meow 注入/反思 prompt（纯文本 context，#53 实测 blocks=[text]）
+ *  整类被排除，只遍历 order 时折叠/注入计算一个锚点都找不到（#72 探针实证
+ *  order 164 vs nodes 185）。补齐部分按 anchorSeq（缺省 data.seq）稳定排序，保持
+ *  与渲染时间序一致；旧宿主 store 无 values() 时只按 order（行为不变）。 */
+function chatKeyOrder(snapshot: ConversationSnapshot): string[] {
+  const chat = snapshot.chat
+  const keys: string[] = []
+  const seen = new Set<string>()
+  for (const key of chat.order) {
+    if (seen.has(key)) continue
+    seen.add(key)
+    keys.push(key)
+  }
+  const store = chat.nodes as unknown as { values?: () => Iterable<ChatNode> }
+  if (typeof store.values !== 'function') return keys
+  const extra: Array<{ key: string; seq: number }> = []
+  for (const node of store.values()) {
+    const key = (node as ChatNode & { key?: string }).key
+    if (key === undefined || seen.has(key)) continue
+    seen.add(key)
+    const seq = (node as ChatNode & { anchorSeq?: number }).anchorSeq
+      ?? (node.data as unknown as { seq?: number }).seq
+      ?? 0
+    extra.push({ key, seq })
+  }
+  extra.sort((a, b) => a.seq - b.seq)
+  for (const item of extra) keys.push(item.key)
+  return keys
+}
+
 /**
  * 从会话快照计算全部可折叠组。
  * @param snapshot - 会话快照（dock 组件收到的 point-in-time 快照）。
@@ -139,7 +174,7 @@ export function computeFoldGroups(snapshot: ConversationSnapshot): FoldGroup[] {
   // fail-closed：宿主快照形状变化（如旧/新 dsh 前端 chat 缺失）时降级为不折叠，
   // 绝不抛错炸掉 dock（官方 issue #2 turnOf 同类无保护读教训）。
   if (snapshot?.chat === undefined) return []
-  const order = snapshot.chat.order
+  const order = chatKeyOrder(snapshot)
   const nodes = snapshot.chat.nodes
   // 同轮同任务合并（2026-09-10）：dream 多组连在同一个 turn 里（第 0 组 followup
   // 另起轮，后续组 steer 连着），每个组的 prompt 都是独立 context 节点——按
@@ -158,7 +193,13 @@ export function computeFoldGroups(snapshot: ConversationSnapshot): FoldGroup[] {
   }
   const groups: FoldGroup[] = []
   for (const anchor of anchors.values()) {
-    const turnKeys = snapshot.chat.locations.getTurn(anchor.turn)
+    // 0.2.x：locations.getTurn 从可见 order 重建，同样缺被排除的节点——先扫键序
+    // 归组，扫不到再回退 getTurn（0.1.x 键序与 getTurn 一致，行为不变）。
+    const scanned = order.filter((key) => {
+      const node = nodes.get(key)
+      return node !== undefined && turnOf(node) === anchor.turn
+    })
+    const turnKeys = scanned.length > 0 ? scanned : snapshot.chat.locations.getTurn(anchor.turn)
     const startIdx = turnKeys.indexOf(anchor.key)
     // 轮的归属（2026-09-10 双形状）：
     // - startIdx === 0：独立 memory 轮（host 走 followup，0.1.2/0.1.3+ 都支持）——
@@ -189,7 +230,7 @@ export function computeFoldGroups(snapshot: ConversationSnapshot): FoldGroup[] {
         else if (data.status === 'interrupted' && status !== 'running') status = 'interrupted'
       }
     }
-    groups.push({ id: anchor.key, variant: anchor.variant, keys, rememberCount, updateCount, status })
+    groups.push({ id: anchor.key, variant: anchor.variant, keys, rememberCount, updateCount, status, turn: anchor.turn })
   }
   return groups
 }
@@ -199,7 +240,7 @@ export function computeFoldGroups(snapshot: ConversationSnapshot): FoldGroup[] {
 export function memoryTurnNumbers(snapshot: ConversationSnapshot): ReadonlySet<number> {
   const out = new Set<number>()
   if (snapshot?.chat === undefined) return out
-  for (const key of snapshot.chat.order) {
+  for (const key of chatKeyOrder(snapshot)) {
     const node = snapshot.chat.nodes.get(key)
     if (node === undefined || !isMemoryPrompt(node)) continue
     const turn = turnOf(node)
@@ -269,6 +310,9 @@ export interface InjectionGroup {
   readonly userText?: string
   /** 消息事件时间（Unix epoch ms）；缺失时操作行不显示时钟。 */
   readonly time?: number
+  /** 该注入节点所属 turn（#53/#58/#72）：0.2.x 上注入块不再单独成行（宿主把内容
+   *  合并进用户消息），DOM 侧按 turn 找落点行。 */
+  readonly turn?: number
 }
 
 /**
@@ -279,7 +323,7 @@ export interface InjectionGroup {
 export function computeInjectionGroups(snapshot: ConversationSnapshot): InjectionGroup[] {
   if (snapshot?.chat === undefined) return [] // fail-closed：快照无 chat 时不注入折叠，绝不抛错
   const groups: InjectionGroup[] = []
-  for (const key of snapshot.chat.order) {
+  for (const key of chatKeyOrder(snapshot)) {
     const node = snapshot.chat.nodes.get(key)
     if (node === undefined) continue
     if (node.kind === 'context') {
@@ -291,11 +335,11 @@ export function computeInjectionGroups(snapshot: ConversationSnapshot): Injectio
       const meta = extractMetaFromSections(source.sections) ?? source.memory
       const memKind = meta?.kind
       if (memKind === 'initial' || memKind === 'reinjection') {
-        groups.push({ id: key, kind: 'first', injectedText: contextText(node) })
+        groups.push({ id: key, kind: 'first', injectedText: contextText(node), turn: turnOf(node) })
         continue
       }
       if (memKind === 'hit') {
-        groups.push({ id: key, kind: 'hit', injectedText: contextText(node) })
+        groups.push({ id: key, kind: 'hit', injectedText: contextText(node), turn: turnOf(node) })
         continue
       }
       // 已知机器元数据但非注入组（如 welcome / delegate 打点）→ 权威跳过，不做文本嗅探，
@@ -304,7 +348,7 @@ export function computeInjectionGroups(snapshot: ConversationSnapshot): Injectio
       if (source.form === 'snapshot') {
         const injectedText = contextText(node)
         const isFirst = injectedText.startsWith(FIRST_INJECTION_MARKER) || injectedText.includes('LONG-TERM MEMORY')
-        groups.push({ id: key, kind: isFirst ? 'first' : 'hit', injectedText })
+        groups.push({ id: key, kind: isFirst ? 'first' : 'hit', injectedText, turn: turnOf(node) })
       }
       continue
     }
