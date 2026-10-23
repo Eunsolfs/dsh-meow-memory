@@ -35,6 +35,8 @@ export interface Doc {
   created_at: number
   /** 记忆时间戳 = 最后更新时间（艾宾浩斯按它算年龄）。 */
   updated_at: number
+  /** 最后被注入/检索的时间（0.35.1 复习强化：取 max(updated_at, last_accessed_at) 算遗忘）。 */
+  last_accessed_at?: number | null
 }
 
 // CJK 类：汉字（\p{Script=Han} 覆盖基本区+Ext A~I）+ 假名 + 日文词内符号（々 叠字 / ー
@@ -418,7 +420,7 @@ export function search(query: string, docs: Doc[], opts: SearchOptions = {}): Ra
     // now=null 是手动检索/测试的"关闭衰减"开关。
     const w = now === null
       ? 1
-      : recencyWeight(now - docs[di].updated_at, { halfLifeDays: opts.halfLifeDays, importance: docs[di].importance })
+      : recencyWeight(now - Math.max(docs[di].updated_at, docs[di].last_accessed_at ?? 0), { halfLifeDays: opts.halfLifeDays, importance: docs[di].importance })
     const impW = useImportance ? 0.85 + 0.05 * docs[di].importance : 1
     const hitW = useHitBoost ? hitBoostWeight(docs[di].hit_count) : 1
     // 词法主分（不含遗忘权重）：recency 统一在 max() 之后乘，词法/字符/语义三条补分走同一 floor 语义。
@@ -541,7 +543,7 @@ export function keywordHitScore(query: string, docs: Doc[], opts: SearchOptions 
     const coverage = queryTokens > 0 ? overlap / queryTokens : 0
     const w = now === null
       ? 1
-      : recencyWeight(now - docs[di].updated_at, { halfLifeDays: opts.halfLifeDays, importance: docs[di].importance })
+      : recencyWeight(now - Math.max(docs[di].updated_at, docs[di].last_accessed_at ?? 0), { halfLifeDays: opts.halfLifeDays, importance: docs[di].importance })
     const impW = useImportance ? 0.85 + 0.05 * docs[di].importance : 1
     const hitW = useHitBoost ? hitBoostWeight(docs[di].hit_count) : 1
     const titleHit = tokenize(docs[di].title ?? '').some((t) => qTf.has(t))

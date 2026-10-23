@@ -66,7 +66,7 @@ There is also the `/dream` command: type it in the composer to consolidate this 
 
 **Write target (0.33)**: `level=soul` / `user`, or `level=rules` with a global project → **user-scope global store**; everything else → **workspace store**. Dedupe/merge happens only inside the target store.
 
-**Semantic embedding (0.35, optional)**: with `retrieval.semantic` enabled, after a successful write/merge the entry's embedding is attached **best-effort** (inline, bounded by `timeoutMs`; failure does not affect the write — a later apply's background backfill fills it in). With semantic disabled, no request is made at all.
+**Semantic embedding (0.35, optional)**: with `retrieval.semantic` enabled, after a successful write/merge the entry's embedding is attached **best-effort** (inline, bounded by `timeoutMs`; failure does not affect the write — a later apply's background backfill fills it in). With semantic disabled, no request is made at all. **A hanging endpoint adds up to `timeoutMs` (5s default) to this write**; only https or loopback http is allowed (a remote plain-http base falls back to lexical with zero requests).
 
 **Dedupe reality**: only **same level**, bigram **Jaccard ≥ 0.8** (near-identical wording) merges. Paraphrases and cross-level duplicates do **not** merge. Merging overwrites keywords with the new list and takes `max(importance)`.
 
@@ -91,7 +91,7 @@ There is also the `/dream` command: type it in the composer to consolidate this 
 
 > **0.33 hybrid lexical floor**: character bigram Jaccard + 0.25×trigram Jaccard (noise floor 0.2), used only as a floor when BM25 is weak (`score = max(BM25, 0.55·fuzzy·recency·importance)`); strong BM25 ordering is unchanged. **Not semantic/embedding retrieval** — paraphrases may still be missed. No config toggle (pure BM25 is a test/internal option).
 
-> **0.35 optional semantic floor**: with `retrieval.semantic.enabled: true`, this tool embeds `query` once (failure/timeout → pure lexical), `relevance = max(lexical, fuzzy, cos·weight·importanceWeight)` with cos **< 0.25 counted as 0** (noise floor), then × recency; `explain=true` includes a `semantic` component. **No rerank** — weak matches can enter. When enabled, **query text is sent to the configured `/embeddings` endpoint**; off (default) = zero network. See [configuration reference](configuration-reference.md).
+> **0.35 optional semantic floor; 0.35.1 transport/latency fixes**: with `retrieval.semantic.enabled: true`, this tool embeds `query` once (failure/timeout → pure lexical), `relevance = max(lexical, fuzzy, cos·weight·importanceWeight)` with cos **< 0.25 counted as 0** (noise floor), then × recency; `explain=true` includes a `semantic` component. **No rerank** — weak matches can enter. **Only https or loopback http is allowed** (a remote plain-http base is rejected with zero requests and falls back to lexical); **a hanging endpoint adds up to `timeoutMs` (5s default) latency to this call** (no throw, lexical results still returned; connection-refused fails fast). When enabled, **query text is sent to the configured `/embeddings` endpoint**; off (default) = zero network. See [configuration reference](configuration-reference.md).
 
 ---
 

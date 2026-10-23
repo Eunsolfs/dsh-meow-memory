@@ -312,6 +312,7 @@ function toDocs(rows: MemoryRow[]): Doc[] {
     embedding: r.embedding ?? null,
     created_at: r.created_at,
     updated_at: r.updated_at,
+    last_accessed_at: r.last_accessed_at ?? null,
   }))
 }
 

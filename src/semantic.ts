@@ -126,6 +126,25 @@ function validateVectors(rows: unknown, expected: number): number[][] | null {
 }
 
 /**
+ * 端点安全策略（0.35.1，review B1）：只允许 **HTTPS** 或 **loopback HTTP**。
+ * 远程明文 http 会以明文发送记忆正文/查询文本/Bearer token，直接拒绝（fail-open 到词法）。
+ * 返回 false 时调用方不发送任何请求。
+ */
+export function semanticEndpointAllowed(baseUrl: string): boolean {
+  if (!nonEmptyString(baseUrl)) return false
+  let url: URL
+  try {
+    url = new URL(baseUrl)
+  } catch {
+    return false
+  }
+  if (url.protocol === 'https:') return true
+  if (url.protocol !== 'http:') return false
+  const host = url.hostname.toLowerCase()
+  return host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '::1' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)
+}
+
+/**
  * 单次 /embeddings 请求（内部）。任何失败返回 null（网络/超时/非 2xx/坏形状/缺 key）。
  * OpenAI-compatible 响应形状：`{ data: [{ embedding: number[], index?: number }, …] }`；
  * index 存在时按 index 归位（部分 provider 乱序），否则按返回顺序。
@@ -134,6 +153,8 @@ async function requestEmbeddings(cfg: SemanticConfigLike, texts: string[]): Prom
   const baseUrl = nonEmptyString(cfg.baseUrl) ? cfg.baseUrl : ''
   const model = nonEmptyString(cfg.model) ? cfg.model : ''
   if (baseUrl === '' || model === '') return null
+  // review B1：拒绝远程明文 http（只允许 HTTPS / loopback HTTP）。
+  if (!semanticEndpointAllowed(baseUrl)) return null
   const url = `${baseUrl.replace(/\/+$/, '')}/embeddings`
   // key：默认 keyEnv（MEOW_MEMORY_EMBEDDING_KEY）缺失时允许无鉴权——本地
   // Ollama/LM Studio 等常见形态；只有**显式配置成其他变量名**且变量为空才视为

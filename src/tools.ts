@@ -583,6 +583,7 @@ function searchTool(dir: string): ToolDefinition {
         embedding: r.embedding ?? null,
         created_at: r.created_at,
         updated_at: r.updated_at,
+        last_accessed_at: r.last_accessed_at ?? null,
       }))
       // 0.35：语义开启时给 query 取一次 embedding（失败/超时 → null → 纯词法）。
       const queryEmbedding = await embedOne(query)

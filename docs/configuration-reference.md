@@ -51,10 +51,10 @@ All changes take effect after a **hot reload or restart of the meow-memory plugi
       importanceWeight: true
       semantic:                  # new in 0.35: optional semantic retrieval (off = zero network)
         enabled: false
-        baseUrl: ''
+        baseUrl: ''              # only https or loopback http (a remote plain-http base is rejected -> lexical)
         model: ''
         apiKeyEnv: 'MEOW_MEMORY_EMBEDDING_KEY'
-        timeoutMs: 5000
+        timeoutMs: 5000          # a hanging endpoint can add up to this per message/search/write
         weight: 0.8
     dream:
       enabled: true
@@ -165,15 +165,15 @@ All changes take effect after a **hot reload or restart of the meow-memory plugi
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `retrieval.halfLifeDays` | number 1–3650 | `30` | Exponential half-life (days): `recency = 0.05 + 0.95·exp(-ln2·ageDays/halfLifeDays)`; `importance ≥ 3` keeps a 0.85 floor |
+| `retrieval.halfLifeDays` | number 1–3650 | `30` | Exponential half-life (days): `recency = 0.05 + 0.95·exp(-ln2·ageDays/halfLifeDays)`; **age = `now − max(updated_at, last_accessed_at)`** (0.35.1 review refresh: injection/search hits update `last_accessed_at`, so recently recalled memories decay more slowly); `importance ≥ 3` keeps a 0.85 floor |
 | `retrieval.minScore` | number 0–1 | `0.35` | Minimum score for a keyword hit to be injected |
 | `retrieval.hitBoost` | bool | `true` | Hit-count reinforcement: `×(1 + 0.15·ln(1+hit_count))`, capped at 2.0 |
 | `retrieval.importanceWeight` | bool | `true` | Importance participates in ranking: `×(0.85 + 0.05·importance)` (1→0.9, 4→1.05) |
 | `retrieval.semantic.enabled` | bool | `false` | **0.35**: semantic retrieval master switch. Enabled only when `true` and `baseUrl`/`model` are non-empty; off (default) = **zero network requests**, behaviour identical to 0.34 |
-| `retrieval.semantic.baseUrl` | string | `''` | OpenAI-compatible endpoint base (the request goes to `${baseUrl}/embeddings`, e.g. `http://127.0.0.1:11434/v1`) |
+| `retrieval.semantic.baseUrl` | string | `''` | OpenAI-compatible endpoint base (the request goes to `${baseUrl}/embeddings`, e.g. `http://127.0.0.1:11434/v1`). **Transport policy (0.35.1)**: only `https://` or loopback `http://` (`localhost`/`127.x`/`[::1]`); a remote plain-`http://` base is rejected and falls back to lexical (no request sent) |
 | `retrieval.semantic.model` | string | `''` | Embedding model name (served by the endpoint; no model is bundled) |
 | `retrieval.semantic.apiKeyEnv` | string | `'MEOW_MEMORY_EMBEDDING_KEY'` | Env var holding the key. **If the default var is unset, requests are sent keyless** (local Ollama/LM Studio); only a *custom* var name that is missing counts as unconfigured (no request). When the key exists, `Authorization: Bearer $env` is sent |
-| `retrieval.semantic.timeoutMs` | number 200–60000 | `5000` | Per-request embedding timeout (ms); timeout/failure silently falls back to pure lexical |
+| `retrieval.semantic.timeoutMs` | number 200–60000 | `5000` | Per-request embedding timeout (ms); timeout/failure silently falls back to pure lexical. **With a hanging endpoint, each user message/search/write can add up to this latency** (no throw, lexical results still returned; connection-refused fails fast) |
 | `retrieval.semantic.weight` | number 0–1 | `0.8` | Semantic floor blend weight: `relevance = max(lexical, fuzzy, cos·weight·importanceWeight)`; `0` disables semantic scoring (requests may still happen — set `enabled: false` to stay offline) |
 
 The per-message hit score is **not BM25**: keyword intersection × IDF × **query coverage** × exponential recency × importance weight × title boost. `memory_search` is BM25 (BM25 × recency).
@@ -182,7 +182,7 @@ The per-message hit score is **not BM25**: keyword intersection × IDF × **quer
 
 > Since 0.32 coverage is `matched query tokens / total query tokens`. The old denominator was the entry's keyword-token count, so writing more keywords (as the prompts demand) *lowered* the score — the exact opposite of the intent. Raise `minScore` (e.g. 0.5) for a quieter chain, lower it for higher recall.
 
-> **0.35 optional semantic retrieval (`retrieval.semantic`, off by default)**: when enabled, cosine similarity between the query and entry embeddings is **also a floor**, with a **0.25 noise floor** (cos < 0.25 counts as 0, so unrelated entries cannot slip in on tiny similarity; negative/zero similarity counts as 0): `relevance = max(lexical, fuzzy, cos·weight·importanceWeight)`; `memory_search` multiplies by recency and `explain` gains `semantic`. **It is not a rerank** and may admit weak matches. Data flow: with it enabled, `memory_remember`/`memory_update` (content/keywords changes) embed inline after the write (bounded by `timeoutMs`, failures silent); after plugin apply it **backfills in the background** the global store (soul/user/rules) and every trusted workspace (project/fact/lesson/topic/rules), ≤50 rows per level, retrying next start on failure. Embeddings live in a nullable `embedding TEXT` (JSON) column added lazily to each table and therefore travel with the DB/backups. **Privacy**: with it enabled, **memory bodies/titles/keywords** and **user message/query text** are sent to your configured `/embeddings` endpoint; with it disabled nothing is sent. **Changing the embedding model invalidates stored vectors** (model-specific; different dimensions count as 0) — re-write entries or clear and re-backfill. An unreachable endpoint silently degrades to pure lexical and never blocks injection/retrieval/writes. The settings page does **not** expose these fields.
+> **0.35 optional semantic retrieval (`retrieval.semantic`, off by default); 0.35.1 audit fixes**: when enabled, cosine similarity between the query and entry embeddings is **also a floor**, with a **0.25 noise floor** (cos < 0.25 counts as 0, so unrelated entries cannot slip in on tiny similarity; negative/zero similarity counts as 0): `relevance = max(lexical, fuzzy, cos·weight·importanceWeight)`; `memory_search` multiplies by recency and `explain` gains `semantic`. **It is not a rerank** and may admit weak matches. **Transport**: only https or loopback http (a remote plain-http base is rejected and falls back to lexical with zero requests). **Latency**: with a hanging endpoint each message/search/write can add up to `timeoutMs` (default 5s); no throw, lexical results are still returned. Data flow: with it enabled, `memory_remember`/`memory_update` (content/keywords changes) embed inline after the write (bounded by `timeoutMs`, failures silent); after plugin apply it **backfills in the background** the global store (soul/user/rules) and every trusted workspace (project/fact/lesson/topic/rules), ≤50 rows per level; **since 0.35.1 a cold start judges workspace trust read-only before backfilling** (foreign/untrusted still skipped), retrying next start on failure. Embeddings live in a nullable `embedding TEXT` (JSON) column added lazily to each table and therefore travel with the DB/backups; **≈31 KiB/row at 1536 dims, 1k entries ≈30 MB** (plaintext derived data). **Privacy**: with it enabled, **memory bodies/titles/keywords** and **user message/query text** are sent to your configured `/embeddings` endpoint (the first enable also sends historical data); with it disabled nothing is sent. **Changing the embedding model invalidates stored vectors** (model-specific; different dimensions count as 0) — re-write entries or clear and re-backfill. An unreachable endpoint silently degrades to pure lexical; latency is bounded (≤`timeoutMs`) and the main chain does not fail. The settings page does **not** expose these fields.
 
 ---
 

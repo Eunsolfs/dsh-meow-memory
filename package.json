@@ -1,6 +1,6 @@
 {
   "name": "meow-memory",
-  "version": "0.35.0",
+  "version": "0.35.1",
   "description": "Hardened fork of Phant0Meow/dsh-meow-memory (0.31.1) for DeepSeek Harness: two-layer (user-scope + workspace) seven-layer SQLite memory with trust-gated stores, bounded injection/consolidation budgets, isolated auto-dream via spawn subagent, optional opt-in semantic embeddings + fuzzy hybrid retrieval, 0.2.x-compatible tools, and explicit memory management (memory_list/memory_forget).",
   "fork": {
     "of": "Phant0Meow/dsh-meow-memory",

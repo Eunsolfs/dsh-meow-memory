@@ -1282,9 +1282,10 @@ check('search marks all returned ids as searched', [...spIds].every((id) => spSe
 dbSplit.insert({ level: 'fact', content: '分段检索测试 未标记条目 特异性词u', project: null, source_session: 'win-other' })
 const spNull = await searchTool.execute({ query: '未标记条目', project: 'dsh' }, splitCtx)
 check('search unmarked row returns project=""', spNull.hits.length >= 1 && spNull.hits[0].project === '')
-// k<5：全盲取（无 fresh 段；同分 descending 的 created_at 决定前三名 = 12/11/10）
+// k<5：全盲取（无 fresh 段）。0.35.1 起 last_accessed_at 参与遗忘曲线（复习刷新），
+// 上一次检索会刷新命中条目的"年龄"，因此不再硬编码 12/11/10 的固定顺序，只断言盲取 3 条。
 const sp3 = await searchTool.execute({ query: '分段检索测试', project: 'dsh', k: 3 }, splitCtx)
-check('search k=3: blind only', sp3.hits.length === 3 && sp3.hits.some((h) => h.id === sid(12)))
+check('search k=3: blind only', sp3.hits.length === 3)
 check('search description mentions 5+5 rule', searchTool.description.includes('前 5 条按相关度无脑取') && searchTool.description.includes('绕开已注入/已检索'))
 dbSplit.close()
 const readTool = tools.find((t) => t.name === 'memory_read')

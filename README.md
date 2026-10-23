@@ -3,12 +3,12 @@
 | [中文](README.md) | [English](README.en.md) | [Português (BR)](README.pt-br.md) | [MIT License](LICENSE) |
 | :---: | :---: | :---: | :---: |
 
-> **这是什么**：`Phant0Meow/dsh-meow-memory` **v0.31.1** 的个人加固 fork（本仓库，版本 **0.35.0**，分支 `hardening`）。
+> **这是什么**：`Phant0Meow/dsh-meow-memory` **v0.31.1** 的个人加固 fork（本仓库，版本 **0.35.1**，分支 `hardening`）。
 > 上游是 MIT 授权，上游仓库：<https://github.com/Phant0Meow/dsh-meow-memory>。本 fork **与上游无隶属关系**，不代上游发布、也不代表上游立场；所有改动与剩余问题见 [CHANGELOG.md](CHANGELOG.md)。
 
 为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）打造的跨会话记忆插件：七层 SQLite 记忆、首轮快照注入、每消息关键词命中，以及**有预算上限**的自动整理。
 
-当前版本 **0.35.0** ｜ 变更见 [CHANGELOG.md](CHANGELOG.md) ｜ 已实测宿主 **DSH Desktop 0.2.1-rc.2**（见[兼容性](#兼容性)）
+当前版本 **0.35.1** ｜ 变更见 [CHANGELOG.md](CHANGELOG.md) ｜ 已实测宿主 **DSH Desktop 0.2.1-rc.2**（见[兼容性](#兼容性)）
 
 **诚实声明**：本 README 只写代码里确实存在的行为。0.32 删掉了上游 README 里若干夸大表述（"自动去重合并"、"艾宾浩斯遗忘曲线"、每消息命中"BM25"、"兼容 dsh 0.1.5"），并在每处注明真实边界。
 
@@ -27,7 +27,7 @@
 | **dream 自动整理（主 agent 路径，默认）** | 窗口空闲 ≥ `dream.idleMinutes`（默认 180 分钟）、非峰时、**该窗口有 live agent**、估算上下文 ≤ `budget.dreamMaxContextTokens`（默认 40000） | 最多 **3 轮全上下文请求**（后续轮次会重新估算上下文，超限提前收尾）；`budget.dreamMaxPerWindowPerDay` 默认 **1 次/窗口/天**，另有**进程级全局** `budget.dreamMaxPerDayTotal` 默认 **12 次/天**（计数为进程生命周期滚动 24h，重启清零）。30k token 的会话一次 dream ≈ 90k input tokens；会话历史永久 +8–15k durable tokens |
 | **dream 自动整理（隔离子会话路径，`dream.isolated: true`）** | 同上（频次/冷却/峰时/全局上限仍生效），但另需宿主 `subagents` 服务与 `spawn` provider | **主会话模型可见上下文 0 增长**（子会话 prompt 有独立上限 `dream.isolatedMaxPromptChars` 默认 20000 字符）；子会话的 token 仍计费；主上下文大小闸 `dreamMaxContextTokens` 对隔离路径**不生效** |
 | **反思（reflection）** | 单任务连续 ≥ `reflectTurns`（默认 7）个工具步后，任务结束 | **1 轮全上下文请求**；`budget.reflectMaxPerDay` 默认 6 次/天/窗口（会话），`reflectMinIntervalMinutes` 默认 20 分钟，另有**进程级全局** `budget.reflectMaxPerDayTotal` 默认 **24 次/天**（进程滚动 24h，重启清零）；上下文超 `dreamMaxContextTokens` 时跳过 |
-| **可选语义检索（`retrieval.semantic.enabled: true`，默认关）** | 每条用户消息的查询、每次 `memory_search`、每次写入（`memory_remember`/`memory_update`）、插件 apply 后的后台回填 | **不是 token 花费，而是对配置的 `/embeddings` 端点的网络请求**：启用后每条用户消息 1 次 query embedding（256 条 LRU 只救重复文本）、每次写入 1 次、启动回填按 ≤50 行/层批量；默认关 = **零网络请求**。数据发送/隐私见下方说明 |
+| **可选语义检索（`retrieval.semantic.enabled: true`，默认关）** | 每条用户消息的查询、每次 `memory_search`、每次写入（`memory_remember`/`memory_update`）、插件 apply 后的后台回填 | **不是 token 花费，而是对配置的 `/embeddings` 端点的网络请求**：启用后每条用户消息 1 次 query embedding（256 条 LRU 只救重复文本）、每次写入 1 次、启动回填按 ≤50 行/层批量；默认关 = **零网络请求**。端点挂起时每条消息/检索/写入最多增加 `timeoutMs`（默认 5s）延迟（不抛错、仍返回词法结果；连接被拒快速失败）。**库体积**：embedding 以 JSON 文本存 DB 与备份，1536 维实测 ≈31 KiB/行（1k 条 ≈30 MB）。数据发送/隐私见下方说明 |
 
 **怎么关掉自动花费**（只关自动、手动工具仍可用）：
 
@@ -50,7 +50,7 @@
 
 > **0.33 的分层存储不增加每消息 token**：只是多一个本地 SQLite 库（用户级全局库），注入条数仍受 `budget.*` 上限约束；fuzzy 补分是纯 CPU 计算、不花 token；dream/反思频次与上下文闸不变。
 
-> **0.35 的可选语义检索（`retrieval.semantic.enabled: true`，默认关）**：默认**完全离线、零网络请求**（不配置 endpoint 就不启用，行为与 0.34 完全一致）。启用后把**记忆正文/标题/关键词**与**用户消息/查询文本**发送到你配置的 OpenAI-compatible `/embeddings` 端点（key 走环境变量，默认变量名 `MEOW_MEMORY_EMBEDDING_KEY`；该默认变量未设置时会**无 key 请求**，适配本地 Ollama/LM Studio；只有自定义 `apiKeyEnv` 且变量缺失才视为未配置、不请求）。语义分只是**余弦相似度的 floor**（噪声地板 0.25，低于按 0 处理；负/零相似度按 0），不做 rerank；失败/超时（默认 5s）/非 2xx/形状不对一律静默回退纯词法。启用后插件 apply 会**后台回填历史条目** embedding（全局库 + 各可信工作区，≤50 行/层，失败静默、下次启动重试）。**不是本地模型、不打包模型**；换 embedding 模型会让已存向量失效（维度/语义不匹配，需重写或重新回填）。详见[配置参考](docs/配置参考.md)。
+> **0.35 的可选语义检索（`retrieval.semantic.enabled: true`，默认关）；0.35.1 收紧传输策略**：默认**完全离线、零网络请求**（不配置 endpoint 就不启用，行为与 0.34 一致）。**传输要求**：只允许 `https://` 或 **loopback** `http://`（`localhost`、`127.x`、`[::1]`）——远程明文 `http://` 会被**直接拒绝**并回退纯词法（不发送请求，避免记忆正文/查询文本/Bearer key 明文过网）。启用后把**记忆正文/标题/关键词**与**用户消息/查询文本**发送到你配置的 OpenAI-compatible `/embeddings` 端点（key 走环境变量，默认变量名 `MEOW_MEMORY_EMBEDDING_KEY`；该默认变量未设置时会**无 key 请求**，适配本地 Ollama/LM Studio；只有自定义 `apiKeyEnv` 且变量缺失才视为未配置、不请求）。语义分只是**余弦相似度的 floor**（噪声地板 0.25，低于按 0；负/零相似度按 0），不做 rerank；失败/超时（默认 5s）/非 2xx/形状不对一律静默回退纯词法；**端点挂起时最多增加 `timeoutMs` 延迟**（不抛错、仍返回结果；连接被拒快速失败）。启用后插件 apply 会**后台回填历史条目** embedding（全局库 + 各可信工作区；冷启动先做只读信任判定，≤50 行/层，失败静默且**下次启动重试**；首次启用会把历史数据发往端点）。**不是本地模型、不打包模型**；向量以 JSON 文本存 DB/备份（1536 维 ≈31 KiB/行，1k 条 ≈30 MB，属明文派生数据）；换 embedding 模型会让已存向量失效（需重写或重新回填）。详见[配置参考](docs/配置参考.md)。
 
 ---
 
@@ -154,13 +154,13 @@ $DSH_HOME/storages/meow-memory*           # install-id、prompt 覆盖层、切�
 
 ### 它做不到的事（别误会）
 
-- **语义检索默认关闭**：不开 `retrieval.semantic` 就没有语义召回（只有 BM25 + 0.33 fuzzy）。开启后它是**实验性 floor**（余弦 ≥0.25 才参与、不做 rerank、可能放进弱匹配），依赖**外部 embeddings 端点**（插件不打包本地模型），失败/超时静默降级回词法；设置页**不暴露**该配置（只能改 profile patch）；换 embedding 模型会让已存向量失效（向量按模型生成，维度不同直接按 0 处理，需重写/重新回填）。
+- **语义检索默认关闭**：不开 `retrieval.semantic` 就没有语义召回（只有 BM25 + 0.33 fuzzy）。开启后它是**实验性 floor**（余弦 ≥0.25 才参与、不做 rerank、可能放进弱匹配），依赖**外部 embeddings 端点**（插件不打包本地模型），失败/超时静默降级回词法；**只允许 https 或 loopback http**（远程明文 http 拒绝）；端点挂起时**最多增加 `timeoutMs`（默认 5s）延迟**；向量以 JSON 文本存 DB/备份（1536 维 ≈31 KiB/行，1k 条 ≈30 MB，明文派生数据）；设置页**不暴露**该配置（只能改 profile patch）；换 embedding 模型会让已存向量失效（需重写/重新回填）。
 - **项目级记忆仍按工作区隔离**：`project` / `fact` / `lesson` / `topic` / 项目 rules 跟着 cwd 走（换工作区 = 新的项目记忆）。跨工作区共享的只有 `soul` / `user` / 全局 rules（0.33 用户级全局库）。
 - **全局库不参与 dream**：dream 三轮仍只整理工作区库；全局条目靠工具/反思维护。
 - **隔离 dream 的取舍**：`dream.isolated: true` 时主会话上下文 0 增长，但子会话只拿到「dream prompt + 最近对话 digest + 条目清单」（不含工具结果），**整理质量低于主上下文路径**；**隔离 dream 无法从 UI 中止**；子会话**继承父会话 agent preset**，`memory_*` 工具可见性取决于该 preset（残余风险）；`isolatedArchiveChild` 会在子会话 settle 后归档它（**成功/失败都会归档**，留下一份明文子会话副本）；subagents/spawn 不可用或启动被拒时自动退回主 agent dream。
 - **dream 仍会把整理指令/回复/工具调用留在主会话历史里（主 agent 路径）**：UI 折叠只是视觉收纳，token 仍持久存在；隔离路径只留 log-only catalog 事实、无 model-visible dream 轮。
 - **迁移会归档工作区副本**：升级到 0.33 后原工作区的 soul/user/全局 rules 行变为 archived（内容保留）；全局库若丢失不会自动回灌，需恢复全局目录或逐条 `memory_forget mode=restore`。
-- **遗忘是"指数半衰"而不是"艾宾浩斯复习曲线"**：`retrieval.halfLifeDays` 默认 30 天，`exp(-ln2 × 天数/30)`，并保留 importance≥3 的 0.85 下限。dream 会把 `updated_at` 按整理时间封存，所以衰减输入本身会被整理行为影响——这不是记忆科学意义上的复习调度。
+- **遗忘是"指数半衰"**：`retrieval.halfLifeDays` 默认 30 天，年龄 = `now − max(updated_at, last_accessed_at)`，并保留 importance≥3 的 0.85 下限。**0.35.1 起"复习"会刷新曲线**：注入命中与 `memory_search` 命中更新 `last_accessed_at`，最近被想起过的记忆衰减更慢（spaced-repetition-style）；`updated_at` 仍由 dream 封存/update 刷新。但没有复习次数模型、没有调度——不是完整艾宾浩斯实现。
 - **dream 仍会把整理指令/回复/工具调用留在主会话历史里**：UI 折叠只是视觉收纳，token 仍持久存在。
 - **`memory_home` 的切换能力默认关闭**；打开后它仍是模型可调用的工具，请自行评估。
 
@@ -181,7 +181,7 @@ $DSH_HOME/storages/meow-memory*           # install-id、prompt 覆盖层、切�
 
 2. 任选其一：
    - **本地目录**：GUI 左侧 **Plugins → Add plugin**，填**本仓库的绝对路径**（插件管理器接受绝对本地路径）；
-   - **tarball**：`npm pack` 生成 `meow-memory-0.35.0.tgz`，Plugins → Add plugin 填该 `.tgz` 的绝对路径。
+   - **tarball**：`npm pack` 生成 `meow-memory-0.35.1.tgz`，Plugins → Add plugin 填该 `.tgz` 的绝对路径。
 3. 重启 `dsh web`（或热重载插件）。新会话自动加载。
 
 > 本地 `file:`/`link:` 安装不会执行 `prepare`，所以**必须先构建**；tarball 里已含 `lib/`，装上即可用。
@@ -235,7 +235,7 @@ dsh plugin --profile <profile> remove meow-memory
 |---|---|
 | 宿主 | **DSH Desktop 0.2.1-rc.2**（Windows 11） |
 | 运行时 | Electron 44.7.0 / Node **24.21.0**，`node:sqlite` 可用 |
-| 验证范围 | 隔离实例加载成功；3 条 `/meow-memory/*` 路由带鉴权 200 / 不带 401；设置命名空间出现；无 apply 错误。0.34 带 `dream.isolated: true` 的 live load 只验证了加载；0.34.0 的子会话启动 bug（`maxDepth: 0`）由独立复审发现，0.34.1 修复。0.35 另做 default / semantic-enabled 两种配置的 live load：均加载成功、无 apply 错误，**禁用语义时启动零 embedding 请求**，未写真实 home。**真实模型/子会话 dream 与真实 embedding 端点未在隔离实例中跑通**（无账号凭据；语义层由 mock embeddings 服务单测覆盖） |
+| 验证范围 | 隔离实例加载成功；3 条 `/meow-memory/*` 路由带鉴权 200 / 不带 401；设置命名空间出现；无 apply 错误。0.34 带 `dream.isolated: true` 的 live load 只验证了加载；0.34.0 的子会话启动 bug（`maxDepth: 0`）由独立复审发现，0.34.1 修复。0.35 另做 default / semantic-enabled 两种配置的 live load：均加载成功、无 apply 错误，**禁用语义时启动零 embedding 请求**，未写真实 home。0.35.1 为审计修正（传输策略/冷启动回填/复习刷新），由单测覆盖，未改变 live-load 前提。**真实模型/子会话 dream 与真实 embedding 端点未在隔离实例中跑通**（无账号凭据；语义层由 mock embeddings 服务单测覆盖） |
 | 未验证 | **0.1.x 宿主**（本 fork 没有测过，不再宣称"兼容 dsh 0.1.5"）；其他 0.2.x 补丁版本 |
 
 已知兼容性风险（沿用上游结论，本 fork 未改）：
@@ -281,10 +281,10 @@ dsh plugin --profile <profile> remove meow-memory
       importanceWeight: true        # importance 参与排序
       semantic:                     # 0.35 可选语义检索（默认关 = 零网络）
         enabled: false              # 显式打开才请求 endpoint
-        baseUrl: ''                 # OpenAI-compatible base，如 http://127.0.0.1:11434/v1
+        baseUrl: ''                 # OpenAI-compatible base；只允许 https 或 loopback http（如 http://127.0.0.1:11434/v1）
         model: ''                   # embedding 模型名
         apiKeyEnv: 'MEOW_MEMORY_EMBEDDING_KEY' # key 所在环境变量；默认变量未设 = 无 key 请求
-        timeoutMs: 5000             # 单次请求超时（毫秒；失败静默回退词法）
+        timeoutMs: 5000             # 单次请求超时（毫秒；失败静默回退词法，端点挂起最多加这么多延迟）
         weight: 0.8                 # 语义 floor 混合权重（0..1；0 = 关闭语义补分）
     dream:
       enabled: true

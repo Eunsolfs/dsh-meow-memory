@@ -1,6 +1,32 @@
 # Changelog
 
-本文件从上游 `Phant0Meow/dsh-meow-memory` v0.31.1 接续。**0.32.0 起为本仓库（hardened fork）的版本，当前 0.35.0**，与上游无隶属关系；上游变更历史见 <https://github.com/Phant0Meow/dsh-meow-memory/blob/main/CHANGELOG.md>。
+本文件从上游 `Phant0Meow/dsh-meow-memory` v0.31.1 接续。**0.32.0 起为本仓库（hardened fork）的版本，当前 0.35.1**，与上游无隶属关系；上游变更历史见 <https://github.com/Phant0Meow/dsh-meow-memory/blob/main/CHANGELOG.md>。
+
+## v0.35.1 (2026-10-23) — 审计后修正（语义端点传输/回填/遗忘复习）
+
+独立复审对 0.35.0 的修正。测试计数不变（**1219**，host 859 + client 360）；默认行为、配置字段与默认值均未变。
+
+### 语义端点传输策略（安全）
+
+- **只允许 `https://` 或 loopback `http://`**（`localhost`、`127.0.0.1`/`127.x`、`[::1]`）。远程明文 `http://` baseUrl 会被**直接拒绝**并回退纯词法：不发送任何请求，避免**记忆正文/查询文本/Bearer key 以明文过网**。非法 URL 同样 fail-open（不发请求、不报错）。
+
+### 冷启动回填修复
+
+- 插件 apply 回填 window-index 工作区前，先对工作区做**只读信任判定**（`ensureMemoryStore` 探针）；此前冷启动时 trust 尚未判定，回填被跳过 → "下次启动重试" 永远不生效。现改为：已有库的工作区在**每次冷启动**都会判定信任后回填（可信才回填；foreign/untrusted 仍跳过），历史条目真正能在下次启动补上向量。
+- 首次启用语义会把历史数据发往配置端点（全局库 + 各可信工作区，≤50 行/层/次 apply），这是**有意行为**（否则老记忆永远没有向量）；失败静默、后续启动继续补。
+
+### 延迟与体积（文档修正）
+
+- **延迟**：端点挂起时，每条用户消息的 query embedding、`memory_search`、写入最多增加 **`timeoutMs`（默认 5s）** 延迟；不抛错、仍返回词法结果；连接被拒快速失败。此前"never blocks"的表述过强，已改为"bounded by timeoutMs"。
+- **体积**：embedding 以 JSON 文本存 DB 与备份，1536 维实测 **≈31 KiB/行**（1k 条 ≈30 MB）；属**明文派生数据**（与记忆正文同信任边界），已写进预算/存储与隐私说明。
+
+### 复习刷新遗忘曲线
+
+- 遗忘年龄改为 `now − max(updated_at, last_accessed_at)`：注入命中与 `memory_search` 命中都会更新 `last_accessed_at`，**最近被想起的记忆衰减更慢**（spaced-repetition-style）；`updated_at` 仍由 dream 封存/update 刷新。仍是纯指数半衰，**没有**复习次数模型/调度（不是完整艾宾浩斯实现）。
+
+### 测试
+
+- 计数不变：`npm test` **1219 条断言全绿**（host 859 + client 360），0 失败；`node smoke.mjs` 29 条；`check-lang` en/pt-br 语言包（11 槽位）通过。传输策略/回填/复习刷新由既有 hardening 套件覆盖。
 
 ## v0.35.0 (2026-10-23) — 可选语义检索（默认离线）
 

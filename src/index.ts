@@ -1400,7 +1400,10 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
           if (n > 0) ctx.logger.info(`meow-memory: 语义回填全局库 ${n} 条`)
         }
         for (const [, w] of windowIndex) {
-          if (storeTrustOf(w, resolved.projectDir)?.trusted !== true) continue
+          // review B3：冷启动时窗口索引里的工作区尚未判定 trust——先做只读判定再回填，
+          // 否则 "下次启动重试" 永远跳过（旧工作区行永远拿不到 embedding）。
+          if (!existsSync(memoryDbPath(w, resolved.projectDir))) continue
+          if (storeTrustOf(w, resolved.projectDir)?.trusted !== true && !trustOf(w).trusted) continue
           try {
             const n = await backfillEmbeddings(getDb(w, resolved.projectDir), resolved.retrieval.semantic, ['project', 'fact', 'lesson', 'topic', 'rules'])
             if (n > 0) ctx.logger.info(`meow-memory: 语义回填 ${w} ${n} 条`)
