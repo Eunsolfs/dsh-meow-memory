@@ -1065,6 +1065,23 @@ export class MemoryDb {
     return out
   }
 
+  /** 收养子会话建立的条目（Phase 2 Round 2 隔离子 agent dream）：把 fromSessionId 的
+   *  source_session 改成 toSessionId（父窗口），让 dream 收尾的 idsBySession/stampDream
+   *  能归属到父窗口。逐表 best-effort：单表失败只 warn、绝不抛出；未知会话自然返回 0。 */
+  adoptSessionEntries(fromSessionId: string, toSessionId: string): number {
+    if (typeof fromSessionId !== 'string' || typeof toSessionId !== 'string') return 0
+    if (fromSessionId.length === 0 || toSessionId.length === 0 || fromSessionId === toSessionId) return 0
+    let total = 0
+    for (const level of LEVELS) {
+      try {
+        total += this.db.prepare(`UPDATE ${level} SET source_session = ? WHERE source_session = ?`).run(toSessionId, fromSessionId).changes
+      } catch (e) {
+        console.warn(`[meow-memory] adoptSessionEntries ${level} 失败（已跳过该表）：${e instanceof Error ? e.message : String(e)}`)
+      }
+    }
+    return total
+  }
+
   /** 批量写记忆时间戳（dream 收尾：本窗口条目 updated_at = 窗口最后对话时间 T；
    *   MAX 防止覆盖 T 之后的 memory_update 刷新）。 */
   stampDream(sessionId: string, time: number): number {
@@ -1234,6 +1251,41 @@ export function backupMemoryDb(workspace: string, dir = '.dsh-meow'): boolean {
     if (existsSync(bakPath) && statSync(bakPath).mtimeMs >= dataMtime) return false
     const tmp = `${bakPath}.tmp`
     getDb(workspace, dir).vacuumInto(tmp)
+    renameSync(tmp, bakPath)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 全局库备份（Phase 2 Round 2）：<全局目录>/global/memory.db → 同目录 memory.db.bak，
+ *  一代轮转。语义与 backupMemoryDb 一致：mtime 增量（bak 不旧于数据即跳过；WAL 下取
+ *  db 与 -wal 的较新者）、VACUUM INTO 先写 .tmp 再 rename 原子替换、失败返回 false。
+ *  全局库不可用/不可信（未创建 / foreign）→ false；库文件缺失或没有任何记忆行也 no-op。
+ *  纯兜底：绝不抛出、绝不影响主流程。 */
+export function backupGlobalDb(): boolean {
+  try {
+    const dbPath = globalDbPath()
+    // 源库不存在：纯 no-op，绝不为了备份去创建/profile 全局库。
+    if (!existsSync(dbPath)) return false
+    if (!ensureGlobalStore().trusted) return false
+    const bakPath = `${dbPath}.bak`
+    let dataMtime = statSync(dbPath).mtimeMs
+    const walPath = `${dbPath}-wal`
+    if (existsSync(walPath)) dataMtime = Math.max(dataMtime, statSync(walPath).mtimeMs)
+    if (existsSync(bakPath) && statSync(bakPath).mtimeMs >= dataMtime) return false
+    const db = getGlobalDb()
+    // 空库（只有 schema、没有任何层行）不备份：首次开库的空壳没有快照价值。
+    let hasRows = false
+    for (const level of LEVELS) {
+      if (db.count(level) > 0) {
+        hasRows = true
+        break
+      }
+    }
+    if (!hasRows) return false
+    const tmp = `${bakPath}.tmp`
+    db.vacuumInto(tmp)
     renameSync(tmp, bakPath)
     return true
   } catch {

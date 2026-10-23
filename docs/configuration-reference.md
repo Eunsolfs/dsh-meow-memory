@@ -1,4 +1,4 @@
-# Configuration reference (0.33 fork)
+# Configuration reference (0.34 fork)
 
 Every field is optional. Two ways to set them:
 
@@ -60,6 +60,11 @@ All changes take effect after a **hot reload or restart of the meow-memory plugi
       timeZone: 'Asia/Shanghai'
       rulesReviewDays: 2
       requireLiveAgent: true     # new in 0.32
+      isolated: false            # new in 0.34: automatic dream in an isolated spawn child (off by default)
+      isolatedProvider: 'spawn'
+      isolatedTimeoutMinutes: 20
+      isolatedMaxPromptChars: 20000
+      isolatedArchiveChild: true
     delegate:
       model: ''
 ```
@@ -99,7 +104,7 @@ All changes take effect after a **hot reload or restart of the meow-memory plugi
 - **Write routing**: `memory_remember` writes `soul`/`user` or global `rules` → global store; everything else → workspace store. Read tools (read/update/forget/search/list/find_similar) query both and dedupe by id (same id: **active wins over archived**); `memory_project` reads the workspace store only.
 - **Automatic migration**: the first **trusted** session in each workspace copies existing soul/user/global rules with their original ids into the global store, then archives the workspace originals (recoverable). Idempotency flag in workspace `dream_meta` (`globalmigrated:v1:<dir>`); foreign workspaces are never migrated.
 - **Fallback**: an absent/untrusted/unavailable global store falls back to 0.32 single-workspace behaviour; there is **no `trustWorkspaceMemory` config override for the global store** (a global dir copied/synced from another machine is foreign).
-- **Note**: the global store moves with `homeDir` / `memory_home` (close the connection first on Windows); `backup.enabled` backs up **only the workspace store**, not the global store.
+- **Note**: the global store moves with `homeDir` / `memory_home` (close the connection first on Windows); `backup.enabled` backs up both the workspace store and the global store (an empty/untrusted global store is skipped and no directory is created).
 
 ---
 
@@ -191,10 +196,17 @@ The per-message hit score is **not BM25**: keyword intersection × IDF × **quer
 | `dream.timeZone` | string | `Asia/Shanghai` | Timezone for suppression windows |
 | `dream.rulesReviewDays` | number ≥0 | `2` | Stable rules older than this skip dream round 1; `0` = no filter |
 | `dream.requireLiveAgent` | bool | `true` | Automatic dream only runs for windows with a live agent; it **never** calls `agents.resume()` (#49). Manual `/dream` / `memory_dream` bypass this automatic gate (manual invocation already requires a live window) |
+| `dream.isolated` | bool | `false` | **0.34**: automatic dream runs in an **isolated spawn child session** — no model-visible dream turn in the main session, **zero main-context growth** (child tokens are still billed). Off by default; manual `/dream` / `memory_dream` **always** use the main-agent path |
+| `dream.isolatedProvider` | string | `'spawn'` | Child provider; must have `inheritsParentContext === false` (spawn qualifies, fork does not). If the service/provider is unavailable, one log is written and the plugin falls back to the main-agent dream |
+| `dream.isolatedTimeoutMinutes` | number 1–120 | `20` | Isolated-dream timeout (minutes): on timeout the child is disposed, the lease released and the next sweep retries; consecutive failures seal at the existing 3-attempt limit |
+| `dream.isolatedMaxPromptChars` | number 2000–60000 | `20000` | Character cap for the child's single prompt (digest + entry rows); overflow trims oldest entries/projects/digest head |
+| `dream.isolatedArchiveChild` | bool | `true` | On success, archive the child session (`workspaceRegistry.archiveSession`, best-effort) |
 
 All conditions must hold for an automatic dream: `dream.enabled` → idle ≥ `idleMinutes` → not in a suppression window → a **live agent** exists → estimated context ≤ `budget.dreamMaxContextTokens` → today's count < `budget.dreamMaxPerWindowPerDay` → process-wide today's count < `budget.dreamMaxPerDayTotal`. Later rounds re-estimate the context and finish early if oversized (entries stay unsealed, can be re-dreamed later); round 1/2 entry lists are ordered by the newest **`updated_at`** (not `created_at`), so recently-touched old entries are not starved by the 60-row cap. Every skip reason is logged (`security.debugLogs` for detail).
 
-**Manual `/dream` / `memory_dream` bypass these cost gates** (manual = explicit intent; only the automatic path calls `evaluateAutoDreamGate`): they run up to 3 rounds over the **full session context** (atomic / topic / project summary) and are never skipped for being oversized. If the context is large, run `/compact` first.
+**Isolated path (`dream.isolated: true`)**: the main-context `dreamMaxContextTokens` gate **does not apply** (the child prompt is independently capped by `isolatedMaxPromptChars`); frequency/cooldown/peak/process-wide caps still apply. The child is **empty-context** (does not inherit the main transcript) and receives the dream prompts + a digest of recent user/assistant text and tool names (no tool results/plugin notices) + entry lists; on success the child's written entries have their `source_session` adopted to the parent (`adoptSessionEntries`) before sealing, and partial results are kept; timeout/failure/abort falls back to the main-agent path. **Isolated dream cannot be aborted from the UI**; `delegate.model` is also used for the isolated child.
+
+**Manual `/dream` / `memory_dream` bypass these cost gates** (manual = explicit intent; only the automatic path calls `evaluateAutoDreamGate`): they run up to 3 rounds over the **full session context** (atomic / topic / project summary), are never skipped for being oversized, and **always use the main agent** (the isolated mode applies to automatic dream only). If the context is large, run `/compact` first.
 
 > The default suppression windows come from upstream and follow GLM/Zhipu peak-tariff hours, not DeepSeek's discount window. Adjust to your provider.
 
@@ -205,7 +217,7 @@ All conditions must hold for an automatic dream: `dream.enabled` → idle ≥ `i
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `autoMigrate` | bool | **`false`** (since 0.32) | Automatically migrate a legacy `PROJECT.md` when the DB is first opened. Off = unknown `PROJECT.md` in a workspace is never imported without consent |
-| `backup.enabled` | bool | `false` | At each dream's end, snapshot the **workspace** `memory.db` into `memory.db.bak` (`VACUUM INTO`, mtime-based increment). **Does not include the user-scope global store** (`<homeDir>/global/memory.db` must be backed up separately). Consumed at registration — reload required |
+| `backup.enabled` | bool | `false` | At each dream's end, snapshot the **workspace store** and the **user-scope global store** into their own `memory.db.bak` (`VACUUM INTO`, mtime-based increment). Empty/untrusted/missing global stores are skipped (no directory is created for a backup). Consumed at registration — reload required |
 
 ---
 

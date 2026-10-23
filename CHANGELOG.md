@@ -1,6 +1,40 @@
 # Changelog
 
-本文件从上游 `Phant0Meow/dsh-meow-memory` v0.31.1 接续。**0.32.0 起为本仓库（hardened fork）的版本，当前 0.33.0**，与上游无隶属关系；上游变更历史见 <https://github.com/Phant0Meow/dsh-meow-memory/blob/main/CHANGELOG.md>。
+本文件从上游 `Phant0Meow/dsh-meow-memory` v0.31.1 接续。**0.32.0 起为本仓库（hardened fork）的版本，当前 0.34.0**，与上游无隶属关系；上游变更历史见 <https://github.com/Phant0Meow/dsh-meow-memory/blob/main/CHANGELOG.md>。
+
+## v0.34.0 (2026-10-23) — 隔离 dream（主会话 0 增长）+ 全局库备份
+
+Phase 2 Round 2。0.33.0 的存储/检索改动全部保留；本版把**自动 dream** 移到隔离 spawn 子会话执行（可选、默认关），并让备份覆盖全局库。
+
+### 隔离 dream（`dream.isolated`，默认关）
+
+- 自动 dream 可改为在 **spawn 空上下文子会话**执行（`isolatedProvider: 'spawn'`，要求 `inheritsParentContext === false`；fork 不满足）。主会话**没有 model-visible 的 dream 轮**（只有 log-only catalog 事实），因此**主会话上下文 0 增长**；子会话 token 仍计费。
+- 子会话拿到：dream 三个 prompt 槽（atomic/topic/project-summary）+ 最近 user/assistant 文本与工具名的 digest（**不含工具结果/插件通知**）+ 条目清单；单条 prompt 上限 `dream.isolatedMaxPromptChars`（默认 20000 字符），超限从旧条目/项目/digest 头部裁剪。**整理质量低于主上下文路径**（已知取舍）。
+- `delivery: 'caller'`：无父会话完成通知，主会话不会追加 dream 回复；成功收尾走既有 finalize（`stampDream`/`finishDream`），先 `adoptSessionEntries(childId, parentSid)` 把子会话写入的条目 `source_session` 归到父窗口再封存（**部分结果也保留**）。
+- 超时 `dream.isolatedTimeoutMinutes`（默认 20 分钟）→ dispose 子会话、释放租约下轮重试；连续失败按既有 3 次上限封存；失败/超时/中止回退主 agent 路径。
+- HMR/dispose 时取消在途隔离任务（`disposeIsolatedDreams`，释放租约避免僵尸）；成功后可归档子会话（`dream.isolatedArchiveChild`，默认 true，best-effort `workspaceRegistry.archiveSession`）。
+- 隔离 dream 的模型复用 `delegate.model`（空 = 子会话默认模型）；**主上下文大小闸 `dreamMaxContextTokens` 对隔离路径不生效**（子 prompt 独立封顶），频次/冷却/峰时/进程级每日上限仍生效。
+- 能力回退：`subagents` 服务 / `spawn` provider 缺失或 `inheritsParentContext !== false` → 记一次日志后走 0.32 主 agent dream。**隔离 dream 无法从 UI 中止**（记录为限制）。
+
+### 新增配置（`dream.*`，全部可选）
+
+- `dream.isolated: false`、`dream.isolatedProvider: 'spawn'`、`dream.isolatedTimeoutMinutes: 20`、`dream.isolatedMaxPromptChars: 20000`、`dream.isolatedArchiveChild: true`。设置页仍未暴露这些字段（连同 0.32 的 security/budget/retrieval），需手编 profile patch。
+
+### 备份：全局库也纳入
+
+- 开启 `backup.enabled` 后，dream 收尾现在同时备份**工作区库**与**全局库**（映射到各自目录的 `memory.db.bak`；`VACUUM INTO` + 一代轮转 + mtime 增量；空库/未受信全局库不备份，**不会为备份创建目录**）。
+
+### 测试
+
+- 全量 `npm test` 通过：**1148 条断言全绿**（host 788 + client 360），0 失败；其中 `tests/hardening.mjs` **212 条**（新增 isolated-dream / adopt / backup 覆盖）。`node smoke.mjs` 另行 29 条；`check-lang` en/pt-br 两个语言包通过。
+- 隔离实例 live load on DSH 0.2.1-rc.2（带 `dream.isolated: true` patch）通过：加载成功、无 apply 错误；**真实模型/子会话 dream 未跑通**（无账号凭据，隔离 dream 由单元测试的 fake subagents 覆盖）。
+
+### 已知限制
+
+- **隔离 dream 无法从 UI 中止**；digest 不含工具结果/插件通知，整理质量低于主上下文路径。
+- **设置页仍未暴露** 0.32 的 `security`/`budget`/`retrieval` 与 0.34 的 `dream.isolated*` 字段。
+- **dream 仍不整理全局库**（全局条目靠工具/反思维护）；**没有语义 embedding**（fuzzy 仅词法变体/词形/词边界）。
+- 项目级记忆仍按工作区隔离（soul/user/全局 rules 才跨工作区）。
 
 ## v0.33.0 (2026-10-23) — Phase 2：用户级全局记忆 + 分层检索
 
@@ -26,7 +60,7 @@ Phase 2 Round 1（用户授权的大改动）。0.32.x 的加固内容全部保�
 
 ### 已知限制
 
-- 全局库**不在 `backup.enabled` 备份范围**（只备份工作区 `memory.db`）。
+- 全局库**不在 `backup.enabled` 备份范围**（只备份工作区 `memory.db`）。（**0.34.0 已修复**：全局库也纳入备份。）
 - **dream/反思仍只整理工作区库**；全局条目靠工具/反思维护。
 - **迁移会把工作区原件归档**；全局库丢失不会自动回灌，需恢复全局目录或 `memory_forget mode=restore` 逐条恢复。
 - **设置页仍未暴露 0.32 新增的 `security` / `budget` / `retrieval` 配置字段**，需手编 profile patch。

@@ -3,12 +3,12 @@
 | [中文](README.md) | [English](README.en.md) | [Português (BR)](README.pt-br.md) | [MIT License](LICENSE) |
 | :---: | :---: | :---: | :---: |
 
-> **O que é isto**: um fork pessoal de endurecimento do `Phant0Meow/dsh-meow-memory` **v0.31.1** (este repositório, versão **0.33.0**, branch `hardening`).
+> **O que é isto**: um fork pessoal de endurecimento do `Phant0Meow/dsh-meow-memory` **v0.31.1** (este repositório, versão **0.34.0**, branch `hardening`).
 > O upstream é MIT: <https://github.com/Phant0Meow/dsh-meow-memory>. Este fork **não tem vínculo com o upstream**, não publica em nome dele e não representa suas posições. Todas as mudanças e problemas restantes estão no [CHANGELOG.md](CHANGELOG.md).
 
 Memória entre sessões para o [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): memória em sete níveis no SQLite, injeção de snapshot na primeira rodada, acertos por palavra-chave a cada mensagem e consolidação automática **com limites de orçamento**.
 
-Versão **0.33.0** ｜ Histórico: [CHANGELOG.md](CHANGELOG.md) ｜ Host verificado: **DSH Desktop 0.2.1-rc.2** (veja [Compatibilidade](#compatibilidade))
+Versão **0.34.0** ｜ Histórico: [CHANGELOG.md](CHANGELOG.md) ｜ Host verificado: **DSH Desktop 0.2.1-rc.2** (veja [Compatibilidade](#compatibilidade))
 
 **Nota de honestidade**: este README só afirma comportamentos que existem no código. A 0.32 removeu várias alegações infladas do upstream ("deduplicação/merge automáticos", "curva de esquecimento de Ebbinghaus", "BM25" nos acertos por mensagem, "compatível com dsh 0.1.5") e declara o limite real em cada ponto.
 
@@ -18,13 +18,14 @@ Versão **0.33.0** ｜ Histórico: [CHANGELOG.md](CHANGELOG.md) ｜ Host verific
 
 Este é o custo mais subestimado do plugin. **Com a configuração padrão ele faz requisições de LLM sem um comando explícito do usuário**; a 0.32 limitou cada tipo, mas não desligou nenhum (o comportamento padrão do upstream foi mantido, só deixou de ser ilimitado).
 
-| Gasto | Quando | Limite 0.33 |
+| Gasto | Quando | Limite 0.34 |
 |---|---|---|
 | **Taxa estática**: manual de memória + descrição/schema de todas as ferramentas no system prompt | **Toda** requisição, mesmo sessão que nunca usa memória | ≈**6,7k tokens/requisição** (medido, pacote chinês; ≈6,3k em inglês; varia com o pacote de idioma e o tamanho das descrições). Não dá para desligar por requisição; para não pagar nada, defina `enabled: false` (ou remova o plugin) |
 | **Snapshot da primeira rodada**: soul / user / regras globais / guia de memória | Uma vez, antes da primeira mensagem real de cada sessão | `budget.snapshotMaxChars` padrão **6000 caracteres** (≈2,7k tokens zh) |
 | **Acertos por palavra-chave** | Da segunda mensagem em diante, quando há acerto | `hitTopK` padrão 2 × `budget.hitMaxChars` padrão **1500 caracteres/entrada** (≈1,4k tokens/mensagem no pior caso) |
 | **Reinjeção pós-compactação** | A rodada seguinte a uma compactação | `budget.reinjectMaxChars` padrão **8000 caracteres** (≈3,6k tokens) |
-| **Dream automático** | Janela ociosa ≥ `dream.idleMinutes` (padrão 180), fora do pico, **com live agent**, contexto estimado ≤ `budget.dreamMaxContextTokens` (padrão 40000) | Até **3 rodadas de contexto completo** (as rodadas seguintes reestimam e encerram cedo se estourar); `budget.dreamMaxPerWindowPerDay` padrão **1 por janela/dia**, mais um limite **de processo** `budget.dreamMaxPerDayTotal` padrão **12/dia** (N janelas não são mais N× gasto; contadores rolam 24h por vida do processo e zeram no restart). Uma sessão de 30k tokens custa ≈90k input tokens por dream; o histórico ganha ≈8–15k tokens duráveis |
+| **Dream automático (caminho do agente principal, padrão)** | Janela ociosa ≥ `dream.idleMinutes` (padrão 180), fora do pico, **com live agent**, contexto estimado ≤ `budget.dreamMaxContextTokens` (padrão 40000) | Até **3 rodadas de contexto completo** (as rodadas seguintes reestimam e encerram cedo se estourar); `budget.dreamMaxPerWindowPerDay` padrão **1 por janela/dia**, mais um limite **de processo** `budget.dreamMaxPerDayTotal` padrão **12/dia** (contadores rolam 24h por vida do processo e zeram no restart). Uma sessão de 30k tokens custa ≈90k input tokens por dream; o histórico ganha ≈8–15k tokens duráveis |
+| **Dream automático (caminho isolado, `dream.isolated: true`)** | Mesmos portões (frequência/cooldown/pico/limite global ainda valem), mais o serviço `subagents` do host e o provider `spawn` | **Zero crescimento de contexto visível na sessão principal** (o prompt do filho tem limite próprio `dream.isolatedMaxPromptChars`, padrão 20000 caracteres); os tokens do filho continuam cobrados; o portão `dreamMaxContextTokens` do contexto principal **não se aplica** ao caminho isolado |
 | **Reflexão** | Depois de uma tarefa com ≥ `reflectTurns` (padrão 7) passos de ferramenta seguidos | **1 requisição de contexto completo**; `budget.reflectMaxPerDay` padrão 6/dia/janela (sessão), `budget.reflectMinIntervalMinutes` padrão 20, mais um limite **de processo** `budget.reflectMaxPerDayTotal` padrão **24/dia** (rolagem 24h, zera no restart); pulada quando o contexto excede `dreamMaxContextTokens` |
 
 **Como parar o gasto automático** (as ferramentas manuais continuam funcionando):
@@ -46,6 +47,8 @@ Ou por janela: menu "…" da linha da sessão → **Participação da memória**
 
 > **O armazenamento em camadas da 0.33 não adiciona tokens por mensagem**: é só mais um banco SQLite local (o global do usuário); as injeções continuam limitadas por `budget.*`. O fuzzy é só CPU (sem tokens); os limites de dream/reflexão e de contexto não mudam.
 
+> **Dream isolado da 0.34 (`dream.isolated: true`, desligado por padrão)**: o dream automático roda numa **sessão filha spawnada de contexto vazio**, então a sessão principal não recebe turno de dream visível ao modelo (só fatos log-only) → **crescimento zero do contexto principal**; o filho ainda gasta tokens. O filho recebe os slots de prompt do dream + um digest de texto recente user/assistant e nomes de ferramentas + listas de entradas (sem resultados de ferramenta/avisos de plugin), então **a qualidade da consolidação é menor que o caminho principal** (trade-off conhecido). `/dream` / `memory_dream` manuais sempre usam o agente principal (visível/abortável); **o dream isolado não pode ser abortado pela UI**. Se `subagents`/`spawn` faltar, o plugin volta ao dream do agente principal.
+
 ---
 
 ## Onde a memória fica: armazenamento em duas camadas (0.33)
@@ -65,7 +68,7 @@ A 0.33 transforma o "global" de "global dentro de um workspace" em armazenamento
 - **Migração automática (uma vez)**: a primeira sessão confiável de cada workspace copia soul / user / regras globais existentes **com os ids originais** para o banco global e depois **arquiva** essas linhas do workspace (recuperáveis; evita contagem dupla em injeção/dream). A marca de idempotência fica no `dream_meta` do workspace (`globalmigrated:v1:<dir>`); só workspaces confiáveis migram, bancos foreign nunca são tocados.
 - **Fallback**: se o banco global estiver ausente / não confiável / indisponível, o plugin volta automaticamente ao comportamento de workspace único da 0.32 (soul/user/regras globais lidos/escritos no banco do workspace), sem erro.
 - **Se o banco global for apagado após a migração**: as linhas originais do workspace continuam archived e **não são reinjetadas automaticamente**. Recuperação: restaurar/fazer backup do diretório global, ou `memory_forget` com `mode:'restore'` por id.
-- **Limite de backup (honesto)**: `backup.enabled` faz backup só do `memory.db` **do workspace**, **não do banco global**; faça backup de `~/.dsh-meow/global/` (ou seu `homeDir`) por conta própria.
+- **Backup**: `backup.enabled` (desligado por padrão) faz backup **do banco do workspace e do banco global** ao fim do dream (cada um em `memory.db.bak`, VACUUM INTO + rotação de uma geração + incremento por mtime; banco global vazio/não confiável é ignorado e nenhum diretório é criado).
 - **dream/reflexão ainda consolidam só o banco do workspace**: entradas globais são mantidas por ferramentas/reflexão, não pelas três rodadas do dream — limitação conhecida.
 
 ---
@@ -124,8 +127,8 @@ Desde a 0.32:
 Desinstalar não apaga memórias. Quando não precisar mais:
 
 ```
-<workspace>/.dsh-meow/                       # memory.db, sessions/, .owner.json, .gitignore
-~/.dsh-meow/                              # ou seu homeDir: global/memory.db, logs, window-index, migrate-state
+<workspace>/.dsh-meow/                       # memory.db, memory.db.bak, sessions/, .owner.json, .gitignore
+~/.dsh-meow/                              # ou seu homeDir: global/memory.db, global/memory.db.bak, logs, window-index, migrate-state
 $DSH_HOME/storages/meow-memory*           # install-id, overrides de prompt, ponteiro de troca (meow-memory-home.json)
 ```
 
@@ -141,7 +144,7 @@ $DSH_HOME/storages/meow-memory*           # install-id, overrides de prompt, pon
 - **Amigável a cache**: a section estática `meow-memory:guide` é registrada uma vez no system prompt, texto constante, não quebra o cache de prefixo do provider.
 - **Reinjeção pós-compactação**: a rodada seguinte reinjeta o snapshot, os panoramas consultados nesta sessão e as entradas escritas nesta sessão (limitado por `reinjectMaxChars`).
 - **Realidade da deduplicação**: só entradas do **mesmo nível** com Jaccard de bigramas ≥ 0.8 (quase idênticas) se fundem automaticamente. **Paráfrases não se fundem** e contradições entre níveis não são detectadas — use `memory_find_similar` + `memory_update`/`memory_forget`.
-- **Dream por janela**: com a janela ociosa ≥ `idleMinutes` (padrão 3 h), fora do pico e com live agent, o agente principal dela consolida em três rodadas (atômicas / topic / resumo de projeto). Desde a 0.32 o dream automático **não chama mais `agents.resume()`** para ressuscitar agent bare (#49), tem limites de contexto e frequência, exclui entradas arquivadas e limita as listas. `/dream` ou `memory_dream` consolidam sob demanda.
+- **Dream por janela**: com a janela ociosa ≥ `idleMinutes` (padrão 3 h), fora do pico e com live agent, o agente principal dela consolida em três rodadas (atômicas / topic / resumo de projeto). Desde a 0.32 o dream automático **não chama mais `agents.resume()`** para ressuscitar agent bare (#49), tem limites de contexto e frequência, exclui entradas arquivadas e limita as listas. A 0.34 permite `dream.isolated: true`: o dream automático roda numa **sessão filha spawnada de contexto vazio** (crescimento zero do contexto principal, tokens do filho ainda cobrados), com fallback ao agente principal em falha/timeout; `/dream` manual sempre usa o agente principal. `/dream` ou `memory_dream` consolidam sob demanda.
 - **Reflexão**: depois de ≥ `reflectTurns` passos de ferramenta seguidos na mesma tarefa, pergunta ao modelo se há algo a memorizar; se a última ferramenta foi `memory_*`, suprime. A 0.32 adiciona limite diário e intervalo mínimo.
 - **UI do cliente**: o texto injetado dobra numa barra, rodadas de reflexão/dream dobram num cartão, a lista de sessões mostra ícones de dream. Depende de internals do host 0.2.x e é "melhor esforço" — um patch do host pode desativar silenciosamente (só estética).
 - **Zero dependências de runtime**: `node:sqlite` + bundle esbuild autocontido, sem módulos nativos.
@@ -151,7 +154,8 @@ $DSH_HOME/storages/meow-memory*           # install-id, overrides de prompt, pon
 - **Memória de nível de projeto continua por workspace**: `project` / `fact` / `lesson` / `topic` / rules de projeto seguem o cwd (workspace novo = memória de projeto nova). Só `soul` / `user` / regras globais são compartilhados entre workspaces (banco global do usuário, 0.33).
 - **Sem busca semântica**: o fuzzy da 0.33 é só um piso léxico de n-gramas de caracteres (variantes / flexões / fronteiras de palavra), não embeddings e não entende paráfrases. `hit_count` afeta o ranking mas nunca reescreve palavras-chave sozinho.
 - **O banco global não participa do dream**: as três rodadas do dream continuam consolidando só o banco do workspace; entradas globais são mantidas por ferramentas/reflexão.
-- **Backup exclui o banco global**: `backup.enabled` faz backup só do `memory.db` do workspace.
+- **Trade-offs do dream isolado**: com `dream.isolated: true` o contexto principal fica estável, mas o filho recebe só o prompt do dream + digest recente + listas de entradas (sem resultados de ferramenta), então **a qualidade da consolidação é menor que o caminho principal**; **o dream isolado não pode ser abortado pela UI**; se `subagents`/`spawn` faltar, volta ao dream do agente principal.
+- **O dream ainda deixa suas instruções/respostas/chamadas no histórico da sessão principal (caminho principal)**: dobrar é só visual, os tokens persistem; o caminho isolado deixa só fatos log-only, sem turno de dream visível ao modelo.
 - **A migração arquiva as cópias do workspace**: após atualizar para 0.33, as linhas originais de soul/user/regras globais no workspace ficam archived (conteúdo preservado); se o banco global se perder, elas não são reinjetadas automaticamente — restaure o diretório global ou `memory_forget mode=restore` por id.
 - **O esquecimento é uma meia-vida exponencial, não uma curva de revisão de Ebbinghaus**: `retrieval.halfLifeDays` padrão 30 dias, `exp(-ln2 × dias/30)` com piso 0.85 para importance≥3. O dream carimba `updated_at` na consolidação, então a entrada da decaída é afetada pela própria consolidação.
 - **O dream ainda deixa suas instruções/respostas/chamadas no histórico da sessão principal**: dobrar é só visual, os tokens persistem.
@@ -174,7 +178,7 @@ $DSH_HOME/storages/meow-memory*           # install-id, overrides de prompt, pon
 
 2. Escolha:
    - **diretório local**: GUI **Plugins → Add plugin**, informe o **caminho absoluto** deste repositório;
-   - **tarball**: `npm pack` gera `meow-memory-0.33.0.tgz`; informe o caminho absoluto do `.tgz`.
+   - **tarball**: `npm pack` gera `meow-memory-0.34.0.tgz`; informe o caminho absoluto do `.tgz`.
 3. Reinicie `dsh web` (ou recarregue o plugin). Novas sessões carregam automaticamente.
 
 > Instalações locais `file:`/`link:` não rodam `prepare`, então **compile primeiro**; um tarball já contém `lib/`.
@@ -228,7 +232,7 @@ O ambiente em que este fork foi realmente verificado (não é uma promessa de "c
 |---|---|
 | Host | **DSH Desktop 0.2.1-rc.2** (Windows 11) |
 | Runtime | Electron 44.7.0 / Node **24.21.0**, `node:sqlite` disponível |
-| Verificado | Instância isolada carrega; 3 rotas `/meow-memory/*` retornam 200 com auth / 401 sem; namespace de settings aparece; sem erro de apply. **Rodadas reais de LLM/chamadas de ferramenta não foram exercitadas na instância isolada** (sem credenciais) |
+| Verificado | Instância isolada carrega; 3 rotas `/meow-memory/*` retornam 200 com auth / 401 sem; namespace de settings aparece; sem erro de apply. A 0.34 também rodou um live load isolado com patch `dream.isolated: true`: carregou, sem erro de apply. **Modelo real / dream de sessão filha não foi exercitado na instância isolada** (sem credenciais; o dream isolado é coberto por testes unitários com fake subagents) |
 | Não verificado | **Hosts 0.1.x** (este fork não testou; a alegação "suporta dsh 0.1.5" foi removida); outros patch releases 0.2.x |
 
 Riscos de compatibilidade conhecidos (achados do upstream, inalterados por este fork):
@@ -275,6 +279,11 @@ Todos os campos são opcionais. **Os novos grupos `security` / `budget` / `retri
     dream:
       enabled: true
       idleMinutes: 180
+      isolated: false             # 0.34: dream automático numa sessão filha spawnada isolada (desligado por padrão)
+      isolatedProvider: 'spawn'   # provider do filho (precisa de inheritsParentContext=false)
+      isolatedTimeoutMinutes: 20  # timeout → dispose do filho, libera lease, retenta
+      isolatedMaxPromptChars: 20000 # limite de caracteres do prompt único do filho
+      isolatedArchiveChild: true  # arquiva a sessão filha no sucesso (melhor esforço)
 ```
 
 **Todos os campos, tipos, padrões e efeitos estão em [docs/configuration-reference.md](docs/configuration-reference.md)** (inclui `titleMax` / `homeDir` / `disabledWorkspaces` / `backup` / `delegate`).
@@ -306,7 +315,7 @@ sem acertos na rodada 1
 
 > Desde a 0.33 o snapshot da primeira rodada lê soul / user / regras globais do banco global do usuário (`<activeHomeDir>/global/memory.db`), com o banco do workspace como fallback; panorama de projeto e reinjeção continuam somente no workspace.
 
-### Ferramentas (10 na 0.33)
+### Ferramentas (10 na 0.34)
 
 | Ferramenta | Faixa | Uso |
 |---|---|---|
@@ -318,7 +327,7 @@ sem acertos na rodada 1
 | `memory_update` | escrita | Corrige status / importance / goal / keywords / content; grava no banco dono da entrada |
 | `memory_list` | leitura | **nova na 0.32**: lista ids/títulos/palavras-chave/status/timestamps, sem corpos; mescla os dois bancos e deduplica por id |
 | `memory_forget` | escrita | **nova na 0.32**: arquivar/restaurar/apagar por id. Arquivar é o padrão; `mode:'delete'` apaga de vez e exige `confirm:true`; consulta os dois bancos |
-| `memory_dream` | escrita | Dispara manualmente a consolidação desta janela (igual a `/dream`; só o banco do workspace) |
+| `memory_dream` | escrita | Dispara manualmente a consolidação desta janela (igual a `/dream`; só o banco do workspace; **sempre o caminho do agente principal** — o modo isolado da 0.34 vale só para dream automático) |
 | `memory_home` | diretório | Consulta o diretório global; **só consulta por padrão desde a 0.32**, exige `security.allowHomeSwitch: true` para trocar (na 0.33 a troca move o banco global também, fechando a conexão antes) |
 
 **Parâmetros, retornos e efeitos colaterais: [docs/tool-reference.md](docs/tool-reference.md)**.
@@ -334,7 +343,7 @@ npm run test           # build + checagem dos pacotes de idioma + asserções (h
 node scripts/check-lang.mjs en       # checa um pacote de prompt
 ```
 
-Asserções de teste: `npm test` **1076 todas verdes** (host 676 + cliente 360), 0 falhas; mais 29 em `node smoke.mjs`; `scripts/check-lang.mjs` valida os pacotes en/pt-br (11 slots alinhados).
+Asserções de teste: `npm test` **1148 todas verdes** (host 788 + cliente 360), 0 falhas; mais 29 em `node smoke.mjs`; `scripts/check-lang.mjs` valida os pacotes en/pt-br (11 slots alinhados).
 
 Os pacotes `@deepseek-ai/*` ficam no workspace pnpm dsh-meow, não no `node_modules` deste pacote. No Windows, `npm run link-workspace` cria junctions para o esbuild resolver (só em tempo de build).
 
@@ -345,7 +354,8 @@ Os pacotes `@deepseek-ai/*` ficam no workspace pnpm dsh-meow, não no `node_modu
 3. Depois de `/dream`, continue conversando: o número de ferramentas está normal? (Guarda #66.)
 4. Depois de uma rodada de reflexão, veja o seletor de modelo: continua o modelo principal? (#71 só dispara com `delegate.model` definido.)
 5. Abra uma sessão num repositório clonado e não confiável: não deve aparecer memória de longo prazo que você não escreveu (banco não confiável + sem auto-migração);
-6. Abra uma sessão em outro workspace: `soul` / `user` / regras globais devem continuar lá (banco global do usuário), enquanto `project` / `fact` são do novo workspace (verifica as duas camadas).
+6. Abra uma sessão em outro workspace: `soul` / `user` / regras globais devem continuar lá (banco global do usuário), enquanto `project` / `fact` são do novo workspace (verifica as duas camadas);
+7. Com `dream.isolated: true`: depois de um dream automático não deve haver turno de dream na sessão principal (só fatos log-only) e a sessão filha deve estar arquivada; um `/dream` manual ainda deve gerar um turno de dream do agente principal.
 
 ---
 

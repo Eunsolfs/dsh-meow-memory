@@ -68,6 +68,13 @@ export const CONFIG_DEFAULTS = {
     checkMinutes: 15,
     timeZone: 'Asia/Shanghai',
     rulesReviewDays: DEFAULT_RULES_REVIEW_DAYS,
+    /** Phase 2：自动 dream 改在隔离 spawn 子会话执行（主会话上下文 0 增长）；默认关。
+     *  手动 /dream 与 memory_dream 始终走主 agent（用户可看可中止）。 */
+    isolated: false,
+    isolatedProvider: 'spawn',
+    isolatedTimeoutMinutes: 20,
+    isolatedMaxPromptChars: 20000,
+    isolatedArchiveChild: true,
   },
   delegate: { model: '' },
   /** 记忆库自动备份（#37 增量②，默认关）：开启后每次 dream 收尾把 memory.db

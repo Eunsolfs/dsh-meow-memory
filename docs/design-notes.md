@@ -76,6 +76,8 @@ Cost: each round is a **full-context request** — ≈90k input tokens for a 30k
 
 Manual `/dream` / `memory_dream` bypass all of these automatic gates (manual = explicit intent; only the automatic path calls `evaluateAutoDreamGate`): peak/frequency/live-agent/context gates do not apply, and they run up to 3 rounds over the **full session context** (atomic / topic / project summary). If the context is large, run `/compact` first.
 
+**0.34 isolated path (`dream.isolated: true`, off by default)**: automatic dream runs in an **empty-context spawn child** (provider with `inheritsParentContext === false`), so the main session has no model-visible dream turn → **zero main-context growth**. The child prompt = the three dream prompt slots + a digest of recent user/assistant text and tool names (no tool results/plugin notices) + entry lists, capped by `isolatedMaxPromptChars` (default 20000 chars); **consolidation quality is therefore lower than the main-context path**. The main-context size gate does not apply to the isolated path (the child prompt is capped independently); frequency/cooldown/peak/process-wide caps still apply. On success, `adoptSessionEntries` reassigns child-written entries to the parent before sealing (partial results kept); failure/timeout/abort falls back to the main agent; HMR/dispose cancels in-flight runs; `delegate.model` is reused for the child. **Isolated dream cannot be aborted from the UI.**
+
 ---
 
 ## 7. Peak-hour suppression (defaults may not fit your provider)
@@ -160,19 +162,33 @@ Also: workspace paths are compared after **realpath normalisation** (junction / 
 - **Tool routing**: writes are routed by level (soul/user/global rules → global store); reads query both stores and dedupe by id (same id: **active wins over archived**, so a migration archive copy cannot shadow the original); `memory_project` reads the workspace store only (project panorama is workspace semantics).
 - **Windows EPERM**: `homeDir` / `memory_home` switches move the global store; the connection is closed first via `closeGlobalDb()` (on Windows an open SQLite file blocks the rename).
 
-**Known boundaries**: `backup.enabled` backs up the workspace store only (not the global store); dream/reflection still consolidate the workspace DB only (global entries are maintained via tools/reflection); migration archives workspace originals and a lost global store is not re-injected automatically.
+**Known boundaries**: dream/reflection still consolidate the workspace DB only (global entries are maintained via tools/reflection); migration archives workspace originals and a lost global store is not re-injected automatically; since 0.34 `backup.enabled` backs up both the workspace store and the global store (an empty/untrusted global store is skipped).
 
 ---
 
-## 17. Known design debt (updated in 0.33)
+## 17. 0.34 isolated dream (zero main-context growth)
+
+0.33's automatic dream was still a full-context request inside the main session: it left the dream instructions/replies/tool calls in the main log (≈+8–15k durable tokens per dream), and large windows were blocked by the `dreamMaxContextTokens` gate. 0.34 moves **automatic** dream into an **isolated spawn child** (off by default):
+
+- **Why spawn, not fork**: `fork` inherits the parent's full transcript (i.e. copies the main context again); `spawn` is a fresh empty-context session that only receives the prompt/digest/lists we build, so the main session grows by **zero**.
+- **Process/cross-process semantics**: leases still live in the workspace DB (`claimDream`/heartbeat) and `dreamiso:<sid>` metadata records in-flight tasks for diagnostics; the child calls `memory_*` in the same workspace/cwd; on success `adoptSessionEntries(childId, parentSid)` reassigns `source_session` to the parent, then the existing `stampDream`/`finishDream` finalises; failure/timeout/abort uses the existing failure counter and retries (seals at 3), then falls back to the main-agent path.
+- **Lifecycle**: timeout `isolatedTimeoutMinutes` (default 20 min) disposes the child and releases the lease; HMR/dispose calls `disposeIsolatedDreams()` to cancel in-flight runs and release leases (no zombie leases); on success `isolatedArchiveChild` archives the child session by default.
+- **Cost vs quality**: child tokens are still billed; the digest only contains recent user/assistant text + tool names (no tool results) and the prompt is capped by `isolatedMaxPromptChars`, so **consolidation quality is lower than the main-context path**; and it **cannot be aborted from the UI**. The main-context size gate does not apply to the isolated path; frequency/cooldown/peak/process-wide caps still do.
+- **Fallback**: missing `subagents` service / `spawn` provider or `inheritsParentContext !== false` → one log then the 0.32 main-agent dream; the main-agent path remains (manual `/dream` always uses it).
+
+---
+
+## 18. Known design debt (updated in 0.34)
 
 | Issue | Impact | Why |
 |---|---|---|
 | **Project-level memory is still workspace-scoped** | `project` / `fact` / `lesson` / `topic` follow the cwd; a new workspace starts with fresh project memory (soul/user/global rules are cross-workspace since 0.33) | Sharing project memory needs a store-ownership model; left for later |
 | **Semantic recall still missing** | fuzzy covers lexical variants/inflections/word boundaries only; paraphrases can still be missed | Needs embeddings/vector indexing; no embedding provider on this host |
-| **Global store is not backed up** | `backup.enabled` backs up the workspace `memory.db` only | The backup path was designed per workspace DB; back up the global store manually |
 | **Dream does not consolidate the global store** | Global entries are maintained via tools/reflection, not dream rounds | Dream is per-window workspace semantics; global consolidation needs its own scheduler |
 | **Migration archives workspace originals** | A lost global store does not re-inject them automatically (content still archived) | Auto-restoring would conflict with "user deleted the global store"; provide `memory_forget mode=restore` |
+| **Isolated dream cannot be aborted from the UI** | Only timeout/completion/failure ends it; dispose/HMR cancels | The host's subagent activation has no UI abort entry (recorded as a 0.34 limitation) |
+| **Isolated dream quality below the main path** | The digest has no tool results/plugin notices and the prompt is capped; some tasks get insufficient context | Directly conflicts with "zero main-context growth"; off by default, opt in per need |
+| **Global backup depends on a dream firing** | With `backup.enabled`, the global-store backup happens at dream completion (both main and isolated paths); there is no scheduled backup | Backup reuses the dream-completion hook |
 | **Scans without indexes (upstream)** | 4 full scans per message; fine at hundreds of entries, a cliff at thousands | T1 added indexes; large-scale behaviour still needs measuring |
 | **#66 host-side tool lock** | After a manual dream the tool set may shrink until restart | Host issue; plugin can only avoid the automatic path |
 | **#71 delegate model leak** | Only with `delegate.model` set | Host projection bug; empty default does not trigger |

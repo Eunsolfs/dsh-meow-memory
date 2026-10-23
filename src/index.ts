@@ -26,7 +26,7 @@ import z from '@deepseek-ai/schemastery'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { backupMemoryDb, closeAllDbs, closeGlobalDb, ensureGlobalStore, ensureMemoryStore, getDb, getGlobalDb, globalDbPath, memoryDbPath, storeTrustOf, type Level, type StoreTrust } from './db.js'
+import { backupGlobalDb, backupMemoryDb, closeAllDbs, closeGlobalDb, ensureGlobalStore, ensureMemoryStore, getDb, getGlobalDb, globalDbPath, memoryDbPath, storeTrustOf, type Level, type StoreTrust } from './db.js'
 import { migrateWorkspaceToGlobal } from './global-store.js'
 import { parseModelSpec, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER, type AgentOptionsSpec } from './delegate.js'
 import { CONFIG_DEFAULTS } from './defaults.js'
@@ -41,6 +41,7 @@ import {
   dreamCommandDefinition,
   dreamTool,
   disposeDreamHeartbeats,
+  disposeIsolatedDreams,
   handleMemoryTurnFailure,
   noteActivity,
   registerLiveAgent,
@@ -315,6 +316,12 @@ const config = z.object({
       rulesReviewDays: z.number().min(0).default(DEFAULT_RULES_REVIEW_DAYS),
       /** 0.32：自动 dream 只在窗口有活 agent 时跑；绝不 agents.resume()（修 #49）。 */
       requireLiveAgent: z.boolean().default(true),
+      /** Phase 2：自动 dream 在隔离 spawn 子会话执行（主会话 0 token 增长）；默认关。 */
+      isolated: z.boolean().default(false),
+      isolatedProvider: z.string().default('spawn'),
+      isolatedTimeoutMinutes: z.number().min(1).max(120).default(20),
+      isolatedMaxPromptChars: z.number().min(2000).max(60000).default(20000),
+      isolatedArchiveChild: z.boolean().default(true),
     })
     .default({}),
   /** 记忆停用工作区名单（#28）：cwd 精确匹配（路径归一：斜杠统一 + 去尾斜杠 + 大小写
@@ -537,11 +544,20 @@ function resolveConfig(config: unknown): ResolvedConfig {
       timeZone: d.timeZone ?? 'Asia/Shanghai',
       rulesReviewDays: d.rulesReviewDays ?? DEFAULT_RULES_REVIEW_DAYS,
       requireLiveAgent: (d as { requireLiveAgent?: boolean }).requireLiveAgent ?? true,
+      isolated: (d as { isolated?: boolean }).isolated ?? false,
+      isolatedProvider: (d as { isolatedProvider?: string }).isolatedProvider ?? 'spawn',
+      isolatedTimeoutMinutes: (d as { isolatedTimeoutMinutes?: number }).isolatedTimeoutMinutes ?? 20,
+      isolatedMaxPromptChars: (d as { isolatedMaxPromptChars?: number }).isolatedMaxPromptChars ?? 20000,
+      isolatedArchiveChild: (d as { isolatedArchiveChild?: boolean }).isolatedArchiveChild ?? true,
+      // 隔离 dream 的模型：复用 delegate.model（未配置 = 继承子会话默认模型）。
+      isolatedModelSpec: parseModelSpec(dg.model),
       budget: {
         dreamMaxContextTokens: bud.dreamMaxContextTokens ?? 40000,
         dreamMaxPerWindowPerDay: bud.dreamMaxPerWindowPerDay ?? 1,
+        dreamMaxPerDayTotal: bud.dreamMaxPerDayTotal ?? 12,
         reflectMaxPerDay: bud.reflectMaxPerDay ?? 6,
         reflectMinIntervalMinutes: bud.reflectMinIntervalMinutes ?? 20,
+        reflectMaxPerDayTotal: bud.reflectMaxPerDayTotal ?? 24,
       },
     },
     delegate: (() => {
@@ -780,7 +796,7 @@ const SETTINGS_SOURCE_WAIT_MS = 250
 // 启动调用）保持冻结：热改需要 dispose+重入，设置页按「需重载」语义对待（#26 同口径）。
 
 const LIVE_CONFIG_KEYS = ['hitTopK', 'titleMax', 'reflect', 'reflectTurns', 'autoMigrate', 'promptLang', 'disabledWorkspaces'] as const
-const LIVE_DREAM_KEYS = ['enabled', 'idleMinutes', 'suppressWindows', 'suppressLeadMinutes', 'checkMinutes', 'timeZone', 'rulesReviewDays', 'requireLiveAgent', 'budget'] as const
+const LIVE_DREAM_KEYS = ['enabled', 'idleMinutes', 'suppressWindows', 'suppressLeadMinutes', 'checkMinutes', 'timeZone', 'rulesReviewDays', 'requireLiveAgent', 'budget', 'isolated', 'isolatedProvider', 'isolatedTimeoutMinutes', 'isolatedMaxPromptChars', 'isolatedArchiveChild', 'isolatedModelSpec'] as const
 
 /** 工作区路径归一（#28 匹配口径）：斜杠统一、去尾斜杠、大小写不敏感（Windows 盘符
  *  友好）。导出供测试直调。 */
@@ -1401,6 +1417,10 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
           if (backupMemoryDb(wsB, resolved.projectDir)) ctx.logger.info(`meow-memory: memory.db 已备份（dream 收尾触发，${shortSessionId(sessionId)}）`)
         } catch { /* 备份失败不影响主流程 */ }
       }
+      // 0.33：全局库（soul/user/全局 rules）也纳入备份；失败静默。
+      try {
+        if (backupGlobalDb()) ctx.logger.info(`meow-memory: 全局 memory.db 已备份（dream 收尾触发，${shortSessionId(sessionId)}）`)
+      } catch { /* 备份失败不影响主流程 */ }
     }
   }
   const disposeDreamTool = ctx.tools.register(dreamTool(ctx, resolved.projectDir, signalDreamState, () => resolved.dream.rulesReviewDays, workspaceDisabled))
@@ -2099,6 +2119,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     clearTimeout(commandTimer)
     stopDream()
     disposeDreamHeartbeats() // 热重载不残留 dream 租约心跳定时器
+    disposeIsolatedDreams() // 0.33：隔离 dream 的 spawn 子会话在 dispose/HMR 时取消
     broadcast.dispose()
     try {
       closeAllDbs()
@@ -2239,7 +2260,7 @@ function persistWindowIndex(): void {
 export { PLUGIN_SOURCE, REFLECT_MARKER }
 export { parseModelSpec, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER } from './delegate.js'
 export { collectDreamStates, headerOf, type PersistedSessionLike } from './dream-signal.js'
-export { MemoryDb, memoryDbPath, getDb, getGlobalDb, globalDbPath, closeAllDbs, closeGlobalDb, backupMemoryDb, ensureMemoryStore, ensureGlobalStore, storeTrustOf, resetStoreTrustCache, type StoreTrust, LEVELS, newId, PROJECT_SUBCATEGORIES, projectList, projectCovers, projectLabel, relativeTime, isGlobalProject, isGlobalScope, globalProjectMarker, GLOBAL_PROJECT_CANON, GLOBAL_PROJECT_CANON_EN } from './db.js'
+export { MemoryDb, memoryDbPath, getDb, getGlobalDb, globalDbPath, closeAllDbs, closeGlobalDb, backupMemoryDb, backupGlobalDb, ensureMemoryStore, ensureGlobalStore, storeTrustOf, resetStoreTrustCache, type StoreTrust, LEVELS, newId, PROJECT_SUBCATEGORIES, projectList, projectCovers, projectLabel, relativeTime, isGlobalProject, isGlobalScope, globalProjectMarker, GLOBAL_PROJECT_CANON, GLOBAL_PROJECT_CANON_EN } from './db.js'
 export { migrateWorkspaceToGlobal, globalStoreRows } from './global-store.js'
 export { migrateLegacy } from './migrate.js'
 export { buildHitInjection, buildInjection, buildReinjection, buildProjectSectionText, readSeen, markSearched, markAccessed, readInjected, markInjected, markProjectQueried, readProjectQueried, markWritten, readWritten, markReinjectPending, clearReinjectPending, isReinjectPending, MAX_REINJECT_PROJECTS, MAX_REINJECT_WRITTEN, sessionsFile, getCurrentProject, setCurrentProject, releaseSeen } from './inject.js'
@@ -2249,4 +2270,4 @@ export { fillTemplate, keyedValue, resolveSlotText, setPromptLang, getPromptLang
 export { DEFAULT_HOME_DIR, activeHomeDir, setActiveHomeDir, dshHomeDir, pluginRootDir, homeDirPresets, resolveHomeDir, switchHomeDir, type HomeDirSwitch } from './home-dir.js'
 export { setMemoryToolGate, registerMemoryTools } from './tools.js'
 export { authGate, connectionAuthOf } from './auth-gate.js'
-export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, handleMemoryTurnFailure, dreamSweepTick, dreamCommandDefinition, isSubagentAgent, dreamSweepOnce, estimateContextTokens, evaluateAutoDreamGate, dreamMaxContextTokens, dreamMaxPerDayTotal, resetGlobalCostCounters, dreamLogPath, DREAM_MAX_ROWS_PER_ROUND, type DreamConfig } from './dream.js'
+export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, handleMemoryTurnFailure, dreamSweepTick, dreamCommandDefinition, isSubagentAgent, dreamSweepOnce, estimateContextTokens, evaluateAutoDreamGate, dreamMaxContextTokens, dreamMaxPerDayTotal, resetGlobalCostCounters, dreamLogPath, DREAM_MAX_ROWS_PER_ROUND, isolatedDreamAvailable, startIsolatedDream, disposeIsolatedDreams, buildIsolatedDreamPrompt, buildIsolatedDigest, ISOLATED_DREAM_META_PREFIX, ISOLATED_DEFAULT_TIMEOUT_MINUTES, ISOLATED_DEFAULT_MAX_PROMPT_CHARS, type DreamConfig } from './dream.js'

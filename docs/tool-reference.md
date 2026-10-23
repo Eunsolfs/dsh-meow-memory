@@ -1,4 +1,4 @@
-# Tool reference (0.33 fork)
+# Tool reference (0.34 fork)
 
 meow-memory registers **10** memory tools. Three bands: **read** (search / read / find_similar / project / list), **write** (remember / update / forget / dream), **directory** (home).
 
@@ -41,7 +41,7 @@ There is also the `/dream` command: type it in the composer to consolidate this 
 | Project panorama | `memory_project` reads the **workspace store only** |
 | Migration | The first **trusted** session in each workspace copies existing soul/user/global rules by original id into the global store, then archives the workspace originals (recoverable); the idempotency flag `globalmigrated:v1:<dir>` lives in the workspace `dream_meta` |
 | Fallback | An absent/untrusted/unavailable global store falls back to 0.32 single-store behaviour; there is **no `trustWorkspaceMemory` config override** for the global store |
-| Backup | `backup.enabled` backs up **only the workspace store**, not the global store |
+| Backup | `backup.enabled` (since 0.34) backs up both the workspace store and the global store (an empty/untrusted global store is skipped; no directory is created for a backup) |
 
 > If the global store is lost after migration: the workspace originals stay archived and are **not re-injected automatically**; restore them per id with `memory_forget` (`mode:'restore'`), or restore a backup of the global directory.
 
@@ -186,6 +186,10 @@ Handles **one** entry by id. Archiving is the default and is recoverable; hard d
 ## `memory_dream` — manual consolidation
 
 No parameters (scope is this window). Same semantics as `/dream`: **manual = explicit intent, so it bypasses the automatic cost gates** — no peak-hour, daily-frequency or context-size gate applies (manual invocation already requires a live window), and it runs up to 3 rounds over the **full session context** (atomic / topic / project summary). If the context is large, run `/compact` first.
+
+0.34's isolated mode (`dream.isolated: true`) applies to **automatic dream only**: automatic dream runs in a spawned child (zero main-context growth, no model-visible dream turn in the main session); **manual `/dream` / `memory_dream` always use the main-agent path** (visible/abortable). Isolated dream itself **cannot be aborted from the UI**, and its digest yields lower consolidation quality than the main-context path.
+
+> Dream only consolidates the workspace store (global entries are maintained via tools/reflection).
 
 ---
 

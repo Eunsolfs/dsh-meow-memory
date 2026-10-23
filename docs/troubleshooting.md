@@ -1,4 +1,4 @@
-# Troubleshooting (0.33 fork)
+# Troubleshooting (0.34 fork)
 
 Start here when installation fails, recall is poor, or behaviour is unexpected.
 
@@ -82,6 +82,8 @@ Or per window: session row "…" menu → **Memory participation** → turn off 
 | Already dreamt today | `budget.dreamMaxPerWindowPerDay` default 1 |
 | **Process-wide quota used up** | `budget.dreamMaxPerDayTotal` default 12/day (process-scoped rolling 24h, reset on restart); `0` = automatic dream off |
 | Context grew mid-dream | Later rounds re-estimate and finish early above `dreamMaxContextTokens` (entries stay unsealed; can be re-dreamed later) |
+| Isolated dream unavailable | `dream.isolated: true` but the host `subagents` service / `spawn` provider (needs `inheritsParentContext=false`) is missing → one log then fallback to the main-agent dream |
+| Isolated dream failed/timed out | The child is disposed, the lease released and the next sweep retries; 3 consecutive failures seal the window (manual `/dream` still works) |
 | Window marked skipped | Restore from the session row "…" menu |
 | Too old / archived | No live agent and >24h old, or archived sessions, are skipped |
 | Last message older than last dream | Only windows whose last message is newer than the last dream are consolidated |
@@ -90,7 +92,11 @@ Reflection additionally has `budget.reflectMinIntervalMinutes` (default 20), `bu
 
 ### How do I consolidate right now?
 
-Type `/dream` in the composer (same as the `memory_dream` tool; **not** subject to peak suppression or the daily cap).
+Type `/dream` in the composer (same as the `memory_dream` tool; **not** subject to peak suppression or the daily cap). Manual always uses the main-agent path (the isolated mode applies to automatic dream only).
+
+### With `dream.isolated` enabled, why is there no dream turn in the main session?
+
+That is 0.34's isolated dream (off by default): automatic dream runs in a **spawned empty-context child session**, so the main session gets no model-visible dream turn (only log-only catalog facts) → **zero main-context growth**; child tokens are still billed and child-written entries are adopted into the parent then sealed. Trade-offs: the child only receives the dream prompts + a recent-conversation digest + entry lists (no tool results/plugin notices), so **consolidation quality is lower than the main-context path**; **isolated dream cannot be aborted from the UI** (it ends on completion/timeout/failure). If `subagents`/`spawn` is unavailable the plugin falls back to the main-agent dream.
 
 ---
 
@@ -156,7 +162,7 @@ Since 0.33 storage is two-layer:
 - Instance-level global directory (global store, logs / window index / migrate state): default `~/.dsh-meow` (**outside `DSH_HOME`**), or `homeDir` / `MEOW_MEMORY_HOME`; `homeDir`/`memory_home` switches move the global store too.
 - Prompt instance overrides: `$DSH_HOME/storages/meow-memory/prompts/<lang>/<slot>.md` (fixed; does not follow `homeDir`/`memory_home` switches).
 
-> On first upgrade to 0.33, the first trusted session per workspace **migrates old workspace soul/user/global rules into the global store and archives the workspace originals** (recoverable); `backup.enabled` backs up the workspace store only, not the global store.
+> On first upgrade to 0.33, the first trusted session per workspace **migrates old workspace soul/user/global rules into the global store and archives the workspace originals** (recoverable); since 0.34 `backup.enabled` backs up both the workspace store and the global store (an empty/untrusted global store is skipped and no directory is created). Backups are each store's `memory.db.bak`.
 
 ---
 
@@ -164,7 +170,7 @@ Since 0.33 storage is two-layer:
 
 ### Which DSH versions are supported?
 
-This fork was **verified on DSH Desktop 0.2.1-rc.2** (Electron 44.7.0 / Node 24.21.0, Windows 11): isolated load succeeded, the 3 routes returned 200/401 under auth, the settings namespace appeared, no apply error. **0.1.x was not tested**; the "supports dsh 0.1.5" claim is gone.
+This fork was **verified on DSH Desktop 0.2.1-rc.2** (Electron 44.7.0 / Node 24.21.0, Windows 11): isolated load succeeded, the 3 routes returned 200/401 under auth, the settings namespace appeared, no apply error; 0.34 additionally ran an isolated live load with a `dream.isolated: true` patch (loaded, no apply error). **0.1.x was not tested**; the "supports dsh 0.1.5" claim is gone.
 
 ### Settings page saves but nothing changes
 

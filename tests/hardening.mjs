@@ -13,7 +13,7 @@
  * No LLM, no harness. Every mutable path is a temp dir; DSH_HOME/MEOW_MEMORY_HOME are
  * redirected before the plugin module is imported so nothing lands in the real home.
  */
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync, utimesSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -26,6 +26,7 @@ const {
   MemoryDb, memoryDbPath, getDb, getGlobalDb, globalDbPath, closeAllDbs, closeGlobalDb,
   ensureMemoryStore, ensureGlobalStore, storeTrustOf, resetStoreTrustCache,
   migrateWorkspaceToGlobal, globalStoreRows,
+  backupGlobalDb,
   recencyWeight, search,
   buildInjection, buildHitInjection, buildReinjection, setCurrentProject,
   registerMemoryTools, setMemoryToolGate, apply,
@@ -33,6 +34,9 @@ const {
   evaluateAutoDreamGate, dreamSweepOnce, dreamLogPath, collectDreamRounds, DREAM_MAX_ROWS_PER_ROUND,
   checkReflectBudget, recordReflectSent, estimateContextTokens, dreamMaxPerDayTotal,
   resetGlobalCostCounters, resetGlobalReflectCounter,
+  isolatedDreamAvailable, startIsolatedDream, disposeIsolatedDreams, buildIsolatedDigest,
+  ISOLATED_DREAM_META_PREFIX, ISOLATED_DEFAULT_TIMEOUT_MINUTES, ISOLATED_DEFAULT_MAX_PROMPT_CHARS,
+  CONFIG_DEFAULTS, factoryDefaultOf, abortDream,
 } = await import('../lib/index.js')
 
 let passed = 0
@@ -783,6 +787,387 @@ const giOf = (ws, dir = '.dsh-meow') => join(ws, dir, '.gitignore')
     check('fuzzy: fuzzyScore noise floor returns 0', mod.fuzzyScore('cache', 'unrelated galaxy') === 0)
   } else {
     console.log('  [note] fuzzyScore is not exported from lib/index.js (src/index.ts export list) — direct unit contract pending; behavior covered via search()')
+  }
+}
+
+// ═══════════════════ 14. Round 2：adoptSessionEntries（子会话条目收养） ═══════════════════
+{
+  const ws = tmp('mmh-adopt-')
+  const db = new MemoryDb(memoryDbPath(ws))
+  const CHILD = 'child-session-adopt'
+  const PARENT = 'parent-session-adopt'
+  const OTHER = 'other-session-adopt'
+  const ids = []
+  for (const level of ['soul', 'user', 'project', 'fact', 'lesson', 'topic', 'rules']) {
+    ids.push(db.insert({
+      level,
+      content: `收养测试 ${level}`,
+      project: level === 'project' || level === 'fact' || level === 'lesson' ? 'femo' : null,
+      title: level === 'topic' ? '收养话题' : null,
+      source_session: CHILD,
+      // 让 project 表 subcategory 保持合法（overview 可空，无强制）
+    }).id)
+  }
+  const otherId = db.insert({ level: 'fact', content: '别的会话条目', source_session: OTHER }).id
+  const moved = db.adoptSessionEntries(CHILD, PARENT)
+  check('adopt: moves child rows across all 7 levels', moved === 7, `got ${moved}`)
+  check('adopt: every level row now owned by parent session', ids.every((id) => db.findById(id)?.row.source_session === PARENT))
+  check('adopt: other session rows untouched', db.findById(otherId)?.row.source_session === OTHER)
+  check('adopt: unknown source session → 0', db.adoptSessionEntries('no-such-source', PARENT) === 0)
+  check('adopt: equal from/to → 0', db.adoptSessionEntries(CHILD, CHILD) === 0)
+  db.close(); closeAllDbs()
+  clean(ws)
+}
+
+// ═══════════════════ 15. Round 2：backupGlobalDb（全局库备份） ═══════════════════
+{
+  const savedActive = activeHomeDir()
+  // ① 全局库不存在 → false，且绝不为了备份去创建 global/
+  const fresh = tmp('mmh-bak-fresh-')
+  closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(fresh)
+  check('backupGlobal: no global store → false and creates nothing', backupGlobalDb() === false && !existsSync(join(fresh, 'global')))
+
+  // ② 可信非空全局库 → 生成 .bak（含行）；立即第二次 mtime 增量跳过；.bak 变旧 → 再备份
+  const home = tmp('mmh-bak-')
+  closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(home)
+  ensureGlobalStore()
+  getGlobalDb().insert({ level: 'soul', content: '全局备份 soul 条目' })
+  check('backupGlobal: trusted non-empty global → true', backupGlobalDb() === true)
+  const bak = join(home, 'global', 'memory.db.bak')
+  check('backupGlobal: .bak created next to the global db', existsSync(bak))
+  const probe = new DatabaseSync(bak, { readOnly: true })
+  check('backupGlobal: snapshot carries global rows', probe.prepare('SELECT COUNT(*) AS n FROM soul').get().n === 1)
+  probe.close()
+  check('backupGlobal: immediate second call skipped (mtime)', backupGlobalDb() === false)
+  const old = (Date.now() - 3600_000) / 1000
+  utimesSync(bak, old, old)
+  check('backupGlobal: stale .bak → backs up again', backupGlobalDb() === true)
+
+  // ③ 可信但空库 → false（空壳无快照价值，且不生成 .bak）
+  const homeEmpty = tmp('mmh-bak-empty-')
+  closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(homeEmpty)
+  ensureGlobalStore(); getGlobalDb()
+  check('backupGlobal: empty trusted global → false, no .bak', backupGlobalDb() === false && !existsSync(join(homeEmpty, 'global', 'memory.db.bak')))
+
+  // ④ 外来/未标记全局库 → false（不备份不可信数据，也不写 .bak）
+  const homeForeign = tmp('mmh-bak-foreign-')
+  closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(homeForeign)
+  mkdirSync(join(homeForeign, 'global'), { recursive: true })
+  const rawForeign = new MemoryDb(join(homeForeign, 'global', 'memory.db'))
+  rawForeign.insert({ level: 'soul', content: '外来全局条目' })
+  rawForeign.close(); closeAllDbs()
+  check('backupGlobal: foreign global → false and no .bak', ensureGlobalStore().trusted === false && backupGlobalDb() === false && !existsSync(join(homeForeign, 'global', 'memory.db.bak')))
+
+  closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(savedActive)
+  clean(fresh); clean(home); clean(homeEmpty); clean(homeForeign)
+}
+
+// ═══════════════════ 16. Round 2：隔离 dream（spawn 子代理） ═══════════════════
+{
+  const baseCfg = () => ({ enabled: true, idleMinutes: 180, checkMinutes: 15, suppressWindows: [], suppressLeadMinutes: 15, timeZone: 'UTC', rulesReviewDays: 2 })
+  const isoCfg = (over = {}) => ({
+    ...baseCfg(),
+    isolated: true, isolatedProvider: 'spawn', isolatedTimeoutMinutes: 20, isolatedMaxPromptChars: 20000, isolatedArchiveChild: false,
+    // 生产路径 resolved.dream 恒定带 budget（index resolveConfig 注入）；隔离路径的主上下文
+    // 闸旁路条件也要求 cfg.budget 存在，故测试按生产形状给全。
+    budget: { dreamMaxContextTokens: 40000, dreamMaxPerWindowPerDay: 1, dreamMaxPerDayTotal: 12 },
+    ...over,
+  })
+  const flush = (ms = 10) => new Promise((r) => setTimeout(r, ms))
+  const deferred = () => {
+    let resolve, reject
+    const promise = new Promise((res, rej) => { resolve = res; reject = rej })
+    return { promise, resolve, reject }
+  }
+  const SPAWN = { name: 'spawn', inheritsParentContext: false, capabilities: { depthLimit: true } }
+  const makeSubagents = ({ provider = SPAWN, childId = 'child-iso-1', result = deferred(), noProvider = false } = {}) => {
+    const specs = []
+    const disposed = []
+    const svc = {
+      getProvider: () => (noProvider ? undefined : provider),
+      startActivation: (spec) => {
+        specs.push(spec)
+        return Promise.resolve({ childId, result: result.promise, dispose: () => { disposed.push(childId) } })
+      },
+    }
+    return { svc, specs, disposed, result }
+  }
+  const ctxWith = ({ agent, svc, warnSpy } = {}) => ({
+    get: (name) => {
+      if (name === 'agents') return { get: () => agent }
+      if (name === 'subagents') return svc
+      if (name === 'workspaceRegistry') return { archiveSession: (id) => { (ctxWith.archived ??= []).push(id) } }
+      return undefined
+    },
+  })
+  const rig = (sid) => {
+    const ws = tmp('mmh-iso-ws-')
+    ensureMemoryStore(ws, '.dsh-meow', { autoGitignore: true, trustWorkspaceMemory: false })
+    const db = getDb(ws, '.dsh-meow')
+    db.touchWindow(sid, ws, Date.now() - 4 * 3600_000) // 空闲 4h
+    const mem = db.insert({ level: 'fact', content: `窗口 ${sid} 的待整理记忆`, project: 'dsh', keywords: ['隔离', '整理', '关键词'], source_session: sid, created_at: 100 })
+    return { ws, db, mem }
+  }
+  const mkAgent = (sid, ws, events = []) => {
+    const a = { session: { header: { id: sid, cwd: ws }, events }, steered: [], followed: [] }
+    a.steer = (m) => a.steered.push(m)
+    a.followup = (m) => a.followed.push(m)
+    return a
+  }
+  const T = 1_700_000_000_000
+
+  // ① 能力判定
+  check('isolated: available with spawn provider', isolatedDreamAvailable(ctxWith({ svc: makeSubagents().svc }), isoCfg()) === true)
+  check('isolated: unavailable without subagents service', isolatedDreamAvailable({ get: () => undefined }, isoCfg()) === false)
+  check('isolated: unavailable for inheritsParentContext provider (fork)',
+    isolatedDreamAvailable(ctxWith({ svc: makeSubagents({ provider: { name: 'spawn', inheritsParentContext: true } }).svc }), isoCfg()) === false)
+
+  // ② 成功路径：started → spec 契约 → 子会话写行 + completed → 收养/收尾/回调
+  {
+    const sid = 'win-iso-ok'
+    const { ws, db } = rig(sid)
+    const agent = mkAgent(sid, ws, [{ type: 'user/message', data: { content: [{ type: 'text', text: '讨论隔离 dream 的设计' }] } }])
+    const sub = makeSubagents({ childId: 'child-iso-ok' })
+    const states = []
+    const rounds = collectDreamRounds(db, sid, ws, '.dsh-meow')
+    const ret = startIsolatedDream(ctxWith({ agent, svc: sub.svc }), agent, db, sid, ws, '.dsh-meow', isoCfg(), rounds, T, (s, st) => states.push(st))
+    check('isolated: startIsolatedDream returns started', ret === 'started', ret)
+    check('isolated: dreamiso meta persisted while running', typeof db.getDreamMeta(ISOLATED_DREAM_META_PREFIX + sid) === 'string')
+    check('isolated: activation spec delivery=caller + provider + cwd + parent',
+      sub.specs.length === 1 && sub.specs[0].delivery === 'caller' && sub.specs[0].provider === 'spawn' &&
+      sub.specs[0].request.cwd === ws && sub.specs[0].request.parent === agent, JSON.stringify(sub.specs[0] && { d: sub.specs[0].delivery, p: sub.specs[0].provider }))
+    const promptText = sub.specs[0]?.request?.prompt?.[0]?.text ?? ''
+    check('isolated: maxDepth=0 (depthLimit capability) and single-text prompt',
+      sub.specs[0]?.request?.maxDepth === 0 && Array.isArray(sub.specs[0]?.request?.prompt) && sub.specs[0].request.prompt.length === 1)
+    check('isolated: prompt respects isolatedMaxPromptChars and carries memory id/keywords',
+      promptText.length <= 20000 && promptText.includes('隔离') && /[0-9a-z]{9}-/.test(promptText), `len=${promptText.length}`)
+    check('isolated: no agentOptions when isolatedModelSpec unset', sub.specs[0]?.request?.agentOptions === undefined)
+    check('isolated: lease claimed while child runs', db.getDreamLease(sid) !== null)
+    // 子会话写 2 条（source_session=childId），然后 completed
+    const childRows = [
+      db.insert({ level: 'fact', content: '子会话新增事实A', project: 'dsh', source_session: 'child-iso-ok', keywords: ['子会话'], updated_at: 100 }),
+      db.insert({ level: 'lesson', content: '子会话新增教训B', source_session: 'child-iso-ok', updated_at: 100 }),
+    ]
+    const eventsLen = agent.session.events.length
+    await flush()
+    sub.result.resolve({ stopReason: 'completed', output: [] })
+    await flush(40)
+    check('isolated: completion releases the lease', db.getDreamLease(sid) === null)
+    const win = db.getWindow(sid)
+    check('isolated: completion sets last_dream_time', win !== undefined && typeof win.last_dream_time === 'number' && win.last_dream_time > 0, JSON.stringify(win))
+    check('isolated: child rows adopted to the parent session', childRows.every((r) => db.findById(r.id)?.row.source_session === sid))
+    check('isolated: adopted rows stamped to dream T', db.findById(childRows[0].id)?.row.updated_at === T)
+    check('isolated: dreamiso meta cleared after completion', db.getDreamMeta(ISOLATED_DREAM_META_PREFIX + sid) === undefined)
+    check('isolated: state callback dreaming → dreamed', JSON.stringify(states) === JSON.stringify(['dreaming', 'dreamed']), JSON.stringify(states))
+    check('isolated: main agent never steered/followed and its events are unchanged',
+      agent.steered.length === 0 && agent.followed.length === 0 && agent.session.events.length === eventsLen)
+    check('isolated: activation disposed after completion', sub.disposed.length >= 1)
+    closeAllDbs(); clean(ws)
+  }
+
+  // ②b isolatedModelSpec → request.agentOptions（复用 delegate.model）
+  {
+    const sid = 'win-iso-model'
+    const { ws, db } = rig(sid)
+    const agent = mkAgent(sid, ws)
+    const sub = makeSubagents({ childId: 'child-iso-model' })
+    const ret = startIsolatedDream(ctxWith({ agent, svc: sub.svc }), agent, db, sid, ws, '.dsh-meow', isoCfg({ isolatedModelSpec: { provider: 'prov', model: 'dream-model' } }), collectDreamRounds(db, sid, ws, '.dsh-meow'), T)
+    check('isolated: isolatedModelSpec forwarded as agentOptions',
+      ret === 'started' && JSON.stringify(sub.specs[0]?.request?.agentOptions) === JSON.stringify({ provider: 'prov', model: 'dream-model' }), JSON.stringify(sub.specs[0]?.request?.agentOptions))
+    disposeIsolatedDreams()
+    check('isolated: dispose after model-spec run releases lease', db.getDreamLease(sid) === null)
+    closeAllDbs(); clean(ws)
+  }
+
+  // ③ 失败路径：result reject / stopReason=error → 失败计数 +1、租约释放（可重试）、回调 active
+  for (const mode of ['reject', 'stop-reason-error']) {
+    const sid = `win-iso-fail-${mode}`
+    const { ws, db } = rig(sid)
+    const agent = mkAgent(sid, ws)
+    const sub = makeSubagents({ childId: `child-fail-${mode}` })
+    const states = []
+    const ret = startIsolatedDream(ctxWith({ agent, svc: sub.svc }), agent, db, sid, ws, '.dsh-meow', isoCfg(), collectDreamRounds(db, sid, ws, '.dsh-meow'), T, (s, st) => states.push(st))
+    check(`isolated failure (${mode}): started`, ret === 'started')
+    await flush()
+    if (mode === 'reject') sub.result.reject(new Error('child exploded'))
+    else sub.result.resolve({ stopReason: 'error', diagnostic: 'model failed' })
+    await flush(40)
+    check(`isolated failure (${mode}): lease released for retry`, db.getDreamLease(sid) === null)
+    check(`isolated failure (${mode}): failure counter incremented`, db.recordDreamFailure(sid, T) === 2)
+    check(`isolated failure (${mode}): callback ends active`, states.length > 0 && states[states.length - 1] === 'active', JSON.stringify(states))
+    check(`isolated failure (${mode}): dreamiso meta cleared`, db.getDreamMeta(ISOLATED_DREAM_META_PREFIX + sid) === undefined)
+    check(`isolated failure (${mode}): child disposed`, sub.disposed.length >= 1)
+    closeAllDbs(); clean(ws)
+  }
+
+  // ④ 超时（小数分钟注入）：dispose + 租约释放 + active
+  {
+    const sid = 'win-iso-timeout'
+    const { ws, db } = rig(sid)
+    const agent = mkAgent(sid, ws)
+    const sub = makeSubagents({ childId: 'child-timeout' }) // result 永不 settle
+    const states = []
+    const ret = startIsolatedDream(ctxWith({ agent, svc: sub.svc }), agent, db, sid, ws, '.dsh-meow', isoCfg({ isolatedTimeoutMinutes: 0.001 }), collectDreamRounds(db, sid, ws, '.dsh-meow'), T, (s, st) => states.push(st))
+    check('isolated timeout: started', ret === 'started')
+    await flush(220)
+    check('isolated timeout: lease released', db.getDreamLease(sid) === null)
+    check('isolated timeout: child activation disposed', sub.disposed.length >= 1)
+    check('isolated timeout: failure counted', db.recordDreamFailure(sid, T) === 2)
+    check('isolated timeout: callback ends active', states[states.length - 1] === 'active', JSON.stringify(states))
+    closeAllDbs(); clean(ws)
+  }
+
+  // ⑤ disposeIsolatedDreams 中途取消：dispose + 租约释放 + meta 清理
+  {
+    const sid = 'win-iso-dispose'
+    const { ws, db } = rig(sid)
+    const agent = mkAgent(sid, ws)
+    const sub = makeSubagents({ childId: 'child-dispose' })
+    startIsolatedDream(ctxWith({ agent, svc: sub.svc }), agent, db, sid, ws, '.dsh-meow', isoCfg(), collectDreamRounds(db, sid, ws, '.dsh-meow'), T)
+    await flush()
+    check('isolated dispose: lease held while running', db.getDreamLease(sid) !== null)
+    disposeIsolatedDreams()
+    check('isolated dispose: activation disposed and lease released', sub.disposed.length >= 1 && db.getDreamLease(sid) === null)
+    check('isolated dispose: dreamiso meta cleared', db.getDreamMeta(ISOLATED_DREAM_META_PREFIX + sid) === undefined)
+    closeAllDbs(); clean(ws)
+  }
+
+  // ⑥ 回退：isolated=false → 主窗口路径（steer），绝不 startActivation
+  {
+    resetGlobalCostCounters()
+    const sid = 'win-fallback-main'
+    const { ws, db } = rig(sid)
+    const agent = mkAgent(sid, ws)
+    const sub = makeSubagents()
+    dreamSweepOnce(ctxWith({ agent, svc: sub.svc }), baseCfg(), '.dsh-meow', new Map([[sid, ws]]))
+    check('fallback: isolated=false uses main-agent dream (memory turn delivered)', (agent.steered.length + agent.followed.length) >= 1 && sub.specs.length === 0)
+    check('fallback: main path claims lease', db.getDreamLease(sid) !== null)
+    abortDream(agent, '.dsh-meow')
+    closeAllDbs(); clean(ws)
+  }
+
+  // ⑦ 回退：provider 缺失 → 主窗口 + unavailable 日志一次；inheritsParentContext=true 同样回退且不刷日志
+  {
+    resetGlobalCostCounters()
+    const sid = 'win-fallback-noprov'
+    const { ws, db } = rig(sid)
+    const agent = mkAgent(sid, ws)
+    const sub = makeSubagents({ noProvider: true })
+    const warns = []
+    const origWarn = console.warn
+    console.warn = (...a) => { warns.push(a.join(' ')) }
+    try {
+      dreamSweepOnce(ctxWith({ agent, svc: sub.svc }), isoCfg(), '.dsh-meow', new Map([[sid, ws]]))
+    } finally {
+      console.warn = origWarn
+    }
+    check('fallback: missing provider → main-agent dream', (agent.steered.length + agent.followed.length) >= 1 && sub.specs.length === 0)
+    // 0.34 修复：provider 缺失时也记一次“隔离不可用 → 回退主窗口”日志（dedupe 在下方用例）。
+    const unavailableWarns = warns.filter((w) => w.includes('隔离 dream 不可用')).length
+    check('fallback: unavailable provider logs exactly once', unavailableWarns === 1, JSON.stringify(unavailableWarns))
+    abortDream(agent, '.dsh-meow')
+
+    const sid2 = 'win-fallback-forkprov'
+    const { ws: ws2, db: db2 } = rig(sid2)
+    const agent2 = mkAgent(sid2, ws2)
+    const sub2 = makeSubagents({ provider: { name: 'spawn', inheritsParentContext: true } })
+    const warns2 = []
+    const origWarn2 = console.warn
+    console.warn = (...a) => { warns2.push(a.join(' ')) }
+    try {
+      dreamSweepOnce(ctxWith({ agent: agent2, svc: sub2.svc }), isoCfg(), '.dsh-meow', new Map([[sid2, ws2]]))
+    } finally {
+      console.warn = origWarn2
+    }
+    check('fallback: fork provider (inheritsParentContext) → main-agent dream', (agent2.steered.length + agent2.followed.length) >= 1 && sub2.specs.length === 0)
+    check('fallback: unavailable log deduped (no repeat warning)', warns2.filter((w) => w.includes('隔离 dream 不可用')).length === 0, JSON.stringify(warns2))
+    abortDream(agent2, '.dsh-meow')
+    closeAllDbs(); clean(ws); clean(ws2)
+  }
+
+  // ⑧ 大主上下文：隔离可用 → 绕过主上下文闸照常隔离；非隔离 → context-oversize 跳过
+  {
+    resetGlobalCostCounters()
+    const sid = 'win-big-iso'
+    const { ws, db } = rig(sid)
+    const bigEvents = [{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(200_000) }] } }]
+    const agent = mkAgent(sid, ws, bigEvents)
+    const sub = makeSubagents({ childId: 'child-big' })
+    dreamSweepOnce(ctxWith({ agent, svc: sub.svc }), isoCfg(), '.dsh-meow', new Map([[sid, ws]]))
+    check('isolated: large main context is NOT a blocker (context gate bypassed)', sub.specs.length === 1 && db.getDreamLease(sid) !== null, `specs=${sub.specs.length} lease=${db.getDreamLease(sid) !== null} skip=${String(db.getDreamMeta('dreamskip:' + sid))}`)
+    check('isolated: no context-oversize dreamskip written on isolated path', db.getDreamMeta('dreamskip:' + sid) === undefined)
+    disposeIsolatedDreams()
+    abortDream(agent, '.dsh-meow')
+
+    resetGlobalCostCounters()
+    const sid2 = 'win-big-main'
+    const { ws: ws2, db: db2 } = rig(sid2)
+    const agent2 = mkAgent(sid2, ws2, [{ type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(200_000) }] } }])
+    dreamSweepOnce(ctxWith({ agent: agent2, svc: makeSubagents().svc }), baseCfg(), '.dsh-meow', new Map([[sid2, ws2]]))
+    check('context gate: non-isolated large context skipped (no lease, no steer)', db2.getDreamLease(sid2) === null && agent2.steered.length === 0)
+    check('context gate: non-isolated oversize persists dreamskip', typeof db2.getDreamMeta('dreamskip:' + sid2) === 'string')
+    closeAllDbs(); clean(ws); clean(ws2)
+  }
+
+  // ⑨ 直接不可用返回值（不抢租约）
+  {
+    const sid = 'win-iso-unavailable-return'
+    const { ws, db } = rig(sid)
+    const agent = mkAgent(sid, ws)
+    const sub = makeSubagents({ noProvider: true })
+    const ret = startIsolatedDream(ctxWith({ agent, svc: sub.svc }), agent, db, sid, ws, '.dsh-meow', isoCfg(), collectDreamRounds(db, sid, ws, '.dsh-meow'), T)
+    check('isolated: startIsolatedDream returns unavailable without provider', ret === 'unavailable' && db.getDreamLease(sid) === null && sub.specs.length === 0, `ret=${ret} lease=${db.getDreamLease(sid) !== null} specs=${sub.specs.length}`)
+    closeAllDbs(); clean(ws)
+  }
+
+  // ⑩ 对话摘录：只取 user/assistant 文本 + 工具名，工具结果/插件通知不进
+  {
+    const digest = buildIsolatedDigest([
+      { type: 'user/message', data: { content: [{ type: 'text', text: '用户说的话' }] } },
+      { type: 'assistant/message', data: { message: { content: [{ type: 'tool-call', name: 'bash' }, { type: 'text', text: '助手的回答' }] } } },
+      { type: 'tool/result', data: { content: [{ type: 'text', text: '工具输出体TOOL_RESULT_BODY' }] } },
+      { type: 'user/message', data: { content: [{ type: 'text', text: '插件通知' }], source: { kind: 'plugin', plugin: 'meow-memory' } } },
+    ], 1000)
+    check('isolated digest: keeps user/assistant text + tool names',
+      digest.includes('user: 用户说的话') && digest.includes('assistant: 助手的回答') && digest.includes('[tools: bash]'))
+    check('isolated digest: excludes tool results and plugin notices', !digest.includes('TOOL_RESULT_BODY') && !digest.includes('插件通知'))
+    check('isolated digest: respects char cap', buildIsolatedDigest([{ type: 'user/message', data: { content: [{ type: 'text', text: 'y'.repeat(500) }] } }], 20).length <= 20)
+  }
+
+  // 清理：任何残留隔离任务都不留给后续用例
+  disposeIsolatedDreams()
+
+  // ═══════════════════ 17. Round 2：配置默认值 + apply 接受 patch 配置 ═══════════════════
+  check('config: dream.isolated default is false', CONFIG_DEFAULTS.dream.isolated === false && factoryDefaultOf({ key: 'isolated', sub: 'dream' }) === false)
+  check('config: isolated defaults (provider/timeout/promptCap/archiveChild)',
+    CONFIG_DEFAULTS.dream.isolatedProvider === 'spawn' && CONFIG_DEFAULTS.dream.isolatedTimeoutMinutes === 20 &&
+    CONFIG_DEFAULTS.dream.isolatedMaxPromptChars === 20000 && CONFIG_DEFAULTS.dream.isolatedArchiveChild === true)
+  check('isolated: timeout/prompt-cap contract exports',
+    ISOLATED_DEFAULT_TIMEOUT_MINUTES === 20 && ISOLATED_DEFAULT_MAX_PROMPT_CHARS === 20000 && ISOLATED_DREAM_META_PREFIX === 'dreamiso:')
+  {
+    const makeCtx = () => {
+      const tools = []
+      const handlers = {}
+      const logs = []
+      const ctx = {
+        logger: { info: (m) => { logs.push(String(m)) }, warn: () => {}, error: () => {} },
+        tools: { register: (t) => { tools.push(t); return () => {} } },
+        on: (name, fn) => { handlers[name] = fn },
+        effect: (fn) => { try { fn() } catch { /* mock */ } return () => {} },
+        get: () => undefined,
+        subagents: { start: () => { throw new Error('subagents not expected') } },
+      }
+      return { ctx, tools, handlers, logs }
+    }
+    const a = makeCtx()
+    let threw = false
+    try {
+      await apply(a.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh', dream: { isolated: true, isolatedProvider: 'spawn' } })
+    } catch {
+      threw = true
+    }
+    check('config: apply accepts dream.isolated:true patch config (no throw, 10 tools)', threw === false && a.tools.length === 10, `tools=${a.tools.length}`)
+    check('config: apply schedules dream normally with isolated config', a.logs.some((m) => m.includes('dream scheduled')))
   }
 }
 

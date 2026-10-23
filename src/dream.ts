@@ -1032,6 +1032,587 @@ export function handleMemoryTurnFailure(db: ReturnType<typeof getDb>, sessionId:
   return 'released'
 }
 
+// ── Phase 2 Round 2：隔离 dream（spawn 子代理，主会话模型上下文零增长）──────────
+//
+// 设计见 research/fork-phase2-dream-spike.md §7：自动 dream 交给 ctx.get('subagents')
+// 的 spawn provider 在**空上下文**子会话里执行——子会话自己调 memory_* 工具写库，
+// 父会话只有一条 log-only subagent/catalog 事实（模型不可见），因此 dream 不再把
+// 3 轮全上下文 + 8–15k 输入/输出留在主会话里。任何能力缺失/失败都退回现有主窗口
+// dream（startWindowDream），绝不阻塞窗口整理。
+//
+// 约定（宿主 @deepseek-ai/dsh-subagent Contract，结构视图，不 import 该包）：
+// - startActivation({provider,label,delivery,signal,request}) → {childId,result,dispose}
+// - delivery:'caller' = 不向父会话发完成通知；result settle 后自行收集
+// - provider.inheritsParentContext 必须为 false（spawn 空上下文；fork 会播种父对话）
+// - 子会话继承父 preset 与 cwd，memory_* 工具（host 级注册）可用；子代理链路已被
+//   pre-step/turn-stopping/memory_dream 守卫跳过，不会递归 dream。
+
+/** 宿主 subagent provider 的结构视图（只声明本插件用到的成员）。 */
+export interface SubagentProviderLike {
+  readonly name?: string
+  readonly inheritsParentContext?: boolean
+  readonly capabilities?: { readonly depthLimit?: boolean; readonly agentOptions?: boolean }
+}
+
+export interface SubagentResultLike {
+  readonly stopReason?: string
+  readonly output?: ReadonlyArray<{ readonly type?: string; readonly text?: string }>
+  readonly diagnostic?: string
+}
+
+export interface SubagentActivationLike {
+  readonly childId?: string
+  readonly result: Promise<SubagentResultLike>
+  dispose(): Promise<void> | void
+}
+
+export interface SubagentActivationSpecLike {
+  readonly provider: string
+  readonly label: string
+  readonly delivery: 'parent' | 'caller'
+  readonly signal: AbortSignal
+  readonly request: {
+    readonly cwd?: string
+    readonly parent: unknown
+    readonly prompt: ReadonlyArray<{ readonly type: 'text'; readonly text: string }>
+    readonly agentOptions?: { readonly provider?: string; readonly model?: string }
+    readonly outputSchema?: unknown
+    readonly maxDepth?: number
+  }
+}
+
+export interface SubagentsLike {
+  getProvider?: (name: string) => SubagentProviderLike | undefined
+  startActivation?: (spec: SubagentActivationSpecLike) => Promise<SubagentActivationLike>
+}
+
+/** dreamiso:<sid> 的 meta 键前缀（跨进程/重启可见的“隔离任务在途”标记，诊断用）。 */
+export const ISOLATED_DREAM_META_PREFIX = 'dreamiso:'
+export const ISOLATED_DEFAULT_TIMEOUT_MINUTES = 20
+export const ISOLATED_DEFAULT_MAX_PROMPT_CHARS = 20_000
+/** 对话摘录最多回看的事件条数（近期优先；不读 tool/result，成本有界）。 */
+const ISOLATED_DIGEST_MAX_EVENTS = 200
+
+interface IsolatedDreamRun {
+  readonly activation: SubagentActivationLike
+  readonly childId: string | undefined
+  readonly db: ReturnType<typeof getDb>
+  readonly sessionId: string
+  readonly controller: AbortController
+}
+
+/** 进程内在途隔离 dream（disposeIsolatedDreams / 防重入用）。 */
+const isolatedDreams = new Map<string, IsolatedDreamRun>()
+
+interface PendingIsolatedStart {
+  readonly controller: AbortController
+  readonly db: ReturnType<typeof getDb>
+  readonly sessionId: string
+}
+
+/** 已抢租约、activation 尚未发布的启动（dispose/HMR 时也要释放，避免僵尸租约）。 */
+const pendingIsolatedStarts = new Map<string, PendingIsolatedStart>()
+
+/** 隔离能力缺失的日志去重（每进程一次，避免 15min/轮刷屏）。 */
+let isolatedUnavailableLogged = false
+
+/** 从插件 ctx 解析 subagents 服务（ctx.get 缺失/抛错一律 undefined → 主窗口 dream 兜底）。 */
+function subagentsOf(ctx: Context): SubagentsLike | undefined {
+  try {
+    return (ctx as { get?: (name: string) => unknown }).get?.('subagents') as SubagentsLike | undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** 隔离 dream 是否可用：服务 + provider + 必须是“空上下文”provider（spawn，非 fork）。 */
+export function isolatedDreamAvailable(ctx: Context, cfg: DreamConfig | undefined): boolean {
+  const svc = subagentsOf(ctx)
+  if (svc === undefined || typeof svc.startActivation !== 'function' || typeof svc.getProvider !== 'function') return false
+  const provider = svc.getProvider(cfg?.isolatedProvider ?? 'spawn')
+  return provider !== undefined && provider.inheritsParentContext === false
+}
+
+/** budget.isolatedTimeoutMinutes（默认 20 分钟；非法回默认）。 */
+export function isolatedDreamTimeoutMinutes(cfg: DreamConfig | undefined): number {
+  const v = budgetNumber(cfg?.isolatedTimeoutMinutes)
+  return v !== undefined && v > 0 ? v : ISOLATED_DEFAULT_TIMEOUT_MINUTES
+}
+
+/** budget.isolatedMaxPromptChars（默认 20000 字符；非法回默认）。 */
+export function isolatedDreamMaxPromptChars(cfg: DreamConfig | undefined): number {
+  const v = budgetNumber(cfg?.isolatedMaxPromptChars)
+  return v !== undefined && v >= 2000 ? v : ISOLATED_DEFAULT_MAX_PROMPT_CHARS
+}
+
+/**
+ * 生成父会话最近对话摘录（隔离 dream 的上下文替代品）：
+ * 只取 user/assistant 的**文本**与 assistant 调用过的**工具名**，绝不带 tool/result 内容；
+ * 从最新事件向前累积到 maxChars，按时间正序输出。插件自身指令消息（source.kind=plugin）
+ * 跳过，避免把历史 dream/reflect 标记回灌。
+ */
+export function buildIsolatedDigest(events: readonly unknown[], maxChars = 12_000): string {
+  const budget = Math.max(0, Math.floor(maxChars))
+  if (budget === 0 || events.length === 0) return ''
+  const lines: string[] = []
+  let used = 0
+  const first = Math.max(0, events.length - ISOLATED_DIGEST_MAX_EVENTS)
+  for (let i = events.length - 1; i >= first && used < budget; i--) {
+    const e = events[i] as {
+      type?: string
+      data?: {
+        source?: { kind?: string; plugin?: string }
+        content?: Array<{ type?: string; text?: string }>
+        message?: { content?: Array<{ type?: string; name?: string; text?: string }> }
+      }
+    }
+    let line: string | undefined
+    if (e?.type === 'user/message') {
+      if (e.data?.source?.kind === 'plugin') continue
+      const text = (e.data?.content ?? [])
+        .filter((b) => b.type === 'text' && typeof b.text === 'string')
+        .map((b) => (b.text ?? '').replace(/\s+/g, ' ').trim())
+        .filter((t) => t.length > 0)
+        .join(' ')
+      if (text.length === 0) continue
+      line = `user: ${text.length > 600 ? `${text.slice(0, 600)}…` : text}`
+    } else if (e?.type === 'assistant/message') {
+      const texts: string[] = []
+      const tools: string[] = []
+      for (const b of e.data?.message?.content ?? []) {
+        if (b.type === 'text' && typeof b.text === 'string' && b.text.trim().length > 0) {
+          texts.push(b.text.replace(/\s+/g, ' ').trim())
+        } else if (b.type === 'tool-call' && typeof b.name === 'string' && b.name.length > 0) {
+          tools.push(b.name)
+        }
+      }
+      const text = texts.join(' ')
+      if (text.length === 0 && tools.length === 0) continue
+      line = `assistant: ${text.length > 600 ? `${text.slice(0, 600)}…` : text}${tools.length > 0 ? `${text.length > 0 ? ' ' : ''}[tools: ${tools.join(', ')}]` : ''}`.trim()
+    } else {
+      continue // tool/result、turn/step 等一律不进摘录（工具结果可能很大，且含原始输出）
+    }
+    if (used + line.length + 1 > budget) {
+      const room = budget - used - 1
+      if (room > 40) lines.unshift(`${line.slice(0, room)}…`)
+      break
+    }
+    lines.unshift(line)
+    used += line.length + 1
+  }
+  return lines.join('\n')
+}
+
+/**
+ * 构造隔离 dream 的**单条**子代理 prompt：拼接既有 prompt 槽（dream-header /
+ * dream-atomic / dream-topic / dream-project-summary）+ 对话摘录 + 截断后的条目清单。
+ * 不新增 prompt 文件；超 budget.isolatedMaxPromptChars 时按「最旧条目 → 项目 →
+ * 摘录头部 → 硬截断」顺序丢弃，保证 token 有上界。
+ */
+export function buildIsolatedDreamPrompt(
+  db: ReturnType<typeof getDb>,
+  rounds: DreamRound[],
+  T: number,
+  digest: string,
+  maxChars = ISOLATED_DEFAULT_MAX_PROMPT_CHARS,
+): { text: string; truncated: boolean } {
+  // db 保留形参：与 buildDreamMessage/startWindowDream 同签名，便于测试与后续按库裁剪。
+  void db
+  const cap = Math.max(2000, Math.floor(maxChars))
+  const lbl = (key: string, params?: Record<string, string>): string => fillTemplate(keyedValue('labels', key), params)
+  const kwLabel = lbl('dream.row.keywordsLabel')
+  const noneLabel = lbl('dream.row.none')
+  const atomic = rounds.find((r) => r.kind === 'atomic')
+  const topic = rounds.find((r) => r.kind === 'topic')
+  const project = rounds.find((r) => r.kind === 'project-summary')
+  let atomicRows: MemoryRow[] = atomic === undefined ? [] : atomic.groups.flatMap((g) => g.rows)
+  let topicRows: MemoryRow[] = topic === undefined ? [] : topic.groups.flatMap((g) => g.rows)
+  let projects: string[] = project?.projects === undefined ? [] : [...project.projects]
+  let digestText = digest
+  let truncated = false
+
+  const groupsText = (rows: MemoryRow[]): string =>
+    groupByProject(rows)
+      .map((g) => {
+        const name = g.name === '' ? lbl('dream.groupUnlabeled') : g.name
+        return `${lbl('dream.groupHeader', { name })}\n${g.rows.map((r) => formatRow(r, kwLabel, noneLabel)).join('\n')}`
+      })
+      .join('\n\n')
+
+  const assemble = (): string => {
+    const parts: string[] = [`${DREAM_MARKER} ${lbl('dream.title')}`, '']
+    parts.push(...resolveSlotText('dream-header', {
+      timestamp: formatTime(T),
+      idx: '1',
+      total: '3',
+      roundKind: lbl('dream.round.atomic'),
+    }).split('\n'))
+    if (atomicRows.length > 0) {
+      parts.push('', ...resolveSlotText('dream-atomic', { list: `\n\n${groupsText(atomicRows)}` }).split('\n'))
+    }
+    parts.push('', ...resolveSlotText('dream-topic', {
+      list: topicRows.length === 0 ? `\n${lbl('dream.topic.empty')}` : `\n\n${groupsText(topicRows)}`,
+    }).split('\n'))
+    if (projects.length > 0) {
+      parts.push('', ...resolveSlotText('dream-project-summary', { projects: projects.join('、') }).split('\n'))
+    }
+    if (digestText.length > 0) parts.push('', '---', digestText)
+    return parts.join('\n')
+  }
+
+  /** 丢弃清单里最旧的一条（atomic/topic 合并按 updated_at 升序）。 */
+  const dropOldestRow = (): boolean => {
+    const candidates: Array<{ kind: 'atomic' | 'topic'; index: number; at: number }> = []
+    atomicRows.forEach((r, index) => candidates.push({ kind: 'atomic', index, at: r.updated_at }))
+    topicRows.forEach((r, index) => candidates.push({ kind: 'topic', index, at: r.updated_at }))
+    if (candidates.length === 0) return false
+    candidates.sort((a, b) => a.at - b.at)
+    const victim = candidates[0]
+    if (victim.kind === 'atomic') atomicRows = atomicRows.filter((_, i) => i !== victim.index)
+    else topicRows = topicRows.filter((_, i) => i !== victim.index)
+    return true
+  }
+
+  let text = assemble()
+  while (text.length > cap) {
+    truncated = true
+    if (dropOldestRow()) {
+      text = assemble()
+      continue
+    }
+    if (projects.length > 0) {
+      projects = projects.slice(0, -1)
+      text = assemble()
+      continue
+    }
+    if (digestText.length > 0) {
+      const keep = Math.max(0, digestText.length - (text.length - cap) - 1)
+      digestText = keep > 0 ? digestText.slice(digestText.length - keep) : ''
+      text = assemble()
+      if (text.length <= cap) break
+      if (digestText.length === 0) { text = text.slice(0, cap); break }
+      continue
+    }
+    text = text.slice(0, cap)
+    break
+  }
+  return { text, truncated }
+}
+
+/** 隔离 dream 的失败路径：沿用主路径的失败计数/释放/封存语义（DREAM_MAX_ATTEMPTS）。 */
+function recordIsolatedFailure(
+  db: ReturnType<typeof getDb>,
+  sessionId: string,
+  T: number,
+  reason: string,
+  onDreamState?: DreamStateCallback,
+): void {
+  stopDreamHeartbeat(sessionId)
+  const fails = db.recordDreamFailure(sessionId, T)
+  if (fails >= DREAM_MAX_ATTEMPTS) {
+    const stamped = db.stampDream(sessionId, T)
+    db.finishDream(sessionId, Date.now())
+    db.logDream(
+      `isolated dream failed (${reason}): ${shortSessionId(sessionId)} fails=${fails} sealed stamped=${stamped}`,
+      { before: undefined, after: undefined },
+    )
+    dreamLog(`isolated-dream sealed session=${shortSessionId(sessionId)} reason=${reason} fails=${fails}/${DREAM_MAX_ATTEMPTS} stamped=${stamped}`)
+    console.warn(`[meow-memory] 隔离 dream 连续失败 ${fails} 次（窗口 ${shortSessionId(sessionId)}），按封存止损；该窗口可手动 /dream`)
+    onDreamState?.(sessionId, 'dreamed')
+    return
+  }
+  db.releaseDream(sessionId)
+  db.logDream(
+    `isolated dream failed (${reason}): ${shortSessionId(sessionId)} fails=${fails} released`,
+    { before: undefined, after: undefined },
+  )
+  dreamLog(`isolated-dream released session=${shortSessionId(sessionId)} reason=${reason} fails=${fails}/${DREAM_MAX_ATTEMPTS} (retry next sweep)`)
+  onDreamState?.(sessionId, 'active')
+}
+
+/** 子代理 activation 已发布后的异步执行体：收集结果 → 收养条目 → 收尾/失败。 */
+async function runIsolatedDream(
+  ctx: Context,
+  db: ReturnType<typeof getDb>,
+  sessionId: string,
+  workspace: string,
+  dir: string,
+  cfg: DreamConfig,
+  activation: SubagentActivationLike,
+  controller: AbortController,
+  T: number,
+  timeoutMinutes: number,
+  promptChars: number,
+  promptTruncated: boolean,
+  onDreamState?: DreamStateCallback,
+): Promise<void> {
+  const sid = shortSessionId(sessionId)
+  const childId = typeof activation.childId === 'string' && activation.childId.length > 0 ? activation.childId : undefined
+  const entry: IsolatedDreamRun = {
+    activation,
+    childId,
+    db,
+    sessionId,
+    controller,
+  }
+  isolatedDreams.set(sessionId, entry)
+  try {
+    db.setDreamMeta(ISOLATED_DREAM_META_PREFIX + sessionId, JSON.stringify({ at: Date.now(), T, childId: childId ?? null }))
+  } catch {
+    /* meta 失败不阻塞 */
+  }
+  armDreamHeartbeat(sessionId, workspace, dir)
+  onDreamState?.(sessionId, 'dreaming')
+  dreamLog(`isolated-dream start sid=${sid} child=${childId === undefined ? '?' : shortSessionId(childId)} chars=${promptChars}${promptTruncated ? ' truncated' : ''}`)
+
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<'timeout'>((resolve) => {
+    // 允许小数分钟（测试可注入极短超时；生产 schema 最小 1 分钟）。
+    timer = setTimeout(() => resolve('timeout'), Math.max(1, Math.round(Math.max(0, timeoutMinutes) * 60_000)))
+    if (typeof timer === 'object' && timer !== null && typeof (timer as { unref?: () => void }).unref === 'function') {
+      ;(timer as { unref: () => void }).unref()
+    }
+  })
+  type RaceOutcome = { kind: 'result'; result: SubagentResultLike } | { kind: 'error'; error: unknown } | 'timeout'
+  let outcome: RaceOutcome
+  try {
+    const resultPromise = activation?.result
+    if (resultPromise === undefined || resultPromise === null || typeof (resultPromise as { then?: unknown }).then !== 'function') {
+      outcome = { kind: 'error', error: new Error('activation.result is missing') }
+    } else {
+      const settlement = resultPromise
+        .then((result): RaceOutcome => ({ kind: 'result', result }))
+        .catch((error: unknown): RaceOutcome => ({ kind: 'error', error }))
+      outcome = await Promise.race([settlement, timeout])
+    }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+
+  try {
+    // 插件 dispose/HMR 已接管（release 视同完成）：本回调查账即可，不再二次改库。
+    if (isolatedDreams.get(sessionId) !== entry) return
+    // 收养放在结果判定之前：子代理可能已经写了一半记忆（max-tokens/error 也保留成果），
+    // 收归父窗口后下一轮 dream/封存都能看到，绝不把半成品挂在子会话名下变孤儿。
+    let adopted = 0
+    if (childId !== undefined) {
+      try {
+        adopted = db.adoptSessionEntries(childId, sessionId)
+      } catch (e) {
+        dreamLog(`isolated-dream adopt-failed child=${shortSessionId(childId)} err=${e instanceof Error ? e.message : String(e)}`)
+      }
+    }
+    if (outcome !== 'timeout' && outcome.kind === 'result' && outcome.result?.stopReason === 'completed') {
+      finalizeDream(db, sessionId, workspace, dir, T, 'done', 1, onDreamState)
+      clearAutoDreamSkip(db, sessionId)
+      dreamLog(`isolated-dream done sid=${sid} child=${childId === undefined ? '?' : shortSessionId(childId)} adopted=${adopted}${promptTruncated ? ' truncated' : ''}`)
+      return
+    }
+    const reason = outcome === 'timeout'
+      ? 'timeout'
+      : outcome.kind === 'error'
+        ? `error: ${outcome.error instanceof Error ? outcome.error.message : String(outcome.error)}`
+        : String(outcome.result?.stopReason ?? 'unknown')
+    if (outcome === 'timeout') {
+      try {
+        entry.controller.abort()
+        await activation.dispose()
+      } catch {
+        /* 超时取消失败：失败计数已足够 */
+      }
+    }
+    dreamLog(`isolated-dream failed sid=${sid} reason=${reason} adopted=${adopted}`)
+    recordIsolatedFailure(db, sessionId, T, reason, onDreamState)
+  } finally {
+    if (isolatedDreams.get(sessionId) === entry) isolatedDreams.delete(sessionId)
+    try {
+      db.delDreamMeta(ISOLATED_DREAM_META_PREFIX + sessionId)
+    } catch {
+      /* 清理失败不阻塞 */
+    }
+    try {
+      await activation.dispose()
+    } catch {
+      /* dispose 失败不阻塞收尾 */
+    }
+    if (cfg.isolatedArchiveChild !== false && childId !== undefined) {
+      try {
+        const registry = (ctx as { get?: (name: string) => unknown }).get?.('workspaceRegistry') as
+          | { archiveSession?: (id: string) => unknown }
+          | undefined
+        registry?.archiveSession?.(childId)
+      } catch {
+        /* 归档失败不阻塞 */
+      }
+    }
+  }
+}
+
+/**
+ * 启动隔离 dream（同步返回，子代理异步执行）：
+ * 1) 成本闸已在 dreamSweepOnce 过完；这里先原子抢租约（跨实例串行）
+ * 2) startActivation(provider, delivery:'caller') 起空上下文子代理；发布后记 meta/心跳/广播
+ * 3) 结果 settle：completed → 收养子会话条目 + finalizeDream；其余/超时 → 失败计数 + 释放
+ * @returns 'started' 已接管；'unavailable' 能力缺失（调用方退回主窗口 dream）；
+ *          'rejected' 租约被占/启动瞬态失败（下个 sweep 重试，不要同轮双跑主路径）。
+ */
+export function startIsolatedDream(
+  ctx: Context,
+  agent: unknown,
+  db: ReturnType<typeof getDb>,
+  sessionId: string,
+  workspace: string,
+  dir: string,
+  cfg: DreamConfig,
+  rounds: DreamRound[],
+  T: number,
+  onDreamState?: DreamStateCallback,
+): 'started' | 'unavailable' | 'rejected' {
+  const sid = shortSessionId(sessionId)
+  const svc = subagentsOf(ctx)
+  const providerName = cfg.isolatedProvider ?? 'spawn'
+  const provider = svc?.getProvider?.(providerName)
+  if (svc === undefined || typeof svc.startActivation !== 'function' || provider === undefined || provider.inheritsParentContext !== false) {
+    return 'unavailable'
+  }
+  if (isolatedDreams.has(sessionId)) return 'rejected' // 本进程已有隔离任务在途
+  const promptCap = isolatedDreamMaxPromptChars(cfg)
+  let prompt: { text: string; truncated: boolean }
+  try {
+    const digest = buildIsolatedDigest(agentSessionEvents(agent), Math.max(2000, Math.floor(promptCap * 0.45)))
+    prompt = buildIsolatedDreamPrompt(db, rounds, T, digest, promptCap)
+  } catch (e) {
+    // prompt 槽缺失/文案层异常：不抢租约、不阻塞扫描（主窗口路径同样会缺文案，直接下轮）
+    dreamLog(`isolated-dream prompt-failed sid=${sid} err=${e instanceof Error ? e.message : String(e)}`)
+    return 'rejected'
+  }
+  if (!db.claimDream(sessionId, newDreamOwner(), T, DREAM_LEASE_MS)) return 'rejected'
+  try {
+    db.setDreamMeta(ISOLATED_DREAM_META_PREFIX + sessionId, JSON.stringify({ at: Date.now(), T, provider: providerName, childId: null }))
+  } catch {
+    /* meta 失败不阻塞（dreamiso 只是诊断标记） */
+  }
+  const controller = new AbortController()
+  const timeoutMinutes = isolatedDreamTimeoutMinutes(cfg)
+  const pending: PendingIsolatedStart = { controller, db, sessionId }
+  pendingIsolatedStarts.set(sessionId, pending)
+  let startPromise: Promise<SubagentActivationLike>
+  try {
+    startPromise = svc.startActivation({
+      provider: providerName,
+      label: `memory-dream ${sid}`,
+      delivery: 'caller',
+      signal: controller.signal,
+      request: {
+        cwd: workspace,
+        parent: agent,
+        prompt: [{ type: 'text', text: prompt.text }],
+        ...(cfg.isolatedModelSpec !== undefined ? { agentOptions: cfg.isolatedModelSpec } : {}),
+        ...(provider.capabilities?.depthLimit === true ? { maxDepth: 0 } : {}),
+      },
+    })
+    if (startPromise === undefined || startPromise === null || typeof (startPromise as { then?: unknown }).then !== 'function') {
+      throw new Error('startActivation did not return a promise')
+    }
+  } catch (e) {
+    if (pendingIsolatedStarts.get(sessionId) === pending) pendingIsolatedStarts.delete(sessionId)
+    try {
+      db.delDreamMeta(ISOLATED_DREAM_META_PREFIX + sessionId)
+      db.releaseDream(sessionId)
+    } catch {
+      /* 释放失败：租约 30min 过期自愈 */
+    }
+    dreamLog(`isolated-dream start-failed sid=${sid} provider=${providerName} err=${e instanceof Error ? e.message : String(e)}`)
+    onDreamState?.(sessionId, 'active')
+    return 'rejected'
+  }
+  void Promise.resolve(startPromise).then(
+    (activation) => {
+      if (pendingIsolatedStarts.get(sessionId) !== pending) {
+        // 启动期间插件已 dispose：取消这个迟到的子代理，不再改库（租约已被 dispose 释放）。
+        pendingIsolatedStarts.delete(sessionId)
+        try {
+          void Promise.resolve(activation.dispose()).catch(() => {})
+        } catch {
+          /* ignore */
+        }
+        return
+      }
+      pendingIsolatedStarts.delete(sessionId)
+      void runIsolatedDream(ctx, db, sessionId, workspace, dir, cfg, activation, controller, T, timeoutMinutes, prompt.text.length, prompt.truncated, onDreamState)
+        .catch((error: unknown) => {
+          // 兜底：隔离执行体自身异常也不能留僵尸租约/心跳（30min 自愈之前就清掉）。
+          try {
+            db.delDreamMeta(ISOLATED_DREAM_META_PREFIX + sessionId)
+            db.releaseDream(sessionId)
+          } catch {
+            /* 租约自愈兜底 */
+          }
+          stopDreamHeartbeat(sessionId)
+          dreamLog(`isolated-dream crashed sid=${sid} err=${error instanceof Error ? error.message : String(error)}`)
+          onDreamState?.(sessionId, 'active')
+        })
+    },
+    (error: unknown) => {
+      // 启动瞬态失败（容量/鉴权/provider 拒绝）：不记失败次数，释放租约等下一轮。
+      if (pendingIsolatedStarts.get(sessionId) === pending) pendingIsolatedStarts.delete(sessionId)
+      try {
+        db.delDreamMeta(ISOLATED_DREAM_META_PREFIX + sessionId)
+        db.releaseDream(sessionId)
+      } catch {
+        /* 释放失败：租约自愈 */
+      }
+      dreamLog(`isolated-dream start-rejected sid=${sid} provider=${providerName} err=${error instanceof Error ? error.message : String(error)}`)
+      onDreamState?.(sessionId, 'active')
+    },
+  )
+  return 'started'
+}
+
+/**
+ * 插件 dispose/HMR 清理：取消所有在途隔离 dream、释放租约、清 meta、停心跳（绝不留
+ * 30min 僵尸租约堵住后续自动整理）。子代理 settle 回调会检测到自己已被接管并跳过改库。
+ */
+export function disposeIsolatedDreams(): void {
+  const runs = [...isolatedDreams.values()]
+  isolatedDreams.clear()
+  const pendings = [...pendingIsolatedStarts.values()]
+  pendingIsolatedStarts.clear()
+  for (const pending of pendings) {
+    try {
+      pending.controller.abort()
+    } catch {
+      /* ignore */
+    }
+    try {
+      pending.db.delDreamMeta(ISOLATED_DREAM_META_PREFIX + pending.sessionId)
+      pending.db.releaseDream(pending.sessionId)
+    } catch {
+      /* 库已关/热重载：租约过期自愈 */
+    }
+    stopDreamHeartbeat(pending.sessionId)
+  }
+  for (const run of runs) {
+    stopDreamHeartbeat(run.sessionId)
+    try {
+      run.controller.abort()
+    } catch {
+      /* ignore */
+    }
+    try {
+      run.db.delDreamMeta(ISOLATED_DREAM_META_PREFIX + run.sessionId)
+      run.db.releaseDream(run.sessionId)
+    } catch {
+      /* 库已关/热重载：租约过期自愈 */
+    }
+    try {
+      void Promise.resolve(run.activation.dispose()).catch(() => {})
+    } catch {
+      /* dispose 失败不阻塞 dispose 链 */
+    }
+  }
+}
+
 // ── 定时器 ──────────────────────────────────────────────────────────────────
 
 export interface DreamConfig {
@@ -1054,6 +1635,20 @@ export interface DreamConfig {
   requireLiveAgent?: boolean
   /** 0.32 成本预算（Lead 从 resolved.budget 传入；缺省按 0.32 出厂默认）。 */
   budget?: DreamBudget
+  /** Phase 2 Round 2：自动 dream 交给 spawn 子代理在空上下文里执行（主会话模型可见
+   *  上下文零增长）。默认 false；服务/provider 不可用或被拒时自动退回主窗口 dream。
+   *  手动 /dream、memory_dream 始终走主窗口路径（用户可看进度/可中止）。 */
+  isolated?: boolean
+  /** 隔离执行使用的 subagent provider 名（默认 'spawn'；需 inheritsParentContext===false）。 */
+  isolatedProvider?: string
+  /** 子代理超时分钟数（默认 20；超时 dispose 并按失败计数处理）。 */
+  isolatedTimeoutMinutes?: number
+  /** 单条子代理 prompt 字符上限（默认 20000；超限按最旧条目→项目→摘录顺序截断）。 */
+  isolatedMaxPromptChars?: number
+  /** 子代理 settle 后归档其会话（默认 true；origin=subagent 会话本就不进图形侧栏）。 */
+  isolatedArchiveChild?: boolean
+  /** 隔离 dream 子代理的 agentOptions（Lead 从 delegate.model 传入；缺省继承父 route）。 */
+  isolatedModelSpec?: { provider?: string; model?: string }
 }
 
 /** rulesReviewDays 的单一默认来源（已抽到 defaults.ts，与 client 设置页「恢复默认」共用）：
@@ -1251,7 +1846,19 @@ export function dreamSweepOnce(ctx: Context, cfg: DreamConfig, dir: string, wind
     }
     // 0.32 成本闸（只挡自动触发；手动 /dream、memory_dream 不过这里）：
     // 24h 频次上限 + 上下文超限 24h 冷却 + 本次会话上下文 token 估算。
-    const gate = evaluateAutoDreamGate(db, sessionId, agent, cfg)
+    // Phase 2：隔离 dream 的 child prompt 有独立上限、不回放主上下文，主上下文大小闸
+    // 对隔离路径不适用（否则大会话永远轮不到隔离整理）；频次/冷却/峰值闸仍然生效。
+    const isoRequested = cfg.isolated === true
+    const isoReady = isoRequested && isolatedDreamAvailable(ctx, cfg)
+    if (isoRequested && !isoReady && !isolatedUnavailableLogged) {
+      isolatedUnavailableLogged = true
+      dreamLog('isolated-dream unavailable (subagents/spawn provider) -> fallback main-agent dream')
+      console.warn('[meow-memory] 隔离 dream 不可用（subagents 服务/spawn provider 缺失或非空上下文）：退回主窗口 dream')
+    }
+    const gateCfg = isoReady
+      ? { ...cfg, budget: { ...(cfg.budget ?? {}), dreamMaxContextTokens: Number.MAX_SAFE_INTEGER } }
+      : cfg
+    const gate = evaluateAutoDreamGate(db, sessionId, agent, gateCfg)
     if (!gate.allowed) {
       logAutoDreamGate(sessionId, gate)
       continue
@@ -1261,6 +1868,23 @@ export function dreamSweepOnce(ctx: Context, cfg: DreamConfig, dir: string, wind
     if (maxTotal <= 0 || globalDreamStartsInWindow(Date.now()) >= maxTotal) {
       dreamLog(`check global-daily-cap sid=${shortSessionId(sessionId)} cap=${maxTotal}`)
       continue
+    }
+    // Phase 2 Round 2：隔离 dream（spawn 子代理，主会话模型可见上下文零增长）。
+    // 能力缺失 → 记一次日志后回退主窗口 dream；租约被占/启动瞬态失败 → 下轮重试，不双跑。
+    if (isoReady) {
+      const T = w.last_event_time > 0 ? w.last_event_time : Date.now()
+      const rounds = collectDreamRounds(db, sessionId, workspace, dir, cfg.rulesReviewDays)
+      const isolated = startIsolatedDream(ctx, agent, db, sessionId, workspace, dir, cfg, rounds, T, onDreamState)
+      if (isolated === 'started') {
+        recordAutoDreamStart(db, sessionId) // 自动频次计数（手动 dream 不占额度）
+        return // 一轮一个窗口
+      }
+      if (isolated === 'rejected') continue
+      if (!isolatedUnavailableLogged) {
+        isolatedUnavailableLogged = true
+        dreamLog('isolated-dream unavailable (subagents/spawn provider) -> fallback main-agent dream')
+        console.warn('[meow-memory] 隔离 dream 不可用（subagents 服务/spawn provider 缺失或非空上下文）：退回主窗口 dream')
+      }
     }
     const started = startWindowDream(ctx, agent as never, workspace, dir, onDreamState, cfg.rulesReviewDays)
     if (started) {
