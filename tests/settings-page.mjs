@@ -486,5 +486,91 @@ check('0.37 factoryDefaultOf: dream isolated + budget defaults',
     JSON.stringify(calls))
 }
 
+// ── 8. 0.37.1：危险开关二次确认 + 新提示 + 40 keys parity ──────────────────
+console.log('=== 8. 0.37.1 danger toggle / hints / 40-key parity ===')
+const NEW_KEYS_0371 = [
+  'settings.field.security.allowHomeSwitch.hint',
+  'settings.field.security.debugLogs.hint',
+  'settings.field.security.trustWorkspaceMemory.confirm',
+]
+settings.setUiLocaleForTest('zh')
+const pageDanger = texts(renderPage())
+check('0.37.1 zh allowHomeSwitch hint rendered', pageDanger.some((s) => s.includes('模型可因配置变化自动迁移')))
+check('0.37.1 zh debugLogs hint rendered', pageDanger.some((s) => s.includes('仅排障时开')))
+check('0.37.1 zh trustWorkspaceMemory confirm text in dictionary',
+  settings.t('settings.field.security.trustWorkspaceMemory.confirm').includes('确定要信任所有既有工作区的同名记忆库'))
+check('0.37.1 zh dream isolated hint expanded (no UI abort / timeout / seal)',
+  pageDanger.some((s) => s.includes('无 UI 中止')))
+const ALL_ADVANCED_40 = ADVANCED_KEYS.concat(NEW_KEYS_0371)
+check('0.37.1: 40 advanced UI keys registered in UI_KEYS', ALL_ADVANCED_40.length === 40 && ALL_ADVANCED_40.every((k) => settings.UI_KEYS.includes(k)))
+for (const lang of ['zh', 'en', 'pt-br']) {
+  settings.setUiLocaleForTest(lang)
+  check(`0.37.1: all 40 advanced keys translated (${lang})`,
+    ALL_ADVANCED_40.every((k) => typeof settings.t(k) === 'string' && settings.t(k).length > 0 && settings.t(k) !== k))
+}
+settings.setUiLocaleForTest('zh')
+
+const dangerScope = (calls) => ({
+  subscribe: () => () => {},
+  getSnapshot: () => ({ status: 'ready', value: { security: { trustWorkspaceMemory: false } }, user: { security: { trustWorkspaceMemory: false } }, base: {}, writable: true, mode: 'user' }),
+  set: async (ns, v) => { calls.push({ ns, v }); return true },
+  unset: async (ns) => { calls.push({ unset: ns }); return true },
+})
+
+// danger 样式只落在 trustWorkspaceMemory 行，普通 security 行不带
+{
+  const tree = settings.MemorySettingsSection({ scope: dangerScope([]) })
+  const dangerRow = rowWithLabel(tree, '信任工作区记忆库')
+  const normalRow = rowWithLabel(tree, '允许自动切换全局目录')
+  check('0.37.1 danger: trustWorkspaceMemory row has meowmm_set_danger class',
+    String(dangerRow?.props?.className ?? '').includes('meowmm_set_danger'))
+  check('0.37.1 danger: ordinary security row does not carry the danger class',
+    !String(normalRow?.props?.className ?? '').includes('meowmm_set_danger'))
+  check('0.37.1 danger: autoGitignore row does not carry the danger class',
+    !String(rowWithLabel(tree, '自动写 .gitignore（忽略记忆库）')?.props?.className ?? '').includes('meowmm_set_danger'))
+}
+
+// 取消确认：window.confirm=false → 不调用 scope.set，checkbox 回滚未选中
+{
+  const confirmCalls = []
+  globalThis.window.confirm = (msg) => { confirmCalls.push(msg); return false }
+  const calls = []
+  try {
+    const tree = settings.MemorySettingsSection({ scope: dangerScope(calls) })
+    const row = rowWithLabel(tree, '信任工作区记忆库')
+    const checkbox = nodesOf(row).find((n) => n.props?.type === 'checkbox')
+    const target = { checked: true }
+    checkbox.props.onChange({ target })
+    await wait(50)
+    check('0.37.1 confirm: enabling danger toggle calls window.confirm once with localized text',
+      confirmCalls.length === 1 && confirmCalls[0].includes('确定要信任所有既有工作区的同名记忆库'), JSON.stringify(confirmCalls))
+    check('0.37.1 confirm: cancelling prevents scope.set for security', calls.filter((c) => c.ns === 'security').length === 0)
+    check('0.37.1 confirm: cancelling rolls the checkbox back to unchecked', target.checked === false)
+  } finally {
+    delete globalThis.window.confirm
+  }
+}
+
+// 确认后：window.confirm=true → scope.set('security', {trustWorkspaceMemory:true})，不把 base 拍平
+{
+  const confirmCalls = []
+  globalThis.window.confirm = (msg) => { confirmCalls.push(msg); return true }
+  const calls = []
+  try {
+    const tree = settings.MemorySettingsSection({ scope: dangerScope(calls) })
+    const row = rowWithLabel(tree, '信任工作区记忆库')
+    const checkbox = nodesOf(row).find((n) => n.props?.type === 'checkbox')
+    checkbox.props.onChange({ target: { checked: true } })
+    await wait(80)
+    const call = calls.find((c) => c.ns === 'security')
+    check('0.37.1 confirm: accepting writes security.trustWorkspaceMemory=true',
+      confirmCalls.length === 1 && call !== undefined && call.v.trustWorkspaceMemory === true, JSON.stringify(calls))
+    check('0.37.1 confirm: accepted write keeps user-layer shape (no patch/base flatten)',
+      call !== undefined && Object.keys(call.v).join(',') === 'trustWorkspaceMemory', JSON.stringify(call?.v))
+  } finally {
+    delete globalThis.window.confirm
+  }
+}
+
 console.log(`\n${passed} passed, ${failed} failed`)
 process.exit(failed === 0 ? 0 : 1)

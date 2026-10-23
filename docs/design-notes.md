@@ -220,7 +220,18 @@ The advanced knobs from 0.32–0.36 were profile-patch-only; the user explicitly
 
 ---
 
-## 21. Known design debt (updated in 0.37)
+## 21. 0.37.1: settings save path (merge/validation/danger confirmation)
+
+After 0.37 moved the advanced fields into the settings page, re-audit found three save-path problems; 0.37.1 fixes them:
+
+- **Group merge**: the settings user layer is designed as "field-level overrides over the patch", but 0.37.0 replaced whole groups for `security`/`budget`/`retrieval` — saving one field silently reverted the patch's other keys in that group (most notably `budget.dreamMaxPerDayTotal` 2→12 = higher cost, dropped `retrieval.semantic.baseUrl/model`, reverted trust-related patch keys). 0.37.1 **shallow-merges** `security`/`budget`/`retrieval`/`dream`/`delegate` and **deep-merges `retrieval.semantic`** one level further; the patch remains the assembly baseline, and hand-edited patches are no longer lost by unrelated UI saves.
+- **Validator + strict coercion**: `validateConfigUserLayer` now type-checks the new groups (incl. nested semantic/dream isolated); `resolveConfig` no longer trusts object fields directly and uses `asBool/asNum/asStr` — strings `"false"`/`"true"`/`"12"` always fall back to defaults and can neither enable a security switch nor set a numeric knob (a real boolean `true` still works). This is defence in depth: callers bypassing the validator (old host/direct apply) cannot poison security switches either. The validator's nested `retrieval.semantic` lookup was also fixed (it previously searched a top-level group, rejecting all semantic field saves).
+- **Danger toggle confirmation**: `trustWorkspaceMemory` uses danger styling + `window.confirm` (localized warning: trusts all existing foreign stores, possibly tampered); cancel rolls the checkbox back and writes nothing. `allowHomeSwitch`/`debugLogs` got hints; `dream.isolated` discloses the tool-capable child, workspace/global writes, and no-UI-abort. Three new UI keys → 40 advanced keys total.
+- **Residual boundaries**: native confirm has no undo/custom modal (P3); `allowHomeSwitch` is not confirmation-gated (P3); the 0.2.x settings save→apply path still has no live click-through (the page shows an explicit error on failure).
+
+---
+
+## 22. Known design debt (updated in 0.37.1)
 
 | Issue | Impact | Why |
 |---|---|---|
@@ -248,7 +259,9 @@ The advanced knobs from 0.32–0.36 were profile-patch-only; the user explicitly
 | **Scans without indexes (upstream)** | 4 full scans per message; fine at hundreds of entries, a cliff at thousands | T1 added indexes; large-scale behaviour still needs measuring |
 | **#66 host-side tool lock** | After a manual dream the tool set may shrink until restart | Host issue; plugin can only avoid the automatic path |
 | **#71 delegate model leak** | Only with `delegate.model` set | Host projection bug; empty default does not trigger |
-| **Settings save path on 0.2.x** | May render but not reach apply (since 0.37 the four advanced groups are on the page, but only the save RPC shape is unit-tested — no live click-through) | Settings service redesign, not in this pass; run the self-check after installing |
+| **Settings save path on 0.2.x** | May render but not reach apply (since 0.37 the four advanced groups are on the page, and 0.37.1 fixes merging/validation/danger confirmation, but only the save RPC shape is unit-tested — no live click-through; the page shows an explicit error on failure) | Settings service redesign, not in this pass; run the self-check after installing |
+| **Danger toggle uses native confirm (no undo/custom modal)** | After a mistaken confirmation you can only toggle it off again; no custom modal/undo | P3: native confirm has zero dependencies and is stable across hosts; a custom modal needs UI-framework wiring for little gain |
+| **`allowHomeSwitch` is not confirmation-gated** | It lets the model move the global directory, but has no confirm like `trustWorkspaceMemory` | P3: lower risk than trusting unknown stores and off by default; can be added later |
 | **Nested "Restore default" writes defaults into the user layer** | The badge correctly shows default, but the user layer gains default values (pre-existing design) | Consistent with "restore = factory default"; clearing the user layer needs profile-level work |
 | **Weak pt-br retrieval** | No Portuguese stemming/stopwords | Needs Portuguese NLP |
 | **Dream history costs tokens** | Folding is visual only | No host "hidden message" semantics |

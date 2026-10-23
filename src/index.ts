@@ -451,6 +451,54 @@ export function validateConfigUserLayer(value: unknown): void {
     const bkv = v.backup as Record<string, unknown>
     if (bkv.enabled !== undefined && typeof bkv.enabled !== 'boolean') throw new Error('backup.enabled 必须是布尔值')
   }
+  // 0.37.1（review）：新进 UI 的 security/budget/retrieval(+semantic)/dream.isolated* 也要
+  // 在插件自己的 user-layer 校验器里过一遍（不能只依赖宿主 schema decode）。
+  const group = (name: string, required: boolean): Record<string, unknown> => {
+    const raw = v[name]
+    if (raw === undefined) {
+      if (required) throw new Error(`${name} 必须是对象`)
+      return {}
+    }
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(`${name} 必须是对象`)
+    return raw as Record<string, unknown>
+  }
+  const gBool = (obj: Record<string, unknown>, prefix: string, keys: readonly string[]): void => {
+    for (const k of keys) {
+      if (obj[k] !== undefined && typeof obj[k] !== 'boolean') throw new Error(`${prefix}.${k} 必须是布尔`)
+    }
+  }
+  const gNum = (obj: Record<string, unknown>, prefix: string, keys: readonly string[]): void => {
+    for (const k of keys) {
+      if (obj[k] !== undefined && (typeof obj[k] !== 'number' || !Number.isFinite(obj[k] as number))) throw new Error(`${prefix}.${k} 必须是数字`)
+    }
+  }
+  const gStr = (obj: Record<string, unknown>, prefix: string, keys: readonly string[]): void => {
+    for (const k of keys) {
+      if (obj[k] !== undefined && typeof obj[k] !== 'string') throw new Error(`${prefix}.${k} 必须是字符串`)
+    }
+  }
+  const secv = group('security', false)
+  gBool(secv, 'security', ['trustWorkspaceMemory', 'allowHomeSwitch', 'autoGitignore', 'debugLogs'])
+  const budv = group('budget', false)
+  gNum(budv, 'budget', ['snapshotMaxChars', 'hitMaxChars', 'reinjectMaxChars', 'dreamMaxContextTokens', 'dreamMaxPerWindowPerDay', 'dreamMaxPerDayTotal', 'reflectMaxPerDay', 'reflectMinIntervalMinutes', 'reflectMaxPerDayTotal'])
+  const retv = group('retrieval', false)
+  gNum(retv, 'retrieval', ['halfLifeDays', 'minScore'])
+  gBool(retv, 'retrieval', ['hitBoost', 'importanceWeight'])
+  if (retv.semantic !== undefined) {
+    // 0.37.1：语义段是 retrieval 的**嵌套**对象（不是顶层 "retrieval.semantic" 键）——
+    // 之前误用 group() 查顶层，导致设置页所有 semantic 字段保存都被拒（review 实测）。
+    if (retv.semantic === null || typeof retv.semantic !== 'object' || Array.isArray(retv.semantic)) {
+      throw new Error('retrieval.semantic 必须是对象')
+    }
+    const semv = retv.semantic as Record<string, unknown>
+    gBool(semv, 'retrieval.semantic', ['enabled'])
+    gStr(semv, 'retrieval.semantic', ['baseUrl', 'model', 'apiKeyEnv'])
+    gNum(semv, 'retrieval.semantic', ['timeoutMs', 'weight'])
+  }
+  const dv2 = group('dream', false)
+  gBool(dv2, 'dream', ['requireLiveAgent', 'isolated', 'isolatedArchiveChild'])
+  gStr(dv2, 'dream', ['isolatedProvider'])
+  gNum(dv2, 'dream', ['isolatedTimeoutMinutes', 'isolatedMaxPromptChars'])
 }
 
 /** Read a legacy config object or the current Host's root volatile reference. */
@@ -471,12 +519,19 @@ export function mergeConfigLayer(patch: unknown, user: Record<string, unknown> |
   // 直接崩掉 applyInner（插件整块不启动）。防御式直通 patch 层。
   if (user === undefined || user === null || typeof user !== 'object') return patch
   const base = (typeof patch === 'object' && patch !== null ? { ...(patch as Record<string, unknown>) } : {}) as Record<string, unknown>
+  // 0.37.1（review）：UI 可写的所有子对象组都做浅合并，避免"改一个字段把 patch 里同组
+  // 其它键整组冲掉"（尤其 budget 上限被悄悄恢复默认 = 成本上升）。retrieval.semantic 还要
+  // 再深一层合并。
+  const mergeGroups = new Set(['dream', 'delegate', 'security', 'budget', 'retrieval'])
   for (const [key, value] of Object.entries(user)) {
-    if (key === 'dream' || key === 'delegate') {
-      // 子对象浅合并：用户只改一个子字段不丢 patch 里的其余键
+    if (mergeGroups.has(key)) {
       const pv = (base[key] ?? {}) as Record<string, unknown>
       const uv = (typeof value === 'object' && value !== null ? value : {}) as Record<string, unknown>
-      base[key] = { ...pv, ...uv }
+      const merged = { ...pv, ...uv }
+      if (key === 'retrieval' && ((pv.semantic as Record<string, unknown> | undefined) !== undefined || (uv.semantic as Record<string, unknown> | undefined) !== undefined)) {
+        merged.semantic = { ...((pv.semantic as Record<string, unknown> | undefined) ?? {}), ...((uv.semantic as Record<string, unknown> | undefined) ?? {}) }
+      }
+      base[key] = merged
     } else {
       base[key] = value
     }
@@ -548,6 +603,11 @@ function resolveConfig(config: unknown): ResolvedConfig {
   const bud = (c.budget ?? {}) as Partial<ResolvedConfig['budget']>
   const ret = (c.retrieval ?? {}) as Partial<ResolvedConfig['retrieval']>
   const sem = (ret.semantic ?? {}) as Partial<ResolvedConfig['retrieval']['semantic']>
+  // 0.37.1（review）：严格类型收敛——string "false"/"0" 这类 truthy 非布尔不能被当成 true；
+  // 数值/字符串非法一律回落默认，避免 validator 之外的入口（宿主旧版/直调 apply）污染安全开关。
+  const asBool = (v: unknown, d: boolean): boolean => (typeof v === 'boolean' ? v : d)
+  const asNum = (v: unknown, d: number): number => (typeof v === 'number' && Number.isFinite(v) ? v : d)
+  const asStr = (v: unknown, d: string): string => (typeof v === 'string' ? v : d)
   return {
     enabled: c.enabled ?? true,
     projectDir: c.projectDir ?? '.dsh-meow',
@@ -566,12 +626,12 @@ function resolveConfig(config: unknown): ResolvedConfig {
       checkMinutes: d.checkMinutes ?? 15,
       timeZone: d.timeZone ?? 'Asia/Shanghai',
       rulesReviewDays: d.rulesReviewDays ?? DEFAULT_RULES_REVIEW_DAYS,
-      requireLiveAgent: (d as { requireLiveAgent?: boolean }).requireLiveAgent ?? true,
-      isolated: (d as { isolated?: boolean }).isolated ?? false,
-      isolatedProvider: (d as { isolatedProvider?: string }).isolatedProvider ?? 'spawn',
-      isolatedTimeoutMinutes: (d as { isolatedTimeoutMinutes?: number }).isolatedTimeoutMinutes ?? 20,
-      isolatedMaxPromptChars: (d as { isolatedMaxPromptChars?: number }).isolatedMaxPromptChars ?? 20000,
-      isolatedArchiveChild: (d as { isolatedArchiveChild?: boolean }).isolatedArchiveChild ?? true,
+      requireLiveAgent: asBool((d as { requireLiveAgent?: unknown }).requireLiveAgent, true),
+      isolated: asBool((d as { isolated?: unknown }).isolated, false),
+      isolatedProvider: asStr((d as { isolatedProvider?: unknown }).isolatedProvider, 'spawn'),
+      isolatedTimeoutMinutes: asNum((d as { isolatedTimeoutMinutes?: unknown }).isolatedTimeoutMinutes, 20),
+      isolatedMaxPromptChars: asNum((d as { isolatedMaxPromptChars?: unknown }).isolatedMaxPromptChars, 20000),
+      isolatedArchiveChild: asBool((d as { isolatedArchiveChild?: unknown }).isolatedArchiveChild, true),
       // 隔离 dream 的模型：复用 delegate.model（未配置 = 继承子会话默认模型）。
       isolatedModelSpec: parseModelSpec(dg.model),
       budget: {
@@ -595,34 +655,34 @@ function resolveConfig(config: unknown): ResolvedConfig {
       enabled: bk.enabled ?? false,
     },
     security: {
-      trustWorkspaceMemory: sec.trustWorkspaceMemory ?? false,
-      allowHomeSwitch: sec.allowHomeSwitch ?? false,
-      autoGitignore: sec.autoGitignore ?? true,
-      debugLogs: sec.debugLogs ?? false,
+      trustWorkspaceMemory: asBool(sec.trustWorkspaceMemory, false),
+      allowHomeSwitch: asBool(sec.allowHomeSwitch, false),
+      autoGitignore: asBool(sec.autoGitignore, true),
+      debugLogs: asBool(sec.debugLogs, false),
     },
     budget: {
-      snapshotMaxChars: bud.snapshotMaxChars ?? 6000,
-      hitMaxChars: bud.hitMaxChars ?? 1500,
-      reinjectMaxChars: bud.reinjectMaxChars ?? 8000,
-      dreamMaxContextTokens: bud.dreamMaxContextTokens ?? 40000,
-      dreamMaxPerWindowPerDay: bud.dreamMaxPerWindowPerDay ?? 1,
-      dreamMaxPerDayTotal: bud.dreamMaxPerDayTotal ?? 12,
-      reflectMaxPerDay: bud.reflectMaxPerDay ?? 6,
-      reflectMinIntervalMinutes: bud.reflectMinIntervalMinutes ?? 20,
-      reflectMaxPerDayTotal: bud.reflectMaxPerDayTotal ?? 24,
+      snapshotMaxChars: asNum(bud.snapshotMaxChars, 6000),
+      hitMaxChars: asNum(bud.hitMaxChars, 1500),
+      reinjectMaxChars: asNum(bud.reinjectMaxChars, 8000),
+      dreamMaxContextTokens: asNum(bud.dreamMaxContextTokens, 40000),
+      dreamMaxPerWindowPerDay: asNum(bud.dreamMaxPerWindowPerDay, 1),
+      dreamMaxPerDayTotal: asNum(bud.dreamMaxPerDayTotal, 12),
+      reflectMaxPerDay: asNum(bud.reflectMaxPerDay, 6),
+      reflectMinIntervalMinutes: asNum(bud.reflectMinIntervalMinutes, 20),
+      reflectMaxPerDayTotal: asNum(bud.reflectMaxPerDayTotal, 24),
     },
     retrieval: {
-      halfLifeDays: ret.halfLifeDays ?? 30,
-      minScore: ret.minScore ?? 0.35,
-      hitBoost: ret.hitBoost ?? true,
-      importanceWeight: ret.importanceWeight ?? true,
+      halfLifeDays: asNum(ret.halfLifeDays, 30),
+      minScore: asNum(ret.minScore, 0.35),
+      hitBoost: asBool(ret.hitBoost, true),
+      importanceWeight: asBool(ret.importanceWeight, true),
       semantic: {
-        enabled: sem.enabled ?? false,
-        baseUrl: sem.baseUrl ?? '',
-        model: sem.model ?? '',
-        apiKeyEnv: sem.apiKeyEnv ?? 'MEOW_MEMORY_EMBEDDING_KEY',
-        timeoutMs: sem.timeoutMs ?? 5000,
-        weight: sem.weight ?? 0.8,
+        enabled: asBool(sem.enabled, false),
+        baseUrl: asStr(sem.baseUrl, ''),
+        model: asStr(sem.model, ''),
+        apiKeyEnv: asStr(sem.apiKeyEnv, 'MEOW_MEMORY_EMBEDDING_KEY'),
+        timeoutMs: asNum(sem.timeoutMs, 5000),
+        weight: asNum(sem.weight, 0.8),
       },
     },
   }
@@ -2191,7 +2251,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
                 return writeJson(res, 200, { ok: true, entry: saved.entry, reinjected })
               }
               const listed = listGlobalMemory()
-              return writeJson(res, 200, { trusted: listed.trusted, entries: listed.entries })
+              return writeJson(res, 200, { trusted: listed.trusted, entries: listed.entries, homePath: listed.homePath })
             } catch (e) {
               writeJson(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) })
             }

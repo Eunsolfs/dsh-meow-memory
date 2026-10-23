@@ -3,12 +3,12 @@
 | [中文](README.md) | [English](README.en.md) | [Português (BR)](README.pt-br.md) | [MIT License](LICENSE) |
 | :---: | :---: | :---: | :---: |
 
-> **这是什么**：`Phant0Meow/dsh-meow-memory` **v0.31.1** 的个人加固 fork（本仓库，版本 **0.37.0**，分支 `hardening`）。
+> **这是什么**：`Phant0Meow/dsh-meow-memory` **v0.31.1** 的个人加固 fork（本仓库，版本 **0.37.1**，分支 `hardening`）。
 > 上游是 MIT 授权，上游仓库：<https://github.com/Phant0Meow/dsh-meow-memory>。本 fork **与上游无隶属关系**，不代上游发布、也不代表上游立场；所有改动与剩余问题见 [CHANGELOG.md](CHANGELOG.md)。
 
 为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）打造的跨会话记忆插件：七层 SQLite 记忆、首轮快照注入、每消息关键词命中，以及**有预算上限**的自动整理。
 
-当前版本 **0.37.0** ｜ 变更见 [CHANGELOG.md](CHANGELOG.md) ｜ 已实测宿主 **DSH Desktop 0.2.1-rc.2**（见[兼容性](#兼容性)）
+当前版本 **0.37.1** ｜ 变更见 [CHANGELOG.md](CHANGELOG.md) ｜ 已实测宿主 **DSH Desktop 0.2.1-rc.2**（见[兼容性](#兼容性)）
 
 **诚实声明**：本 README 只写代码里确实存在的行为。0.32 删掉了上游 README 里若干夸大表述（"自动去重合并"、"艾宾浩斯遗忘曲线"、每消息命中"BM25"、"兼容 dsh 0.1.5"），并在每处注明真实边界。
 
@@ -145,7 +145,7 @@ $DSH_HOME/storages/meow-memory*           # install-id、prompt 覆盖层、切�
 - **七层记忆**：`soul`（AI 自身）/ `user`（用户信息与偏好）/ `project`（项目信息，含 `subcategory`）/ `fact`（原子事实）/ `lesson`（教训与纠正）/ `topic`（进行中的话题，带目标句）/ `rules`（设计原则与行为准则）。每层一张 SQLite 表，id 带时间前缀。
 - **两层存储（0.33）**：`soul` / `user` / 全局 `rules` 放在**用户级全局库**，跨工作区共享；`project` / `fact` / `lesson` / `topic` / 项目 rules 放工作区库。详见[记忆存哪里](#记忆存哪里两层存储033)。
 - **全局记忆可视化编辑（0.36）**：DSH 设置页「喵记忆」页面底部新增「全局记忆（用户级）」卡片，可**列出/内联编辑 content、keywords、importance**、**新增**（soul/user/rules）、**归档/恢复**；只覆盖 user-scope 全局库的 soul/user/全局 rules。保存后 host 给相关会话打 reinject 标记，这些会话在**下一轮用户消息**按压缩重注入通道重新注入（不改写历史、不产生即时模型调用）。校验：内容 trim 1–4000 字符、关键词 1–30、importance 整数 1–100；**无硬删除**（归档代替）；last-write-wins。详见[配置参考的「UI 编辑」](docs/配置参考.md#ui-编辑全局记忆036)。
-- **设置页覆盖几乎所有配置（0.37）**：「喵记忆」新增 4 组——**安全与隐私**（`security.*`，含危险的 `trustWorkspaceMemory` 警告）、**预算与上限**（9 个 `budget.*`）、**检索与遗忘**（`retrieval.*` + **嵌套 `retrieval.semantic`** 6 字段）、**隔离 dream**（`dream.requireLiveAgent` + 5 个 `dream.isolated*`）；共 37 个新 UI 文案键 × zh/en/pt-br。嵌套子对象保存只合并该子对象到 `retrieval` user 层（不会把 base 其它键洗进 user 层）；「恢复默认」写回出厂默认并显示默认徽章。**配置 patch 仍是装配基线**；UI 保存后需热重载/重启生效（热字段在 settings 命名空间就绪后自动纠正）。
+- **设置页覆盖几乎所有配置（0.37；0.37.1 保存修复）**：「喵记忆」新增 4 组——**安全与隐私**（`security.*`）、**预算与上限**（9 个 `budget.*`）、**检索与遗忘**（`retrieval.*` + **嵌套 `retrieval.semantic`** 6 字段）、**隔离 dream**（`dream.requireLiveAgent` + 5 个 `dream.isolated*`）；共 **40 个**新 UI 文案键 × zh/en/pt-br。**保存合并语义（0.37.1 修复）**：保存任一 `security`/`budget`/`retrieval`（以及 `dream`/`delegate`）字段时，会与该组在 profile patch 里的值**浅合并**（`retrieval.semantic` 再深合并一层），不再整组替换——此前 UI 保存会静默回退 patch 的 `budget.dreamMaxPerDayTotal`（如 2→12）、丢掉 `retrieval.semantic.baseUrl/model`（0.37.1 修复；手工改过 patch 的用户用 UI 不再丢配置）。**校验/强制转换（0.37.1）**：`validateConfigUserLayer` 对上述组做类型校验，`resolveConfig` 用严格 `asBool/asNum/asStr`——字符串 `"false"`/`"true"`/`"12"` 既不能打开安全开关也不能设置数值（回退默认；真正的布尔 `true` 仍有效）。**危险开关**：`trustWorkspaceMemory` 以危险样式渲染，打开前必须 `window.confirm` 二次确认（本地化警告：会信任所有既有 foreign 记忆库，可能含被篡改内容）；取消则复选框回滚、**什么都不写**。`allowHomeSwitch`/`debugLogs` 有提示；`dream.isolated` 提示披露"工具能力子会话、会写工作区/全局库、无 UI 中止"。「恢复默认」写回出厂默认并显示默认徽章。**配置 patch 仍是装配基线**；UI 保存后需热重载/重启生效（热字段在 settings 命名空间就绪后自动纠正）。
 - **稳定性收尾（0.37）**：① 隔离 dream 成功时把子会话写入的条目**同时**在工作区库与**用户级全局库**收养到父会话（不再有"全局条目孤儿 attribution"）；② dream 检查门只对**已存在且受信**的库取（陌生/缺失库不写 `last_check`）；③ turn/end 失败兜底 `handleMemoryTurnFailure` 前先过 trust（未受信库连 schema 升级都不触发，测试中库文件字节不变）；④ `workspaceRegistry.archiveSession()` 的 promise rejection 已接住（不再可能未处理拒绝，dream 仍正常收尾）。
 - **首轮注入（长期记忆块）**：第一条用户消息前注入 soul / user / 全局 rules / 记忆导引。soul / user / 全局 rules 优先从用户级全局库读，工作区库兜底；作为独立 plugin snapshot 消息放在真实 user 消息之前，**不改写用户 prompt**；**首轮不跑关键词命中**（从第二轮起）。
 - **每消息关键词命中 + 混合词法兜底 + 可选语义 floor（0.35）**：从第二条用户消息起，按条目**关键词**（不是全文）检索 fact/lesson/rules/topic（全局 + 当前 project 锚定），`hitTopK` 命中注入。0.33 加离线混合词法补分：字符 bigram Jaccard + 0.25×trigram Jaccard（CJK 安全、NFKC），作为 BM25 弱命中时的 **floor**：`score = max(BM25, 0.55·fuzzy·recency·importance)`，噪声地板 0.2；对同义变体/词形/CJK 词边界有改善。0.35 可选 `retrieval.semantic`（默认关）：启用后把 query 与条目 embedding 的余弦相似度**也只当 floor**（`relevance = max(词法, fuzzy, cos·weight·importance)`，cos < 0.25 按 0），从而覆盖一部分同义改写；**不是 rerank，也不保证语义质量**（见下方限制）。
@@ -188,7 +188,7 @@ $DSH_HOME/storages/meow-memory*           # install-id、prompt 覆盖层、切�
 
 2. 任选其一：
    - **本地目录**：GUI 左侧 **Plugins → Add plugin**，填**本仓库的绝对路径**（插件管理器接受绝对本地路径）；
-   - **tarball**：`npm pack` 生成 `meow-memory-0.37.0.tgz`，Plugins → Add plugin 填该 `.tgz` 的绝对路径。
+   - **tarball**：`npm pack` 生成 `meow-memory-0.37.1.tgz`，Plugins → Add plugin 填该 `.tgz` 的绝对路径。
 3. 重启 `dsh web`（或热重载插件）。新会话自动加载。
 
 > 本地 `file:`/`link:` 安装不会执行 `prepare`，所以**必须先构建**；tarball 里已含 `lib/`，装上即可用。
@@ -242,12 +242,12 @@ dsh plugin --profile <profile> remove meow-memory
 |---|---|
 | 宿主 | **DSH Desktop 0.2.1-rc.2**（Windows 11） |
 | 运行时 | Electron 44.7.0 / Node **24.21.0**，`node:sqlite` 可用 |
-| 验证范围 | 隔离实例加载成功；4 条 `/meow-memory/*` 路由（dreamed-sessions / dream-events / skip-dreams / global-memory）带鉴权 200 / 不带 401；设置命名空间出现；无 apply 错误。0.34 带 `dream.isolated: true` 的 live load 只验证了加载；0.34.0 的子会话启动 bug（`maxDepth: 0`）由独立复审发现，0.34.1 修复。0.35 另做 default / semantic-enabled 两种配置的 live load：均加载成功、无 apply 错误，**禁用语义时启动零 embedding 请求**，未写真实 home。0.35.1 为审计修正（传输策略/冷启动回填/复习刷新），由单测覆盖。0.36 的编辑器路由做了 live boot 后的 401/200 round-trip（mock webServer/auth + 隔离实例），并由单测覆盖 editor/route/propagation/component；0.36.1 修正传播对**header 形状冷会话**的读取（`headerOf`）并加 2000 会话标记上限，单测覆盖。0.37 的设置页 parity 由单测覆盖（安全/预算/检索+嵌套 semantic/隔离 dream 4 组渲染、37 个 UI key 三语、嵌套 save 形状、恢复默认），稳定性修复由 hardening 单测覆盖；**0.2.x 设置页"保存→落到 apply"仍无 live click-through**。**真实模型/子会话 dream 与真实 embedding 端点未在隔离实例中跑通**（无账号凭据；语义层由 mock embeddings 服务单测覆盖） |
+| 验证范围 | 隔离实例加载成功；4 条 `/meow-memory/*` 路由（dreamed-sessions / dream-events / skip-dreams / global-memory）带鉴权 200 / 不带 401；设置命名空间出现；无 apply 错误。0.34 带 `dream.isolated: true` 的 live load 只验证了加载；0.34.0 的子会话启动 bug（`maxDepth: 0`）由独立复审发现，0.34.1 修复。0.35 另做 default / semantic-enabled 两种配置的 live load：均加载成功、无 apply 错误，**禁用语义时启动零 embedding 请求**，未写真实 home。0.35.1 为审计修正（传输策略/冷启动回填/复习刷新），由单测覆盖。0.36 的编辑器路由做了 live boot 后的 401/200 round-trip（mock webServer/auth + 隔离实例），并由单测覆盖 editor/route/propagation/component；0.36.1 修正传播对**header 形状冷会话**的读取（`headerOf`）并加 2000 会话标记上限，单测覆盖。0.37 的设置页 parity 由单测覆盖（安全/预算/检索+嵌套 semantic/隔离 dream 4 组渲染、UI key 三语、嵌套 save 形状、恢复默认），稳定性修复由 hardening 单测覆盖；0.37.1 由单测覆盖配置组合并/深合并、validator 拒绝错误类型、严格强制转换矩阵、危险开关确认/取消不写/回滚、40 key 三语；**0.2.x 设置页"保存→落到 apply"仍无 live click-through**。**真实模型/子会话 dream 与真实 embedding 端点未在隔离实例中跑通**（无账号凭据；语义层由 mock embeddings 服务单测覆盖） |
 | 未验证 | **0.1.x 宿主**（本 fork 没有测过，不再宣称"兼容 dsh 0.1.5"）；其他 0.2.x 补丁版本 |
 
 已知兼容性风险（沿用上游结论，本 fork 未改）：
 
-- **设置页保存链路**：0.2.x 的 settings 服务改版后，插件走降级适配。设置页能渲染，但"改字段 → 保存 → 热重载 → 生效"未在本 fork 实测（0.37 起 4 组高级字段也在设置页上，但同样只有单测覆盖 save RPC 形状，没有 live click-through）；最坏情况是设置页显示但不落到 apply。装完请按[自测清单](#自测清单)验一次。
+- **设置页保存链路**：0.2.x 的 settings 服务改版后，插件走降级适配。设置页能渲染，但"改字段 → 保存 → 热重载 → 生效"未在本 fork 实测（0.37 起 4 组高级字段也在设置页上，0.37.1 又修了合并/校验/危险确认，但同样只有单测覆盖 save RPC 形状，没有 live click-through）；最坏情况是设置页显示但不落到 apply。装完请按[自测清单](#自测清单)验一次。**0.37.1 已知 minor**：危险开关用原生 `window.confirm`，没有自定义弹窗/撤销；`allowHomeSwitch` 未做二次确认（P3，已知）。
 - **客户端 UI**（折叠条/月亮图标/菜单面板）依赖 0.2.x `ChatSnapshot` 内部结构与 DOM 观察，宿主小版本更新可能静默失效；只影响外观。
 - `node:sqlite` 要求 **Node ≥ 22.13**（22.5–22.12 需 `--experimental-sqlite`）。
 
@@ -255,7 +255,7 @@ dsh plugin --profile <profile> remove meow-memory
 
 ## ⚙️ 配置
 
-所有字段可选。**0.32 新增的安全/预算/检索（含 0.35 语义）与 0.34 隔离 dream 字段自 0.37 起也可在设置页「喵记忆」编辑**（profile patch / `cordis.patch.yml` 仍是装配基线）；**0.36 起设置页另有「全局记忆（用户级）」可视化编辑器（数据编辑，不是配置项）**。设置页保存后一般需热重载/重启生效（热字段在 settings 命名空间就绪后自动纠正）；但 0.2.x 的"保存 → 落到 apply"链路仍未在本 fork 实测，见[兼容性](#兼容性)。
+所有字段可选。**0.32 新增的安全/预算/检索（含 0.35 语义）与 0.34 隔离 dream 字段自 0.37 起也可在设置页「喵记忆」编辑**（profile patch / `cordis.patch.yml` 仍是装配基线；0.37.1 起 UI 保存按组浅合并进 patch，不再整组覆盖——手工改过 patch 的用户不会再因无关保存丢配置）；**0.36 起设置页另有「全局记忆（用户级）」可视化编辑器（数据编辑，不是配置项）**。设置页保存后一般需热重载/重启生效（热字段在 settings 命名空间就绪后自动纠正）；但 0.2.x 的"保存 → 落到 apply"链路仍未在本 fork 实测，见[兼容性](#兼容性)。
 
 ```yaml
 - id: meow-memory
@@ -361,14 +361,14 @@ npm run test           # build + 语言包自查 + 全量断言（host + client 
 node scripts/check-lang.mjs en       # 只查某个 prompt 语言包
 ```
 
-测试断言数：`npm test` **1317 条全绿**（host 940 + client 377），0 失败；另 `node smoke.mjs` 29 条；`scripts/check-lang.mjs` 校验 en/pt-br 两个语言包（11 槽位对齐）。
+测试断言数：`npm test` **1354 条全绿**（host 961 + client 393），0 失败；另 `node smoke.mjs` 29 条；`scripts/check-lang.mjs` 校验 en/pt-br 两个语言包（11 槽位对齐）。
 
 `@deepseek-ai/*` 包位于 dsh-meow pnpm workspace，不在本包 `node_modules` 里。Windows 上 `npm run link-workspace` 创建 workspace 包的 junction 镜像供 esbuild 解析；仅构建期需要。
 
 ### 自测清单
 
 1. 普通对话一轮：首轮是否出现长期记忆快照横条（无 → 插件没工作）；
-2. 设置页改一个字段（含 0.37 新增的「安全与隐私 / 预算与上限 / 检索与遗忘 / 隔离 dream」任意字段）→ 保存 → 热重载插件 → 值是否生效（验证 0.2.x settings 漂移）；嵌套 `retrieval.semantic` 字段保存后不应把 base 其它键洗进 user 层。
+2. 设置页改一个字段（含 0.37 新增的「安全与隐私 / 预算与上限 / 检索与遗忘 / 隔离 dream」任意字段）→ 保存 → 热重载插件 → 值是否生效（验证 0.2.x settings 漂移）；嵌套 `retrieval.semantic` 字段保存后不应把 base 其它键洗进 user 层；**打开 `trustWorkspaceMemory` 应弹确认框，取消应保持关闭且不写配置**；手工改过 patch 的组，UI 保存后 patch 其它键应保留（0.37.1 合并语义）。
 3. `/dream` 跑完 → 继续聊天：工具数量是否正常（防 #66）；
 4. 反思轮后检查模型选择栏是否仍为主模型（防 #71，仅配置 `delegate.model` 时可能触发）；
 5. 在克隆来的陌生仓库里开新会话：不应出现你没写过的长期记忆内容（不信任库/默认不迁移）；

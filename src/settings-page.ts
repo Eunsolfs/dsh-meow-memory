@@ -58,6 +58,8 @@ const CSS = `
 .meowmm_set_mirrornote{background:color-mix(in srgb,#f59e0b 12%,transparent);border:1px solid color-mix(in srgb,#f59e0b 35%,transparent);border-radius:8px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:1.6;padding:8px 12px}
 .meowmm_set_saved{color:#34d399;font-size:12px}
 .meowmm_set_muted{color:var(--dsw-alias-label-caption);font-size:12px}
+.meowmm_set_danger{border:1px solid color-mix(in srgb,#f43f5e 45%,transparent);border-radius:8px;padding:8px}
+.meowmm_set_danger .meowmm_set_hint{color:#f43f5e}
 .meowmm_global_card{border-color:color-mix(in srgb,#6366f1 35%,var(--dsw-alias-border-l3))}
 .meowmm_global_head{align-items:center;display:flex;gap:8px;justify-content:space-between}
 .meowmm_global_entry{border-top:1px solid var(--dsw-alias-border-l3);display:flex;flex-direction:column;gap:6px;padding-top:8px}
@@ -85,6 +87,9 @@ interface FieldSpec {
   type: 'bool' | 'num' | 'str' | 'homeDir'
   hint?: UiKey
   placeholder?: string
+  /** 危险开关：危险样式 + 打开前确认。 */
+  danger?: boolean
+  confirm?: UiKey
 }
 
 interface GroupSpec {
@@ -149,10 +154,10 @@ const FIELDS: GroupSpec[] = [
   {
     title: 'settings.group.security',
     fields: [
-      { key: 'trustWorkspaceMemory', sub: 'security', label: 'settings.field.security.trustWorkspaceMemory.label', type: 'bool', hint: 'settings.field.security.trustWorkspaceMemory.hint' },
-      { key: 'allowHomeSwitch', sub: 'security', label: 'settings.field.security.allowHomeSwitch.label', type: 'bool' },
+      { key: 'trustWorkspaceMemory', sub: 'security', label: 'settings.field.security.trustWorkspaceMemory.label', type: 'bool', hint: 'settings.field.security.trustWorkspaceMemory.hint', danger: true, confirm: 'settings.field.security.trustWorkspaceMemory.confirm' },
+      { key: 'allowHomeSwitch', sub: 'security', label: 'settings.field.security.allowHomeSwitch.label', type: 'bool', hint: 'settings.field.security.allowHomeSwitch.hint' },
       { key: 'autoGitignore', sub: 'security', label: 'settings.field.security.autoGitignore.label', type: 'bool' },
-      { key: 'debugLogs', sub: 'security', label: 'settings.field.security.debugLogs.label', type: 'bool' },
+      { key: 'debugLogs', sub: 'security', label: 'settings.field.security.debugLogs.label', type: 'bool', hint: 'settings.field.security.debugLogs.hint' },
     ],
   },
   {
@@ -773,6 +778,14 @@ export function MemorySettingsSection(props: { scope: any }): any {
         disabled: !snap.writable,
         onChange: (e: any) => {
           const next = e.target.checked
+          // 0.37.1（review P2）：危险开关（如信任陌生工作区记忆库）打开前必须二次确认，
+          // 避免一次误点 + 重载就把所有既有 foreign 库纳入注入。
+          if (next && spec.confirm !== undefined && typeof window !== 'undefined' && typeof window.confirm === 'function') {
+            if (!window.confirm(t(spec.confirm))) {
+              e.target.checked = false
+              return
+            }
+          }
           // 保存成功后保留 draft（值与新 mirror 一致，渲染稳定）：立即清除会在
           // 宿主镜像确认前回落旧值，造成「保存成功却闪回旧值」的视觉抖动。
           void apply(spec, next)
@@ -859,7 +872,7 @@ export function MemorySettingsSection(props: { scope: any }): any {
     }
     return el(
       'div',
-      { key: spec.key, className: 'meowmm_set_row' },
+      { key: spec.key, className: 'meowmm_set_row' + (spec.danger === true ? ' meowmm_set_danger' : '') },
       el(
         'div',
         { className: 'meowmm_set_rowtext' },

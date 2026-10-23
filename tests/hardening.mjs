@@ -16,6 +16,7 @@
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync, utimesSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { DatabaseSync } from 'node:sqlite'
 import { createServer } from 'node:http'
 
@@ -41,6 +42,7 @@ const {
   embedTexts, semanticEnabled, semanticWeightOf, cosine, clearEmbeddingCache, setMemorySemanticOptionsForTests,
   listGlobalMemory, saveGlobalMemory, GLOBAL_EDIT_LEVELS, GLOBAL_STORE_UNTRUSTED_ERROR,
   globalProjectMarker, readSeen, sessionsFile, isReinjectPending,
+  mergeConfigLayer, validateConfigUserLayer,
 } = await import('../lib/index.js')
 
 let passed = 0
@@ -2224,6 +2226,116 @@ export function useSyncExternalStore(_subscribe, get) { return get() }
   if (savedMeowEnv === undefined) delete process.env.MEOW_MEMORY_HOME
   else process.env.MEOW_MEMORY_HOME = savedMeowEnv
   clean(home); clean(wsForeign); clean(wsMissing)
+}
+
+// ═══════════════════ 28. 0.37.1：配置层合并 / user-layer 校验 / 严格类型收敛 ═══════════════════
+{
+  // (a) mergeConfigLayer：security/budget/retrieval 组浅合并 + retrieval.semantic 深合并
+  const patch = {
+    enabled: true,
+    security: { trustWorkspaceMemory: true, allowHomeSwitch: false },
+    budget: { dreamMaxPerDayTotal: 2, snapshotMaxChars: 6000 },
+    retrieval: { halfLifeDays: 30, minScore: 0.35, semantic: { baseUrl: 'http://127.0.0.1:9/v1', model: 'embed-x', enabled: false } },
+    dream: { enabled: true, idleMinutes: 180 },
+  }
+  const user = {
+    security: { debugLogs: true },
+    budget: { snapshotMaxChars: 7000 },
+    retrieval: { minScore: 0.5, semantic: { timeoutMs: 3000 } },
+  }
+  const merged = mergeConfigLayer(patch, user)
+  check('0.37.1 merge: security group shallow-merged without clobbering patch siblings',
+    merged.security.trustWorkspaceMemory === true && merged.security.allowHomeSwitch === false && merged.security.debugLogs === true, JSON.stringify(merged.security))
+  check('0.37.1 merge: budget group shallow-merged (patch cap kept, user override applied)',
+    merged.budget.dreamMaxPerDayTotal === 2 && merged.budget.snapshotMaxChars === 7000, JSON.stringify(merged.budget))
+  check('0.37.1 merge: retrieval group shallow-merged', merged.retrieval.halfLifeDays === 30 && merged.retrieval.minScore === 0.5)
+  check('0.37.1 merge: retrieval.semantic deep-merged (patch baseUrl/model + user timeoutMs)',
+    merged.retrieval.semantic.baseUrl === 'http://127.0.0.1:9/v1' && merged.retrieval.semantic.model === 'embed-x' &&
+    merged.retrieval.semantic.enabled === false && merged.retrieval.semantic.timeoutMs === 3000, JSON.stringify(merged.retrieval.semantic))
+  check('0.37.1 merge: untouched patch values preserved', merged.enabled === true && merged.dream.enabled === true && merged.dream.idleMinutes === 180)
+  check('0.37.1 merge: undefined user layer returns patch untouched', mergeConfigLayer(patch, undefined) === patch)
+
+  // (b) validateConfigUserLayer：新进 UI 的组逐字段类型校验
+  const throwsOf = (input) => {
+    try { validateConfigUserLayer(input); return false } catch { return true }
+  }
+  check('0.37.1 validate: accepts a valid mixed object (no nested semantic)', (() => {
+    try {
+      validateConfigUserLayer({
+        security: { trustWorkspaceMemory: true },
+        budget: { snapshotMaxChars: 7000 },
+        retrieval: { halfLifeDays: 30, hitBoost: true, importanceWeight: false },
+        dream: { isolated: true },
+      })
+      return true
+    } catch { return false }
+  })())
+  // 0.37.1：semantic 分组是 retrieval 的嵌套对象——合法 user layer 必须通过（早前误查
+  // 顶层 "retrieval.semantic" 键会让设置页所有 semantic 保存被拒；现已在源码修正）。
+  {
+    const validWithSemantic = {
+      retrieval: { semantic: { enabled: true, baseUrl: 'http://x/v1', model: 'm', timeoutMs: 3000 } },
+    }
+    check('0.37.1 validate: accepts valid nested retrieval.semantic user layer', throwsOf(validWithSemantic) === false)
+  }
+  check('0.37.1 validate: security.trustWorkspaceMemory string boolean throws', throwsOf({ security: { trustWorkspaceMemory: 'false' } }))
+  check('0.37.1 validate: budget.snapshotMaxChars string number throws', throwsOf({ budget: { snapshotMaxChars: '7000' } }))
+  check('0.37.1 validate: retrieval.semantic.enabled string boolean throws', throwsOf({ retrieval: { semantic: { enabled: 'true' } } }))
+  check('0.37.1 validate: retrieval.semantic.baseUrl non-string throws', throwsOf({ retrieval: { semantic: { baseUrl: 1 } } }))
+  check('0.37.1 validate: dream.isolated string boolean throws', throwsOf({ dream: { isolated: 'false' } }))
+  check('0.37.1 validate: non-object security group throws', throwsOf({ security: [] }))
+
+  // (c) resolveConfig 严格收敛（resolveConfig 未从包入口导出 → 用源码副本 bundle 出可断言入口）
+  let resolveConfig
+  const bundlePath = 'tests/_resolve-config-bundle.mjs'
+  try {
+    const { build } = await import('esbuild')
+    const source = readFileSync(fileURLToPath(new URL('../src/index.ts', import.meta.url)), 'utf8')
+    const { outputFiles } = await build({
+      stdin: {
+        contents: source + '\nexport { resolveConfig }\n',
+        resolveDir: fileURLToPath(new URL('../src/', import.meta.url)),
+        sourcefile: 'index-copy.ts',
+        loader: 'ts',
+      },
+      bundle: true,
+      platform: 'node',
+      format: 'esm',
+      write: false,
+      logLevel: 'silent',
+      target: 'node22',
+    })
+    writeFileSync(bundlePath, outputFiles[0].contents)
+    const mod = await import('file:///' + process.cwd().replace(/\\/g, '/') + '/' + bundlePath + '?t=' + Date.now())
+    resolveConfig = mod.resolveConfig
+  } catch (e) {
+    console.log('  [note] resolveConfig bundle unavailable:', e instanceof Error ? e.message : String(e))
+  } finally {
+    rmSync(bundlePath, { force: true })
+  }
+  check('0.37.1 coercion: resolveConfig reachable through a source bundle', typeof resolveConfig === 'function')
+  if (typeof resolveConfig === 'function') {
+    const coerced = resolveConfig({
+      security: { trustWorkspaceMemory: 'false', autoGitignore: 'false' },
+      budget: { dreamMaxPerDayTotal: '2' },
+      retrieval: { semantic: { enabled: 'true' } },
+      dream: { isolated: 'false' },
+    })
+    check('0.37.1 coercion: string trustWorkspaceMemory → false', coerced.security.trustWorkspaceMemory === false)
+    check('0.37.1 coercion: string autoGitignore → default true', coerced.security.autoGitignore === true)
+    check('0.37.1 coercion: string budget number → default 12', coerced.budget.dreamMaxPerDayTotal === 12)
+    check('0.37.1 coercion: string semantic.enabled → false', coerced.retrieval.semantic.enabled === false)
+    check('0.37.1 coercion: string dream.isolated → false', coerced.dream.isolated === false)
+    const valid = resolveConfig({
+      security: { trustWorkspaceMemory: true, autoGitignore: false },
+      budget: { dreamMaxPerDayTotal: 2 },
+      retrieval: { semantic: { enabled: true, baseUrl: 'http://x/v1', model: 'm' } },
+      dream: { isolated: true },
+    })
+    check('0.37.1 coercion: valid booleans/numbers preserved',
+      valid.security.trustWorkspaceMemory === true && valid.security.autoGitignore === false &&
+      valid.budget.dreamMaxPerDayTotal === 2 && valid.retrieval.semantic.enabled === true && valid.dream.isolated === true)
+  }
 }
 
 // 清理

@@ -1,6 +1,38 @@
 # Changelog
 
-本文件从上游 `Phant0Meow/dsh-meow-memory` v0.31.1 接续。**0.32.0 起为本仓库（hardened fork）的版本，当前 0.37.0**，与上游无隶属关系；上游变更历史见 <https://github.com/Phant0Meow/dsh-meow-memory/blob/main/CHANGELOG.md>。
+本文件从上游 `Phant0Meow/dsh-meow-memory` v0.31.1 接续。**0.32.0 起为本仓库（hardened fork）的版本，当前 0.37.1**，与上游无隶属关系；上游变更历史见 <https://github.com/Phant0Meow/dsh-meow-memory/blob/main/CHANGELOG.md>。
+
+## v0.37.1 (2026-10-24) — 设置页保存路径修复（合并/校验/危险开关确认）
+
+独立复审对 0.37.0 设置页保存路径的 P2 修复。无配置/API 变更；测试 1317 → **1354**。
+
+### 配置组合并（此前会静默回退 patch 值）
+
+- 设置页保存任一 `security` / `budget` / `retrieval` 字段时，改为把该组与 profile patch **浅合并**（`retrieval.semantic` 再**深合并一层**），而不是整组替换。此前一次无关的 UI 保存可能把 patch 的 `budget.dreamMaxPerDayTotal` 从 2 回退成 12（成本上升）、丢掉 `retrieval.semantic.baseUrl/model`、或回退 trust 相关 patch 键。**兼容性**：手工改过 `cordis.patch.yml` 的用户，之后用新 UI 做无关保存不再丢这些值。
+- 同一修复覆盖 `dream` / `delegate` 组的浅合并。
+
+### Validator + 严格强制转换
+
+- `validateConfigUserLayer` 对新增组做类型校验：`security.*` / `budget.*` / `retrieval.*`（含嵌套 `retrieval.semantic`）/ `dream.isolated*`。
+- `resolveConfig` 改用严格 `asBool/asNum/asStr`：字符串 `"false"` / `"true"` / `"12"` **既不能打开安全开关、也不能设置数值**（非法类型回退默认；真正的布尔 `true` 仍有效）。这关闭了"'false' 字符串反而启用工作区信任"这类风险。
+- 同时修正 validator 对嵌套 `retrieval.semantic` 的定位（此前误按顶层 group 查找，导致设置页 semantic 字段保存被拒）。
+
+### 危险开关 UX
+
+- `trustWorkspaceMemory` 以危险样式渲染，打开前必须 `window.confirm` 二次确认（本地化警告：会信任所有既有 foreign 记忆库，其中可能有被篡改内容）；**取消则复选框回滚、什么都不写**。
+- `allowHomeSwitch` / `debugLogs` 增加提示；`dream.isolated` 提示改为披露"工具能力子会话、会写工作区/全局库、无 UI 中止"。
+- 新增 **3** 个 UI 键（1 个确认 + 2 个提示），设置页高级键总数 **40**（4 分组 + 36 字段/提示）× zh/en/pt-br。
+
+### 测试
+
+- 新增回归：组合并保留/深合并、validator 拒绝错误类型并接受合法嵌套 semantic、严格强制转换矩阵、危险开关确认/取消不写/回滚、提示渲染、40 key 三语对齐。
+- `npm test`：**1354 条断言全绿**（host 961 + client 393），0 失败；`tests/hardening.mjs` **364 → 385**（+21 合并/校验/强制转换）；`tests/settings-page.mjs` **83 → 99**（+16 危险确认/提示/40 key）。`node smoke.mjs` 29 条；`check-lang` en/pt-br（11 槽位）通过。
+
+### 已知 minor（不变/新增）
+
+- **0.2.x 设置页"保存→apply"仍无 live click-through**（页面渲染与 save RPC 形状有单测；失败时页面会显示明确错误）。
+- 危险开关用原生 `window.confirm`，**无撤销/自定义弹窗**（P3）；`allowHomeSwitch` **未做二次确认**（P3）。
+- 其余 0.37 限制不变（next-turn 传播、无硬删除、仅全局作用域等）。
 
 ## v0.37.0 (2026-10-24) — 设置页 parity + 稳定性收尾
 

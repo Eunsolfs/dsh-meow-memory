@@ -1,4 +1,4 @@
-# Tool reference (0.37 fork)
+# Tool reference (0.37.1 fork)
 
 meow-memory registers **10** memory tools. Three bands: **read** (search / read / find_similar / project / list), **write** (remember / update / forget / dream), **directory** (home).
 
@@ -232,7 +232,7 @@ The "Global memory (user-scope)" card at the bottom of the settings page ("Meow 
 - Division of work: `memory_*` still covers all levels/both stores (including project-level memory); the editor covers global scope only.
 - After a save the host marks related sessions for reinject (window index + `sessionPersistence`; **both the header shape `{header:{id,cwd}}` and the flat `{id,cwd}` shape are read**, fixed in 0.36.1, so cold sessions are marked too; at most 2000 sessions per save, already pending not rewritten); those sessions re-inject the updated global memory on their **next user message** (no history rewrite, no immediate model call). What the model sees is "the injected content changed on the next turn", not an extra tool call.
 - Validation/limits: content 1–4000 chars, keywords 1–30, importance 1–100; no hard delete (archive); last-write-wins; global scope only; effective on the next message; marking is bounded (≤2000 sessions per save).
-- **Config fields (0.37)**: `security` / `budget` / `retrieval` (incl. nested `retrieval.semantic`) and `dream.isolated*` are now editable on the "Meow memory" settings page too; tool behaviour is unchanged, and with semantic enabled `memory_search`'s query still sends one embedding request.
+- **Config fields (0.37; 0.37.1 save fixes)**: `security` / `budget` / `retrieval` (incl. nested `retrieval.semantic`) and `dream.isolated*` are now editable on the "Meow memory" settings page too; saves shallow-merge their group into the patch (deep-merge for semantic) instead of replacing it; `trustWorkspaceMemory` requires a confirm before enabling; string-typed booleans/numbers fall back to defaults. Tool behaviour is unchanged, and with semantic enabled `memory_search`'s query still sends one embedding request.
 
 ---
 
