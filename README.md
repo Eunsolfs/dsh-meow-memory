@@ -3,12 +3,12 @@
 | [中文](README.md) | [English](README.en.md) | [Português (BR)](README.pt-br.md) | [MIT License](LICENSE) |
 | :---: | :---: | :---: | :---: |
 
-> **这是什么**：`Phant0Meow/dsh-meow-memory` **v0.31.1** 的个人加固 fork（本仓库，版本 **0.32.1**，分支 `hardening`）。
+> **这是什么**：`Phant0Meow/dsh-meow-memory` **v0.31.1** 的个人加固 fork（本仓库，版本 **0.33.0**，分支 `hardening`）。
 > 上游是 MIT 授权，上游仓库：<https://github.com/Phant0Meow/dsh-meow-memory>。本 fork **与上游无隶属关系**，不代上游发布、也不代表上游立场；所有改动与剩余问题见 [CHANGELOG.md](CHANGELOG.md)。
 
 为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）打造的跨会话记忆插件：七层 SQLite 记忆、首轮快照注入、每消息关键词命中，以及**有预算上限**的自动整理。
 
-当前版本 **0.32.1** ｜ 变更见 [CHANGELOG.md](CHANGELOG.md) ｜ 已实测宿主 **DSH Desktop 0.2.1-rc.2**（见[兼容性](#兼容性)）
+当前版本 **0.33.0** ｜ 变更见 [CHANGELOG.md](CHANGELOG.md) ｜ 已实测宿主 **DSH Desktop 0.2.1-rc.2**（见[兼容性](#兼容性)）
 
 **诚实声明**：本 README 只写代码里确实存在的行为。0.32 删掉了上游 README 里若干夸大表述（"自动去重合并"、"艾宾浩斯遗忘曲线"、每消息命中"BM25"、"兼容 dsh 0.1.5"），并在每处注明真实边界。
 
@@ -18,7 +18,7 @@
 
 这是本插件最容易被低估的成本。**默认配置下，插件会在你不发指令时自动发起 LLM 请求**；0.32 给每一类都加了上限，但没有把任何一类关掉（保持上游默认行为，只把无界变有界）。
 
-| 花费 | 何时发生 | 0.32 上限 |
+| 花费 | 何时发生 | 0.33 上限 |
 |---|---|---|
 | **静态税**：system prompt 里的记忆手册 + 全部工具描述/schema | **每一次**模型请求，哪怕这个会话一次记忆都没用 | ≈**6.7k tokens/请求**（中文包实测；英文包 ≈6.3k；随语言包与工具描述长度略变）。无法按请求关闭；要彻底不付这笔税，设 `enabled: false` 停用插件（或卸载） |
 | **首轮快照**：soul / user / 全局 rules / 记忆导引 | 每个会话第一条真实用户消息前，一次 | `budget.snapshotMaxChars` 默认 **6000 字符**（≈2.7k tokens 中文） |
@@ -44,6 +44,30 @@
 
 > 这些是**上限**，不是承诺。实际花费取决于条目数、内容长度和会话长度；最坏情况下一天的自动花费仍有量级上限（≤1 次 dream + ≤6 次反思的全上下文轮）。上下文闸里的"估算 token"是**近似值**：CJK ≈1.7 字符/token、非 CJK ≈4 字符/token（宁可估高），不是精确计费。
 
+> **0.33 的分层存储不增加每消息 token**：只是多一个本地 SQLite 库（用户级全局库），注入条数仍受 `budget.*` 上限约束；fuzzy 补分是纯 CPU 计算、不花 token；dream/反思频次与上下文闸不变。
+
+---
+
+## 记忆存哪里：两层存储（0.33）
+
+0.33 把"全局"从"单工作区内全局"改成真正的**用户级**两层存储：
+
+```
+<activeHomeDir>/global/memory.db        ← 用户级（跨工作区）
+  soul / user / rules(全局)
+<workspace>/<projectDir>/memory.db      ← 工作区级（每个 cwd 一份）
+  project / fact / lesson / topic / rules(项目)
+```
+
+- **用户级全局库**：在全局数据目录下（`activeHomeDir()/global/memory.db`；默认 `~/.dsh-meow/global/memory.db`，可用 `homeDir` / `MEOW_MEMORY_HOME` 改）。`homeDir` / `memory_home` 切目录时全局库跟着搬。
+- **工作区库**：仍按 cwd 一份，保存 `project` / `fact` / `lesson` / `topic` / 项目级 `rules`。
+- **写入路由**：`memory_remember` 写 `soul` / `user`，或 `rules` 且 project 是全局标记 → **全局库**；其余 → **工作区库**。`memory_read` / `memory_update` / `memory_forget` / `memory_search` / `memory_list` / `memory_find_similar` **两库都查、按 id 去重**；同 id 时 **active 优先于 archived**（迁移后的工作区归档副本不会遮住全局正本）。`memory_project` 仍只读工作区库。
+- **自动迁移（一次性）**：每个工作区的第一个可信会话会把工作区里原有的 soul / user / 全局 rules **按原 id 复制**进全局库，然后把工作区里的这些行**归档**（可恢复；避免注入与 dream 双计）。幂等标记写在工作区库 `dream_meta`（`globalmigrated:v1:<dir>`）；只对可信工作区执行，foreign 库不碰。
+- **回退**：全局库不存在 / 未受信 / 不可用时，自动退回 0.32 的单工作区行为（soul/user/全局 rules 仍从工作区库读写），不报错。
+- **迁移后如果全局库被删**：工作区里的原行仍是 archived，**不会自动重新注入**。恢复办法：恢复/备份全局目录，或用 `memory_forget`（`mode:'restore'`）逐条恢复工作区里的归档行。
+- **备份边界（诚实声明）**：`backup.enabled` 只备份**工作区** `memory.db`，**不含全局库**；全局库请自行备份 `~/.dsh-meow/global/`（或你的 `homeDir`）。
+- **dream/反思仍只整理工作区库**：全局条目靠工具/反思（每次任务后的反思轮可写全局库）维护，不进 dream 的三轮清单——已知限制。
+
 ---
 
 ## 安全模型
@@ -52,9 +76,11 @@
 
 | 数据 | 位置 |
 |---|---|
-| 记忆库（明文 SQLite） | `<工作区>/<projectDir>/memory.db`，`projectDir` 默认 `.dsh-meow` |
+| 用户级全局记忆库（明文 SQLite） | `<activeHomeDir>/global/memory.db`：默认 `~/.dsh-meow/global/memory.db`（**在 `DSH_HOME` 之外**；可用 `homeDir` / `MEOW_MEMORY_HOME` 改） |
+| 工作区记忆库（明文 SQLite） | `<工作区>/<projectDir>/memory.db`，`projectDir` 默认 `.dsh-meow` |
 | 会话级"已见/查阅"留痕 | `<工作区>/.dsh-meow/sessions/<id>.json` |
 | 工作区库的信任标记 | `<工作区>/.dsh-meow/.owner.json` |
+| 全局库的信任标记 | `<activeHomeDir>/global/.owner.json`（installId 标记，`workspace: ''`） |
 | 自忽略 `.gitignore` | `<工作区>/.dsh-meow/.gitignore`（内容 `*`，**目录自忽略**，`git add .` 不会把记忆提交进仓库） |
 | 实例级全局目录（日志 / window-index / migrate 状态） | 默认 `~/.dsh-meow`（**在 `DSH_HOME` 之外**），可用 `homeDir` 或 `MEOW_MEMORY_HOME` 改 |
 | prompt 文案实例覆盖层 | `$DSH_HOME/storages/meow-memory/prompts/<lang>/<slot>.md`（固定路径，`$DSH_HOME` 缺省 `~/.dsh`；**不随 `homeDir`/`memory_home` 切换**） |
@@ -73,6 +99,7 @@
 - untrusted 库**不会被正常聊天轮打开**：不升级 schema、不建索引、不迁移、不读；只有一次只读探针会碰文件。它的内容不注入，**所有记忆工具（读和写）、dream 与反思全部拒绝**，会话里提示一次如何信任（`security.trustWorkspaceMemory: true`）；
 - 直到你显式信任、或删除/改名该库。确认库是你自己的再打开；
 - `autoMigrate` **默认改为 `false`**：不再自动把工作区里的 `PROJECT.md` 导入记忆库。
+- **全局库同样过信任闸**：`<activeHomeDir>/global/.owner.json`（installId 标记、`workspace: ''` 无工作区绑定）；库不存在 → 自动创建并信任，已存在但无有效标记 → **foreign**。全局库 foreign 时自动退回 0.32 单工作区行为（不读/不写全局），**没有 `trustWorkspaceMemory` 这类配置信任档**；从别的机器复制/同步来的全局目录会被判 foreign。
 
 ### `memory_home` 默认只读（#64-2 修复）
 
@@ -97,10 +124,9 @@
 卸载插件不会删除记忆。确认不再需要后手动删：
 
 ```
-<工作区>/.dsh-meow/                      # memory.db、sessions/、.owner.json、.gitignore
-~/.dsh-meow/                             # 或你配置的 homeDir：logs、window-index、migrate-state
-$DSH_HOME/storages/meow-memory/prompts/  # prompt 实例覆盖层（若手工加过）
-~/.dsh/storages/meow-memory-home.json    # memory_home 切换指针（若从未切换则可能不存在）
+<工作区>/.dsh-meow/                       # memory.db、sessions/、.owner.json、.gitignore
+~/.dsh-meow/                              # 或你配置的 homeDir：global/memory.db、logs、window-index、migrate-state
+$DSH_HOME/storages/meow-memory*           # install-id、prompt 覆盖层、切换指针（meow-memory-home.json）
 ```
 
 ---
@@ -108,8 +134,9 @@ $DSH_HOME/storages/meow-memory/prompts/  # prompt 实例覆盖层（若手工加
 ## ✨ 功能特性
 
 - **七层记忆**：`soul`（AI 自身）/ `user`（用户信息与偏好）/ `project`（项目信息，含 `subcategory`）/ `fact`（原子事实）/ `lesson`（教训与纠正）/ `topic`（进行中的话题，带目标句）/ `rules`（设计原则与行为准则）。每层一张 SQLite 表，id 带时间前缀。
-- **首轮注入（长期记忆块）**：第一条用户消息前注入 soul / user / 全局 rules / 记忆导引。作为独立 plugin snapshot 消息放在真实 user 消息之前，**不改写用户 prompt**；**首轮不跑关键词命中**（从第二轮起）。
-- **每消息关键词命中**：从第二条用户消息起，按条目**关键词**（不是全文）检索 fact/lesson/rules/topic（全局 + 当前 project 锚定），`hitTopK` 命中注入。0.32 加了 `minScore` 阈值（默认 0.35）与 `hit_count` 反馈加权，减少无关注入；**仍然是关键词匹配，没有向量/语义检索**，关键词写得不好就会静默召回不到。
+- **两层存储（0.33）**：`soul` / `user` / 全局 `rules` 放在**用户级全局库**，跨工作区共享；`project` / `fact` / `lesson` / `topic` / 项目 rules 放工作区库。详见[记忆存哪里](#记忆存哪里两层存储033)。
+- **首轮注入（长期记忆块）**：第一条用户消息前注入 soul / user / 全局 rules / 记忆导引。soul / user / 全局 rules 优先从用户级全局库读，工作区库兜底；作为独立 plugin snapshot 消息放在真实 user 消息之前，**不改写用户 prompt**；**首轮不跑关键词命中**（从第二轮起）。
+- **每消息关键词命中 + 混合词法兜底**：从第二条用户消息起，按条目**关键词**（不是全文）检索 fact/lesson/rules/topic（全局 + 当前 project 锚定），`hitTopK` 命中注入。0.33 加离线混合词法补分：字符 bigram Jaccard + 0.25×trigram Jaccard（CJK 安全、NFKC），作为 BM25 弱命中时的 **floor**：`score = max(BM25, 0.55·fuzzy·recency·importance)`，噪声地板 0.2；对同义变体/词形/CJK 词边界有改善。**仍然不是向量/语义检索**（没有 embedding）；关键词质量差仍会静默召回不到。
 - **当前 project 锚定**：带 project 参数即锚定该会话的当前项目；未锚定时命中只搜全局（闲聊不误伤）。
 - **缓存友好**：静态 `meow-memory:guide` section 在 system prompt 中注册一次，文本恒定，不破坏 provider 的前缀缓存。
 - **压缩后重注入**：会话压缩后，下一轮重新注入长期记忆快照 + 本会话查阅过的项目全景 + 本会话写入过的记忆原文（受 `reinjectMaxChars` 上限约束）。
@@ -121,8 +148,11 @@ $DSH_HOME/storages/meow-memory/prompts/  # prompt 实例覆盖层（若手工加
 
 ### 它做不到的事（别误会）
 
-- **"全局"记忆只在一个工作区里全局**：记忆库按工作区（cwd）各存一份。换工作区 = 换一个空库；从子目录/软链打开也会生成新库。跨项目复用的信息目前只能靠同一 cwd。
-- **没有语义检索**：只有关键词匹配。`hit_count` 现在参与排序（反馈），但不会自动改写关键词。
+- **项目级记忆仍按工作区隔离**：`project` / `fact` / `lesson` / `topic` / 项目 rules 跟着 cwd 走（换工作区 = 新的项目记忆）。跨工作区共享的只有 `soul` / `user` / 全局 rules（0.33 用户级全局库）。
+- **没有语义检索**：0.33 的 fuzzy 只是字符 n-gram 词法兜底（同义变体/词形/词边界），不是 embedding、不懂同义改写。`hit_count` 参与排序但不会自动改写关键词。
+- **全局库不参与 dream**：dream 三轮仍只整理工作区库；全局条目靠工具/反思维护。
+- **备份不含全局库**：`backup.enabled` 只备份工作区 `memory.db`。
+- **迁移会归档工作区副本**：升级到 0.33 后原工作区的 soul/user/全局 rules 行变为 archived（内容保留）；全局库若丢失不会自动回灌，需恢复全局目录或逐条 `memory_forget mode=restore`。
 - **遗忘是"指数半衰"而不是"艾宾浩斯复习曲线"**：`retrieval.halfLifeDays` 默认 30 天，`exp(-ln2 × 天数/30)`，并保留 importance≥3 的 0.85 下限。dream 会把 `updated_at` 按整理时间封存，所以衰减输入本身会被整理行为影响——这不是记忆科学意义上的复习调度。
 - **dream 仍会把整理指令/回复/工具调用留在主会话历史里**：UI 折叠只是视觉收纳，token 仍持久存在。
 - **`memory_home` 的切换能力默认关闭**；打开后它仍是模型可调用的工具，请自行评估。
@@ -144,7 +174,7 @@ $DSH_HOME/storages/meow-memory/prompts/  # prompt 实例覆盖层（若手工加
 
 2. 任选其一：
    - **本地目录**：GUI 左侧 **Plugins → Add plugin**，填**本仓库的绝对路径**（插件管理器接受绝对本地路径）；
-   - **tarball**：`npm pack` 生成 `meow-memory-0.32.1.tgz`，Plugins → Add plugin 填该 `.tgz` 的绝对路径。
+   - **tarball**：`npm pack` 生成 `meow-memory-0.33.0.tgz`，Plugins → Add plugin 填该 `.tgz` 的绝对路径。
 3. 重启 `dsh web`（或热重载插件）。新会话自动加载。
 
 > 本地 `file:`/`link:` 安装不会执行 `prepare`，所以**必须先构建**；tarball 里已含 `lib/`，装上即可用。
@@ -273,20 +303,22 @@ dsh plugin --profile <profile> remove meow-memory
 每会话一次，首轮不做命中
 ```
 
-### 工具（0.32 共 10 个）
+> 0.33 起：首轮快照里的 soul / user / 全局 rules 优先来自用户级全局库（`<activeHomeDir>/global/memory.db`），工作区库兜底；项目全景与重注入仍只读工作区库。
+
+### 工具（0.33 共 10 个）
 
 | 工具 | 档 | 用途 |
 |---|---|---|
-| `memory_remember` | 写 | 写入一条记忆（必填 content/project/keywords/importance；近逐字重复自动合并） |
-| `memory_search` | 读 | BM25 × 指数半衰检索，支持 level/project/status/days 过滤与 `explain` 分项得分 |
-| `memory_project` | 读 | 取回某项目完整注入段落（`project` 参数必填） |
-| `memory_find_similar` | 读 | 查重与冲突检测 |
-| `memory_read` | 读 | 按 id 读取单条完整元数据 |
-| `memory_update` | 写 | 修正 status / importance / goal / keywords / content |
-| `memory_list` | 读 | **0.32 新增**：列条目 id/标题/关键词/状态/时间，不含正文；支持 level/project/status/limit/offset |
-| `memory_forget` | 写 | **0.32 新增**：按 id 归档/取消归档/硬删除。默认归档；`mode:'delete'` 才硬删且必须 `confirm:true` |
-| `memory_dream` | 写 | 手动触发本窗口整理（与 `/dream` 同语义） |
-| `memory_home` | 目录 | 查看全局数据目录；**0.32 起默认只读**，需 `security.allowHomeSwitch: true` 才能切换 |
+| `memory_remember` | 写 | 写入一条记忆（必填 content/project/keywords/importance；**soul/user/全局 rules 写用户级全局库，其余写工作区库**；近逐字重复自动合并） |
+| `memory_search` | 读 | 混合词法检索（BM25 + 字符 n-gram 兜底 floor）× 指数半衰，支持 level/project/status/days 过滤与 `explain`（含可选 `fuzzy`）；两库都查 |
+| `memory_project` | 读 | 取回某项目完整注入段落（`project` 参数必填）；**只读工作区库** |
+| `memory_find_similar` | 读 | 查重与冲突检测；两库都查 |
+| `memory_read` | 读 | 按 id 读取单条完整元数据；两库都查 |
+| `memory_update` | 写 | 修正 status / importance / goal / keywords / content；改哪库写哪库 |
+| `memory_list` | 读 | **0.32 新增**：列条目 id/标题/关键词/状态/时间，不含正文；两库合并、按 id 去重 |
+| `memory_forget` | 写 | **0.32 新增**：按 id 归档/取消归档/硬删除。默认归档；`mode:'delete'` 才硬删且必须 `confirm:true`；两库都查 |
+| `memory_dream` | 写 | 手动触发本窗口整理（与 `/dream` 同语义；只整理工作区库） |
+| `memory_home` | 目录 | 查看全局数据目录；**0.32 起默认只读**，需 `security.allowHomeSwitch: true` 才能切换（0.33 切换会连全局库一起搬，搬前先关连接） |
 
 **参数、返回与副作用见 [docs/工具参考.md](docs/工具参考.md)**。
 
@@ -301,7 +333,7 @@ npm run test           # build + 语言包自查 + 全量断言（host + client 
 node scripts/check-lang.mjs en       # 只查某个 prompt 语言包
 ```
 
-测试断言数：`npm test` **1032 条全绿**（host 672 + client 360），0 失败；另 `node smoke.mjs` 29 条；`scripts/check-lang.mjs` 校验 en/pt-br 两个语言包（11 槽位对齐）。
+测试断言数：`npm test` **1076 条全绿**（host 676 + client 360），0 失败；另 `node smoke.mjs` 29 条；`scripts/check-lang.mjs` 校验 en/pt-br 两个语言包（11 槽位对齐）。
 
 `@deepseek-ai/*` 包位于 dsh-meow pnpm workspace，不在本包 `node_modules` 里。Windows 上 `npm run link-workspace` 创建 workspace 包的 junction 镜像供 esbuild 解析；仅构建期需要。
 
@@ -311,7 +343,8 @@ node scripts/check-lang.mjs en       # 只查某个 prompt 语言包
 2. 设置页改一个字段 → 保存 → 热重载插件 → 值是否生效（验证 0.2.x settings 漂移）；
 3. `/dream` 跑完 → 继续聊天：工具数量是否正常（防 #66）；
 4. 反思轮后检查模型选择栏是否仍为主模型（防 #71，仅配置 `delegate.model` 时可能触发）；
-5. 在克隆来的陌生仓库里开新会话：不应出现你没写过的长期记忆内容（不信任库/默认不迁移）。
+5. 在克隆来的陌生仓库里开新会话：不应出现你没写过的长期记忆内容（不信任库/默认不迁移）；
+6. 换一个工作区开新会话：`soul` / `user` / 全局 rules 应该还在（来自用户级全局库），`project` / `fact` 是新工作区的（验证两层存储）。
 
 ---
 
@@ -320,6 +353,7 @@ node scripts/check-lang.mjs en       # 只查某个 prompt 语言包
 | 想了解 | 看这里 |
 | --- | --- |
 | 10 个工具的参数、返回与副作用 | [docs/工具参考.md](docs/工具参考.md) |
+| 记忆存哪里、迁移与回退 | [记忆存哪里](#记忆存哪里两层存储033) |
 | 全部配置项、类型与默认值 | [docs/配置参考.md](docs/配置参考.md) |
 | 为什么这样设计、成本与取舍 | [docs/设计说明.md](docs/设计说明.md) |
 | 装不上、检索不准、报错怎么读 | [docs/常见问题.md](docs/常见问题.md) |

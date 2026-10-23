@@ -12,6 +12,9 @@ import { join, resolve } from 'node:path'
 // `.owner.json`，又不把 install-id 落到真实 ~/.dsh（测试全程隔离）。
 const TEST_DSH_HOME = mkdtempSync(join(tmpdir(), 'mm-test-dsh-'))
 process.env.DSH_HOME = TEST_DSH_HOME
+// 0.32.2：全局记忆库落在 activeHomeDir() 下——测试必须把它也指向临时目录，
+// 绝不写真实 ~/.dsh-meow（此前 apply 级测试的 window-index/perf 会落到用户家目录）。
+process.env.MEOW_MEMORY_HOME = join(TEST_DSH_HOME, 'meow-home')
 mkdirSync(join(TEST_DSH_HOME, 'storages', 'meow-memory'), { recursive: true })
 writeFileSync(join(TEST_DSH_HOME, 'storages', 'meow-memory', 'install-id'), 'test-install-id\n')
 
@@ -27,6 +30,7 @@ import {
   memoryDbPath,
   getDb,
   closeAllDbs,
+  closeGlobalDb,
   loadWindowIndex,
   migrateLegacy,
   buildInjection,
@@ -108,6 +112,15 @@ let failed = 0
 function check(name, cond, detail = '') {
   if (cond) { passed++; console.log(`  ok  ${name}`) }
   else { failed++; console.log(`FAIL  ${name} ${detail}`) }
+}
+
+// Phase 2（0.33）测试隔离：全局记忆库（<activeHomeDir>/global）是进程级/实例级状态，
+// 会跨越 apply 级测试块存活（首个可信 pre-step 会迁移 fixture 的 soul/user/全局 rules，
+// 后续 search/list 会读到它们）。测试块之间按需重置：关连接 + 清信任缓存 + 删磁盘目录。
+function resetGlobalStoreForTest() {
+  try { closeGlobalDb() } catch { /* 未打开 */ }
+  resetStoreTrustCache()
+  try { rmSync(join(activeHomeDir(), 'global'), { recursive: true, force: true }) } catch { /* 不存在 */ }
 }
 
 // ═══════════════════════ 部分 1：模块级 ═══════════════════════
@@ -1127,6 +1140,8 @@ function ownStore(workspace, dir = '.dsh-meow') {
 ownStore(ws)
 ownStore(ws2)
 
+// Phase 2：apply 级测试从干净的全局库开始（前一节 module 级断言不依赖它）。
+resetGlobalStoreForTest()
 const { ctx, tools, handlers } = makeCtx()
 await apply(ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
 check('ten tools registered', tools.length === 10 && ['memory_remember', 'memory_search', 'memory_find_similar', 'memory_read', 'memory_update', 'memory_dream', 'memory_project', 'memory_list', 'memory_forget', 'memory_home']
@@ -1228,26 +1243,38 @@ check('search status=archived single filter (#68)', sArch.hits.length >= 1 && sA
 const searchRender = searchTool.output.render({}, { note: '', hits: [{ level: 'fact', id: '0msum4ifx-bf3a-0000000000000000000000', project: 'dsh', content: 'x', keywords: ['dream', '机制'], updated_at: Date.now() - 2 * 86_400_000 }] })
 check('search shows keywords + relative time, no content', searchRender.some((b) => b.text.includes('[dsh : fact]') && b.text.includes('关于：dream, 机制') && b.text.includes('2 天前') && !b.text.includes('记忆时间戳')))
 
+// Phase 2：搜索/分段断言只依赖本工作区 fixture——先清掉可能残留的全局库与信任缓存。
+resetGlobalStoreForTest()
 // search 5+5 分段（用户拍板 2026-08-19）：前 5 条无脑取（不排除已见/本 session 建立的），
-// 第 6 名起绕开已见（injected+searched）补齐。分数相同时排名稳定=插入序。
+// 第 6 名起绕开已见（injected+searched）补齐。0.33：全局库/模糊补分会改变得分细节，// 因此把 fixture 做成**完全同分**（等长正文 + 相同 updated_at）并显式 created_at 定序：
+// 同分时 ranked 顺序 = db.list 的 created_at DESC（12→1），盲取前 5 = 12/11/10/9/8。
 const wsSplit = mkdtempSync(join(tmpdir(), 'mm-split-'))
 ownStore(wsSplit)
 const dbSplit = new MemoryDb(memoryDbPath(wsSplit))
+const SPLIT_TS = 1_700_000_000_000
+const splitIds = []
 for (let i = 1; i <= 12; i++) {
-  dbSplit.insert({ level: 'fact', content: `分段检索测试 内容${i} 特异性词${i}`, project: 'dsh', source_session: i === 5 || i === 12 ? 's-split' : 'win-other' })
+  const pad = String(i).padStart(2, '0')
+  splitIds.push(dbSplit.insert({
+    level: 'fact',
+    content: `分段检索测试 内容${pad} 特异性词${pad}`,
+    project: 'dsh',
+    source_session: i === 5 || i === 9 ? 's-split' : 'win-other',
+    created_at: i,
+    updated_at: SPLIT_TS,
+  }).id)
 }
-const splitRows = dbSplit.list('fact')
-const sid = (n) => splitRows[n - 1].id // 排名 = 插入序（BM25 分数相同）
-markInjected(wsSplit, 's-split', [sid(1), sid(2)], '.dsh-meow')
-markSearched(wsSplit, 's-split', [sid(6), sid(7)], '.dsh-meow')
+const sid = (n) => splitIds[n - 1] // n = 插入序（1..12），与 created_at 显式对应
+markInjected(wsSplit, 's-split', [sid(8), sid(9)], '.dsh-meow') // 落在盲取前 5 的已见条目
+markSearched(wsSplit, 's-split', [sid(6), sid(7)], '.dsh-meow') // 落在第 6 名之后的已见条目
 const splitCtx = { agent: { session: { header: { cwd: wsSplit, id: 's-split' } } } }
 const sp = await searchTool.execute({ query: '分段检索测试', project: 'dsh', k: 10 }, splitCtx)
 const spIds = new Set(sp.hits.map((h) => h.id))
 check('search 5+5: default k=10 returns 10 hits', sp.hits.length === 10, `got ${sp.hits.length}`)
-check('search top5 blind includes seen (injected) entries', spIds.has(sid(1)) && spIds.has(sid(2)))
+check('search top5 blind includes seen (injected) entries', spIds.has(sid(8)) && spIds.has(sid(9)))
 check('search rank6+ skips seen entries (6,7 excluded)', !spIds.has(sid(6)) && !spIds.has(sid(7)))
-check('search blind includes this-session memory', spIds.has(sid(5)))
-check('search fresh includes this-session unseen memory', spIds.has(sid(12)))
+check('search blind includes this-session memory', spIds.has(sid(9)))
+check('search fresh includes this-session unseen memory', spIds.has(sid(5)))
 check('search 5+5 exact result set', JSON.stringify([...spIds].sort()) === JSON.stringify([1, 2, 3, 4, 5, 8, 9, 10, 11, 12].map(sid).sort()))
 const spSeen = readSeen(wsSplit, 's-split', '.dsh-meow')
 check('search marks all returned ids as searched', [...spIds].every((id) => spSeen.has(id)))
@@ -1255,9 +1282,9 @@ check('search marks all returned ids as searched', [...spIds].every((id) => spSe
 dbSplit.insert({ level: 'fact', content: '分段检索测试 未标记条目 特异性词u', project: null, source_session: 'win-other' })
 const spNull = await searchTool.execute({ query: '未标记条目', project: 'dsh' }, splitCtx)
 check('search unmarked row returns project=""', spNull.hits.length >= 1 && spNull.hits[0].project === '')
-// k<5：全盲取（无 fresh 段）
+// k<5：全盲取（无 fresh 段；同分 descending 的 created_at 决定前三名 = 12/11/10）
 const sp3 = await searchTool.execute({ query: '分段检索测试', project: 'dsh', k: 3 }, splitCtx)
-check('search k=3: blind only', sp3.hits.length === 3 && sp3.hits.some((h) => h.id === sid(1)))
+check('search k=3: blind only', sp3.hits.length === 3 && sp3.hits.some((h) => h.id === sid(12)))
 check('search description mentions 5+5 rule', searchTool.description.includes('前 5 条按相关度无脑取') && searchTool.description.includes('绕开已注入/已检索'))
 dbSplit.close()
 const readTool = tools.find((t) => t.name === 'memory_read')
@@ -2379,25 +2406,32 @@ rmSync(wsNoDb, { recursive: true, force: true })
   const tmp = mkdtempSync(join(tmpdir(), 'meow-homedir-'))
 
   // resolveHomeDir：预设/缺省/非法输入
+  // 0.33：test.mjs 顶部为隔离设置了 MEOW_MEMORY_HOME（全局库落临时目录），而
+  // resolveHomeDir 的回落链是 env > 稳定位置指针 > 平台默认——"回落默认"类断言必须
+  // 同时摘掉 env 且让 DSH_HOME 指向一个空目录（否则读到本次测试早前写下的 home 指针）。
+  const savedMeowEnv = process.env.MEOW_MEMORY_HOME
+  const savedDshHomeEnv = process.env.DSH_HOME
+  delete process.env.MEOW_MEMORY_HOME
+  process.env.DSH_HOME = join(tmp, 'dshhome-clean')
   check('resolveHomeDir: default 标记=平台默认目录', resolveHomeDir('default') === DEFAULT_HOME_DIR)
   check('resolveHomeDir: 空/undefined 回落默认', resolveHomeDir('') === DEFAULT_HOME_DIR && resolveHomeDir(undefined) === DEFAULT_HOME_DIR)
-  const savedEnv = process.env.DSH_HOME
   process.env.DSH_HOME = join(tmp, 'dshhome')
   check('resolveHomeDir: dsh-storage 预设=DSH_HOME/storages/meow-memory', resolveHomeDir('dsh-storage') === join(tmp, 'dshhome', 'storages', 'meow-memory'))
-  // 直接赋 undefined 会存成字符串 "undefined"（#70 起 dshHomeDir 会把它当真值读走）
-  if (savedEnv === undefined) delete process.env.DSH_HOME
-  else process.env.DSH_HOME = savedEnv
+  process.env.DSH_HOME = join(tmp, 'dshhome-clean')
   check('resolveHomeDir: plugin-root 预设=插件根/storage（绝对路径）', resolveHomeDir('plugin-root') === homeDirPresets()['plugin-root'] && resolve(resolveHomeDir('plugin-root')) === resolveHomeDir('plugin-root'))
   check('resolveHomeDir: 相对路径非法回落默认', resolveHomeDir('relative/path') === DEFAULT_HOME_DIR)
   check('resolveHomeDir: 用户主目录本身非法回落默认', resolveHomeDir(homedir()) === DEFAULT_HOME_DIR)
   const customAbs = join(tmp, 'custom-home')
   check('resolveHomeDir: 合法绝对路径原样通过', resolveHomeDir(customAbs) === resolve(customAbs))
-  const savedEnvHome = process.env.MEOW_MEMORY_HOME
   process.env.MEOW_MEMORY_HOME = join(tmp, 'env-home')
   check('resolveHomeDir: env 兜底生效（配置无值时）', resolveHomeDir(undefined) === join(tmp, 'env-home') && resolveHomeDir('') === join(tmp, 'env-home'))
-  if (savedEnvHome === undefined) delete process.env.MEOW_MEMORY_HOME
-  else process.env.MEOW_MEMORY_HOME = savedEnvHome // 直接赋 undefined 会存成字符串 "undefined"
+  delete process.env.MEOW_MEMORY_HOME // 再摘掉，验证"env 还原（缺失）后回落默认"
   check('resolveHomeDir: env 还原后回落默认', resolveHomeDir(undefined) === DEFAULT_HOME_DIR)
+  // 块末恢复全局隔离 env（后续 switch/sweep 断言不再依赖它，但保持测试隔离状态一致）
+  if (savedMeowEnv === undefined) delete process.env.MEOW_MEMORY_HOME
+  else process.env.MEOW_MEMORY_HOME = savedMeowEnv
+  if (savedDshHomeEnv === undefined) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = savedDshHomeEnv
 
   // switchHomeDir：same / 目标非空直接启用 / 同盘 rename 迁移
   const from = join(tmp, 'from-home')

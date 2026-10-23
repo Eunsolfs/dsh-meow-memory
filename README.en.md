@@ -3,12 +3,12 @@
 | [中文](README.md) | [English](README.en.md) | [Português (BR)](README.pt-br.md) | [MIT License](LICENSE) |
 | :---: | :---: | :---: | :---: |
 
-> **What this is**: a personal hardening fork of `Phant0Meow/dsh-meow-memory` **v0.31.1** (this repository, version **0.32.1**, branch `hardening`).
+> **What this is**: a personal hardening fork of `Phant0Meow/dsh-meow-memory` **v0.31.1** (this repository, version **0.33.0**, branch `hardening`).
 > Upstream is MIT-licensed: <https://github.com/Phant0Meow/dsh-meow-memory>. This fork is **not affiliated with upstream**, does not publish on upstream's behalf, and does not represent upstream's views. All changes and remaining issues are in [CHANGELOG.md](CHANGELOG.md).
 
 Cross-session memory for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): seven-layer SQLite memory, first-turn snapshot injection, per-message keyword hits, and automatic consolidation **with budget caps**.
 
-Version **0.32.1** ｜ Changelog: [CHANGELOG.md](CHANGELOG.md) ｜ Verified host: **DSH Desktop 0.2.1-rc.2** (see [Compatibility](#compatibility))
+Version **0.33.0** ｜ Changelog: [CHANGELOG.md](CHANGELOG.md) ｜ Verified host: **DSH Desktop 0.2.1-rc.2** (see [Compatibility](#compatibility))
 
 **Honesty note**: this README only claims behaviour that exists in the code. 0.32 removed several inflated upstream claims ("automatic dedupe/merge", "Ebbinghaus forgetting curve", per-message "BM25", "supports dsh 0.1.5") and states the real boundary at each point.
 
@@ -18,7 +18,7 @@ Version **0.32.1** ｜ Changelog: [CHANGELOG.md](CHANGELOG.md) ｜ Verified host
 
 This is the plugin's most under-estimated cost. **With default settings it issues LLM requests without an explicit user command**; 0.32 put a cap on every kind, but did not switch any of them off (upstream default behaviour kept, only unbounded → bounded).
 
-| Spend | When | 0.32 cap |
+| Spend | When | 0.33 cap |
 |---|---|---|
 | **Static tax**: memory manual + every tool description/schema in the system prompt | **Every** model request, even a session that never uses memory | ≈**6.7k tokens/request** (measured, Chinese pack; ≈6.3k English; varies with language pack and tool-description length). Cannot be disabled per request; to avoid it entirely set `enabled: false` (or remove the plugin) |
 | **First-turn snapshot**: soul / user / global rules / memory guide | Once, before the first real user message of each session | `budget.snapshotMaxChars` default **6000 chars** (≈2.7k tokens zh) |
@@ -44,6 +44,30 @@ Or per window: session row "…" menu → **Memory participation** → turn off 
 
 > These are **caps**, not promises. Actual spend depends on entry counts, content length and session length; the worst case per day is still bounded in orders of magnitude (≤1 dream + ≤6 reflection full-context turns). The "estimated tokens" used by the context gates are **approximate**: CJK ≈1.7 chars/token, non-CJK ≈4 chars/token (deliberately over-estimated), not exact billing.
 
+> **The 0.33 layered store adds no per-message tokens**: it is just one more local SQLite database (the user-scope global store); injections stay bounded by `budget.*`. Fuzzy scoring is pure CPU (no tokens); dream/reflection frequency and context caps are unchanged.
+
+---
+
+## Where memory lives: two-layer storage (0.33)
+
+0.33 turns "global" from "global within one workspace" into real **user-scope** layered storage:
+
+```
+<activeHomeDir>/global/memory.db        ← user-scope (across workspaces)
+  soul / user / rules(global)
+<workspace>/<projectDir>/memory.db      ← workspace-scope (one per cwd)
+  project / fact / lesson / topic / rules(project)
+```
+
+- **User-scope global store**: under the global data directory (`activeHomeDir()/global/memory.db`; default `~/.dsh-meow/global/memory.db`, change with `homeDir` / `MEOW_MEMORY_HOME`). `homeDir` / `memory_home` switches move it along.
+- **Workspace store**: still one per cwd, holding `project` / `fact` / `lesson` / `topic` / project-level `rules`.
+- **Write routing**: `memory_remember` writes `soul` / `user`, or `rules` whose project is the global marker → **global store**; everything else → **workspace store**. `memory_read` / `memory_update` / `memory_forget` / `memory_search` / `memory_list` / `memory_find_similar` **query both stores and dedupe by id**; on an id collision **active wins over archived** (a migrated workspace archive copy cannot shadow the global original). `memory_project` stays workspace-only.
+- **Automatic one-time migration**: the first trusted session in each workspace copies existing soul / user / global rules **with their original ids** into the global store, then **archives** those workspace rows (recoverable; avoids injection/dream double-counting). The idempotency flag lives in the workspace DB `dream_meta` (`globalmigrated:v1:<dir>`); only trusted workspaces are migrated, foreign stores are never touched.
+- **Fallback**: if the global store is absent / untrusted / unavailable, the plugin automatically falls back to 0.32 single-workspace behaviour (soul/user/global rules read/written from the workspace DB), no error.
+- **If the global store is deleted after migration**: the workspace originals stay archived and are **not re-injected automatically**. Recovery: restore/back up the global directory, or `memory_forget` with `mode:'restore'` per id.
+- **Backup boundary (honest)**: `backup.enabled` backs up only the **workspace** `memory.db`, **not the global store**; back up `~/.dsh-meow/global/` (or your `homeDir`) yourself.
+- **dream/reflection still consolidate the workspace DB only**: global entries are maintained via tools/reflection (the post-task reflection turn can write global entries), not by dream's three rounds — known limitation.
+
 ---
 
 ## Security model
@@ -52,9 +76,11 @@ Or per window: session row "…" menu → **Memory participation** → turn off 
 
 | Data | Location |
 |---|---|
-| Memory store (plaintext SQLite) | `<workspace>/<projectDir>/memory.db`, `projectDir` defaults to `.dsh-meow` |
+| User-scope global memory store (plaintext SQLite) | `<activeHomeDir>/global/memory.db`: default `~/.dsh-meow/global/memory.db` (**outside `DSH_HOME`**; change with `homeDir` / `MEOW_MEMORY_HOME`) |
+| Workspace memory store (plaintext SQLite) | `<workspace>/<projectDir>/memory.db`, `projectDir` defaults to `.dsh-meow` |
 | Session bookkeeping (seen / queried) | `<workspace>/.dsh-meow/sessions/<id>.json` |
-| Store trust marker | `<workspace>/.dsh-meow/.owner.json` |
+| Workspace store trust marker | `<workspace>/.dsh-meow/.owner.json` |
+| Global store trust marker | `<activeHomeDir>/global/.owner.json` (installId marker, `workspace: ''`) |
 | Self-ignoring `.gitignore` | `<workspace>/.dsh-meow/.gitignore` (content `*` — the directory ignores itself, so `git add .` never commits memories) |
 | Instance-level global directory (logs / window index / migrate state) | default `~/.dsh-meow` (**outside `DSH_HOME`**); change with `homeDir` or `MEOW_MEMORY_HOME` |
 | Prompt-copy instance overrides | `$DSH_HOME/storages/meow-memory/prompts/<lang>/<slot>.md` (fixed path; `$DSH_HOME` defaults to `~/.dsh`; **does not follow `homeDir`/`memory_home` switches**) |
@@ -73,6 +99,7 @@ Workspaces are often `git clone`d repositories — someone can drop a `.dsh-meow
 - an untrusted store is **never opened by normal chat turns**: no schema upgrade, no index creation, no migration, no read — only one read-only trust probe touches the file. Its content is not injected, and **all memory tools (read and write), dream and reflection are refused**; a one-time notice explains how to trust it (`security.trustWorkspaceMemory: true`);
 - until you explicitly trust it or delete/rename it. Only enable trust for a store you know is yours;
 - `autoMigrate` **now defaults to `false`**: a workspace's `PROJECT.md` is no longer imported automatically.
+- **The global store is trust-gated too**: `<activeHomeDir>/global/.owner.json` (installId marker, `workspace: ''` — no workspace binding); absent → created and trusted, pre-existing without a valid marker → **foreign**. A foreign global store automatically falls back to 0.32 single-workspace behaviour (no global reads/writes); there is **no `trustWorkspaceMemory`-style config override for the global store**; a global directory copied/synced from another machine is judged foreign.
 
 ### `memory_home` is query-only by default (#64-2 fix)
 
@@ -97,10 +124,9 @@ Since 0.32:
 Uninstalling does not delete memories. When you no longer need them:
 
 ```
-<workspace>/.dsh-meow/                      # memory.db, sessions/, .owner.json, .gitignore
-~/.dsh-meow/                                # or your configured homeDir: logs, window-index, migrate-state
-$DSH_HOME/storages/meow-memory/prompts/     # prompt instance overrides (if you added any)
-~/.dsh/storages/meow-memory-home.json       # memory_home switch pointer (may not exist)
+<workspace>/.dsh-meow/                       # memory.db, sessions/, .owner.json, .gitignore
+~/.dsh-meow/                              # or your homeDir: global/memory.db, logs, window-index, migrate-state
+$DSH_HOME/storages/meow-memory*           # install-id, prompt overrides, switch pointer (meow-memory-home.json)
 ```
 
 ---
@@ -108,8 +134,9 @@ $DSH_HOME/storages/meow-memory/prompts/     # prompt instance overrides (if you 
 ## Features
 
 - **Seven memory layers**: `soul` (the AI itself) / `user` / `project` (with `subcategory`) / `fact` / `lesson` / `topic` (with a goal sentence) / `rules`. One SQLite table per layer, time-prefixed ids.
-- **First-turn injection (long-term block)**: soul / user / global rules / memory guide are injected before the first user message as an independent plugin snapshot **without rewriting the user prompt**; **no keyword hits on turn 1** (hits start from message 2).
-- **Per-message keyword hits**: from the second user message, fact/lesson/rules/topic are matched by entry **keywords** (not full text), scoped to global + the current project anchor, injecting up to `hitTopK`. 0.32 adds a `minScore` threshold (default 0.35) and `hit_count` reinforcement; **this is still keyword matching — no vector/semantic retrieval**, badly-keyworded entries are silently unreachable.
+- **Two-layer storage (0.33)**: `soul` / `user` / global `rules` live in the **user-scope global store**, shared across workspaces; `project` / `fact` / `lesson` / `topic` / project rules stay in the workspace store. See [Where memory lives](#where-memory-lives-two-layer-storage-033).
+- **First-turn injection (long-term block)**: soul / user / global rules / memory guide are injected before the first user message as an independent plugin snapshot **without rewriting the user prompt**; soul / user / global rules come from the user-scope global store with the workspace store as fallback; **no keyword hits on turn 1** (hits start from message 2).
+- **Per-message keyword hits + hybrid lexical floor**: from the second user message, fact/lesson/rules/topic are matched by entry **keywords** (not full text), scoped to global + the current project anchor, injecting up to `hitTopK`. 0.33 adds an offline lexical complement — character bigram Jaccard + 0.25×trigram Jaccard (CJK-safe, NFKC) — used as a **floor** when BM25 is weak: `score = max(BM25, 0.55·fuzzy·recency·importance)`, noise floor 0.2. It helps with variants / inflections / CJK word-boundary differences; **it is still not vector/semantic retrieval** (no embeddings), and poorly keyworded entries remain silently unreachable.
 - **Current-project anchor**: passing a project parameter anchors the session's current project; unanchored sessions hit global entries only.
 - **Cache-friendly**: the static `meow-memory:guide` system-prompt section is registered once with constant text and cannot break the provider's prefix cache.
 - **Post-compaction re-injection**: after compaction the next turn re-injects the long-term snapshot, project panoramas queried this session, and entries written this session (bounded by `reinjectMaxChars`).
@@ -121,8 +148,11 @@ $DSH_HOME/storages/meow-memory/prompts/     # prompt instance overrides (if you 
 
 ### What it cannot do (do not misunderstand)
 
-- **"Global" memory is only global within one workspace**: the store is per-workspace (cwd). Switching workspaces gives an empty store; opening from a subdirectory or a symlink creates a new one.
-- **No semantic retrieval**, only keyword matching. `hit_count` now affects ranking but never rewrites keywords automatically.
+- **Project-level memory is still workspace-scoped**: `project` / `fact` / `lesson` / `topic` / project rules follow the cwd (a new workspace starts with fresh project memory). Only `soul` / `user` / global rules are shared across workspaces (0.33 user-scope global store).
+- **No semantic retrieval**: 0.33's fuzzy layer is a character n-gram lexical floor (variants / inflections / word boundaries), not embeddings and not paraphrase understanding. `hit_count` affects ranking but never rewrites keywords automatically.
+- **Global store does not participate in dream**: dream's three rounds still consolidate the workspace DB only; global entries are maintained via tools/reflection.
+- **Backup excludes the global store**: `backup.enabled` backs up the workspace `memory.db` only.
+- **Migration archives workspace copies**: after upgrading to 0.33 the original workspace soul/user/global-rule rows become archived (content retained); if the global store is lost they are not re-injected automatically — restore the global directory or `memory_forget mode=restore` per id.
 - **Forgetting is an exponential half-life, not an Ebbinghaus review curve**: `retrieval.halfLifeDays` default 30 days, `exp(-ln2 × days/30)` with an importance≥3 floor of 0.85. Dream stamps `updated_at` at consolidation time, so the decay input is itself affected by consolidation.
 - **Dream still keeps its instructions/responses/tool calls in the main session history**: folding is visual only, tokens persist.
 - **`memory_home` switching is off by default**; when enabled it is still a model-callable tool — evaluate the risk yourself.
@@ -144,7 +174,7 @@ $DSH_HOME/storages/meow-memory/prompts/     # prompt instance overrides (if you 
 
 2. Either:
    - **local directory**: GUI **Plugins → Add plugin**, enter the **absolute path** of this repository (the plugin manager accepts absolute local paths);
-   - **tarball**: `npm pack` produces `meow-memory-0.32.1.tgz`; enter the absolute path of that `.tgz`.
+   - **tarball**: `npm pack` produces `meow-memory-0.33.0.tgz`; enter the absolute path of that `.tgz`.
 3. Restart `dsh web` (or hot-reload the plugin). New sessions load it automatically.
 
 > Local `file:`/`link:` installs do not run `prepare`, so **build first**; a tarball already contains `lib/`.
@@ -274,20 +304,22 @@ once per session,               compaction → release seen + re-inject
 no hits on turn 1
 ```
 
-### Tools (10 in 0.32)
+> Since 0.33 the first-turn snapshot's soul / user / global rules come from the user-scope global store (`<activeHomeDir>/global/memory.db`) with the workspace store as fallback; project panorama and re-injection stay workspace-only.
+
+### Tools (10 in 0.33)
 
 | Tool | Band | Purpose |
 |---|---|---|
-| `memory_remember` | write | Write a memory (content/project/keywords/importance required; near-identical duplicates merge) |
-| `memory_search` | read | BM25 × exponential-recency search, with `explain` and level/project/status/days filters |
-| `memory_project` | read | Fetch a project's complete injection paragraph (`project` required) |
-| `memory_find_similar` | read | Duplicate & conflict detection |
-| `memory_read` | read | Read one entry's complete metadata by id |
-| `memory_update` | write | Fix status / importance / goal / keywords / content |
-| `memory_list` | read | **new in 0.32**: list ids/titles/keywords/status/timestamps, no bodies; supports level/project/status/limit/offset |
-| `memory_forget` | write | **new in 0.32**: archive/restore/delete by id. Archives by default; `mode:'delete'` hard-deletes and requires `confirm:true` |
-| `memory_dream` | write | Manually trigger this window's consolidation (same as `/dream`) |
-| `memory_home` | directory | Inspect the global data directory; **query-only by default since 0.32**, requires `security.allowHomeSwitch: true` to switch |
+| `memory_remember` | write | Write a memory (content/project/keywords/importance required; **soul/user/global rules go to the user-scope global store, everything else to the workspace store**; near-identical duplicates merge) |
+| `memory_search` | read | Hybrid lexical search (BM25 + character n-gram floor) × exponential recency, with `explain` (optional `fuzzy`) and level/project/status/days filters; queries both stores |
+| `memory_project` | read | Fetch a project's complete injection paragraph (`project` required); **workspace store only** |
+| `memory_find_similar` | read | Duplicate & conflict detection; queries both stores |
+| `memory_read` | read | Read one entry's complete metadata by id; queries both stores |
+| `memory_update` | write | Fix status / importance / goal / keywords / content; writes to whichever store owns the entry |
+| `memory_list` | read | **new in 0.32**: list ids/titles/keywords/status/timestamps, no bodies; merges both stores and dedupes by id |
+| `memory_forget` | write | **new in 0.32**: archive/restore/delete by id. Archives by default; `mode:'delete'` hard-deletes and requires `confirm:true`; queries both stores |
+| `memory_dream` | write | Manually trigger this window's consolidation (same as `/dream`; workspace DB only) |
+| `memory_home` | directory | Inspect the global data directory; **query-only by default since 0.32**, requires `security.allowHomeSwitch: true` to switch (0.33 switches move the global store too, closing the connection first) |
 
 **Parameters, returns and side effects: [docs/tool-reference.md](docs/tool-reference.md)**.
 
@@ -302,7 +334,7 @@ npm run test           # build + language-pack check + full assertions (host + c
 node scripts/check-lang.mjs en       # check one prompt language pack
 ```
 
-Test assertions: `npm test` **1032 all green** (host 672 + client 360), 0 failed; plus 29 in `node smoke.mjs`; `scripts/check-lang.mjs` validates the en/pt-br packs (11 slots aligned).
+Test assertions: `npm test` **1076 all green** (host 676 + client 360), 0 failed; plus 29 in `node smoke.mjs`; `scripts/check-lang.mjs` validates the en/pt-br packs (11 slots aligned).
 
 The `@deepseek-ai/*` packages live in the dsh-meow pnpm workspace, not in this package's `node_modules`. On Windows, `npm run link-workspace` creates junction mirrors so esbuild can resolve them (build-time only).
 
@@ -312,7 +344,8 @@ The `@deepseek-ai/*` packages live in the dsh-meow pnpm workspace, not in this p
 2. Change a setting → save → hot-reload the plugin → did the value apply? (Checks the 0.2.x settings drift.)
 3. After `/dream`, keep chatting: is the tool count normal? (Guards #66.)
 4. After a reflection turn, check the model selector: still the main model? (#71 can trigger only with `delegate.model` set.)
-5. Open a session in a cloned, untrusted repository: no long-term memory you did not write should appear (untrusted store + no auto-migration).
+5. Open a session in a cloned, untrusted repository: no long-term memory you did not write should appear (untrusted store + no auto-migration);
+6. Open a session in a different workspace: `soul` / `user` / global rules should still be there (user-scope global store), while `project` / `fact` are the new workspace's (verifies the two layers).
 
 ---
 

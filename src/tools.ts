@@ -11,7 +11,7 @@
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { isAbsolute, resolve } from 'node:path'
 import { findSimilar, search, tokenize, type RankedHit } from './bm25.js'
-import { getDb, getDreamWorkspace, globalProjectMarker, isGlobalProject, projectCovers, projectLabel, projectList, relativeTime, type Level, LEVELS, type MemoryPatch, type MemoryRow, type ProjectSubcategory, PROJECT_SUBCATEGORIES } from './db.js'
+import { closeGlobalDb, getDb, getDreamWorkspace, globalProjectMarker, isGlobalProject, isGlobalScope, projectCovers, projectLabel, projectList, relativeTime, type Level, LEVELS, type MemoryPatch, type MemoryRow, type ProjectSubcategory, PROJECT_SUBCATEGORIES } from './db.js'
 import { fillTemplate, keyedValue } from './prompt-loader.js'
 import { activeHomeDir, homeDirPresets, resolveHomeDir, switchHomeDir } from './home-dir.js'
 
@@ -58,6 +58,60 @@ export interface MemoryBudgetOptions {
 let budgetOptions: MemoryBudgetOptions = { projectMaxChars: 8000 }
 export function setMemoryBudgetOptions(opts: MemoryBudgetOptions | undefined): void {
   if (opts !== undefined) budgetOptions = opts
+}
+
+// ── 0.33 分层存储（Phase 2）：用户级全局库 + 工作区库 ────────────────────────
+// soul/user/全局 rules 写全局库；project/fact/lesson/topic/项目 rules 写工作区库。
+// 读路径两库都查、按 id 去重；未注入 globalDb provider 时行为与 0.32 完全一致。
+type Db = ReturnType<typeof getDb>
+let globalDbProvider: (() => Db | undefined) | undefined
+/** host 在 apply 时注入全局库 getter（返回 undefined = 分层存储未启用/不可用）。 */
+export function setMemoryGlobalDbProvider(fn: (() => Db | undefined) | undefined): void {
+  globalDbProvider = fn
+}
+function globalDbOf(): Db | undefined {
+  try {
+    return globalDbProvider?.()
+  } catch {
+    return undefined
+  }
+}
+/** 读路径：工作区库 + 全局库（无全局库时只有工作区库）。 */
+function dbsFor(workspace: string, dir: string): Db[] {
+  const wsDb = getDb(workspace, dir)
+  const g = globalDbOf()
+  return g !== undefined && g !== wsDb ? [wsDb, g] : [wsDb]
+}
+/** 写路径：soul/user/全局 rules → 全局库；其余 → 工作区库。 */
+function writeDbFor(level: Level, project: string | null, workspace: string, dir: string): Db {
+  const g = globalDbOf()
+  if (g !== undefined && (level === 'soul' || level === 'user' || (level === 'rules' && isGlobalScope(project)))) return g
+  return getDb(workspace, dir)
+}
+/** 按 id 在两库中定位（工作区优先）；返回所属库供 update/delete 使用。 */
+function findInAny(id: string, workspace: string, dir: string): { row: MemoryRow; level: Level; db: Db } | undefined {
+  for (const db of dbsFor(workspace, dir)) {
+    const f = db.findById(id)
+    if (f !== undefined) return { row: f.row, level: f.level, db }
+  }
+  return undefined
+}
+/** 两库合并去重（按 id，先出现的库优先）。同 id 去重时 active 优先于 archived：
+ *  迁移后工作区可能残留 archived 副本、全局库是 active 正本，`status:'all'` 视图必须
+ *  展示正本（review 备注：过去按工作区优先会显示归档副本）。 */
+function dedupeRows(rows: MemoryRow[]): MemoryRow[] {
+  const order: string[] = []
+  const byId = new Map<string, MemoryRow>()
+  for (const r of rows) {
+    const prev = byId.get(r.id)
+    if (prev === undefined) {
+      order.push(r.id)
+      byId.set(r.id, r)
+      continue
+    }
+    if (prev.status !== 'active' && r.status === 'active') byId.set(r.id, r)
+  }
+  return order.map((id) => byId.get(id) as MemoryRow)
 }
 
 /** 门控检查：拒绝时抛出带理由的 Error（工具错误的既有通道）。 */
@@ -292,7 +346,7 @@ function rememberTool(dir: string): ToolDefinition {
 
       const workspace = workspaceOf(exec)
       if (!workspace) throw new Error('memory_remember: 无法确定工作区（会话无 cwd）')
-      const db = getDb(workspace, dir)
+      const db = writeDbFor(level, project, workspace, dir)
       const source_session = sessionIdOf(exec)
       // 锚定当前 project：带 project 参数的 memory 调用更新会话状态（命中检索用它）；"全局"与多项目（逗号分隔）不锚定。
       if (project && !isGlobalProject(project) && !project.includes(',')) setCurrentProject(workspace, source_session ?? 'unknown', project, dir)
@@ -411,6 +465,10 @@ function searchTool(dir: string): ToolDefinition {
                     importance: { type: 'number' },
                     recencyWeight: { type: 'number' },
                     status: { type: 'string' },
+                    // 0.33：0.32/Phase-2 新增分项（可选；tools.md 无对应键时用内置英文短名）
+                    importanceWeight: { type: 'number' },
+                    hitBoost: { type: 'number' },
+                    fuzzy: { type: 'number' },
                   },
                 },
               },
@@ -441,7 +499,7 @@ function searchTool(dir: string): ToolDefinition {
       if (!query) throw new Error('memory_search: query 必填且不能为空（例：{"query": "关键词"}）；浏览项目全貌请用 memory_project')
       const workspace = workspaceOf(exec)
       if (!workspace) throw new Error('memory_search: 无法确定工作区（会话无 cwd）')
-      const db = getDb(workspace, dir)
+      const dbs = dbsFor(workspace, dir)
       const sessionId = sessionIdOf(exec)
       const seen = readSeen(workspace, sessionId ?? 'unknown', dir)
       // project/status 支持逗号多选（OR 语义，用户拍板 2026-08-19）。
@@ -465,7 +523,7 @@ function searchTool(dir: string): ToolDefinition {
       const levels: Level[] = typeof parsed.level === 'string' && parsed.level.trim()
         ? parsed.level.split(',').map((s) => s.trim()).filter((s): s is Level => (LEVELS as readonly string[]).includes(s))
         : (['fact', 'lesson', 'topic', 'rules'] as Level[])
-      const rows = levels.flatMap((lv) => {
+      const rows = dedupeRows(levels.flatMap((lv) => dbs.flatMap((db) => {
         // 'all' = 不过滤 → 全量直出（#68：listSearchable 只出 active+todo-stale，
         // archived 在 db 层就被滤掉，"all" 名不符实）。单一非默认 status → db 层过滤；
         // 多选 → 全量取出后 filterSearchable 过滤；默认 active（+todo stale）。
@@ -473,7 +531,7 @@ function searchTool(dir: string): ToolDefinition {
         if (statusList.length === 1 && statusList[0] !== 'active') return db.list(lv, { status: statusList[0] as MemoryRow['status'] })
         if (statusList.length > 1) return db.list(lv)
         return db.listSearchable(lv)
-      })
+      })))
       // 查询参数过滤（project/status/days）；不再预排除已见/本 session 建立的记忆。
       const filtered = filterSearchable(rows, { project, status, days })
       const byId = new Map(filtered.map((r) => [r.id, r]))
@@ -501,7 +559,15 @@ function searchTool(dir: string): ToolDefinition {
         fresh.push(h)
       }
       const hits = [...blind, ...fresh]
-      for (const h of hits) db.bumpHit(h.level as Level, h.id)
+      for (const h of hits) {
+        // 0.33 分层存储：命中条目可能来自工作区库或全局库，反馈要写回其所属库。
+        for (const searchDb of dbs) {
+          if (searchDb.findById(h.id) !== undefined) {
+            searchDb.bumpHit(h.level as Level, h.id)
+            break
+          }
+        }
+      }
       markSearched(workspace, sessionId ?? 'unknown', hits.map((h) => h.id), dir)
       // 按记忆时间戳（updated_at）重排：旧→新；null 视为最旧（从未封存/更新）。
       const reordered = [...hits].sort((a, b) => (a.updated_at ?? 0) - (b.updated_at ?? 0))
@@ -527,6 +593,9 @@ function searchTool(dir: string): ToolDefinition {
                     importance: row?.importance ?? 0,
                     recencyWeight: h.explain?.recencyWeight ?? 1,
                     status: row?.status ?? 'active',
+                    ...(h.explain?.importanceWeight !== undefined ? { importanceWeight: h.explain.importanceWeight } : {}),
+                    ...(h.explain?.hitBoost !== undefined ? { hitBoost: h.explain.hitBoost } : {}),
+                    ...(h.explain?.fuzzy !== undefined ? { fuzzy: h.explain.fuzzy } : {}),
                   },
                 }
               : {}),
@@ -594,7 +663,7 @@ function findSimilarTool(dir: string): ToolDefinition {
       const workspace = workspaceOf(exec)
       if (!workspace) throw new Error('memory_find_similar: 无法确定工作区（会话无 cwd）')
       const db = getDb(workspace, dir)
-      const found = db.findById(id)
+      const found = findInAny(id, workspace, dir)
       if (!found) throw new Error(`memory_find_similar: 未找到记忆 ${id.slice(0, 12)}`)
       const sessionId = sessionIdOf(exec)
       const seen = readSeen(workspace, sessionId ?? 'unknown', dir)
@@ -603,7 +672,7 @@ function findSimilarTool(dir: string): ToolDefinition {
       const cmRaw = coerceNumber(parsed.content_max)
       const contentMax = cmRaw !== undefined ? Math.max(0, Math.min(5000, Math.round(cmRaw))) : 200
 
-      const rows = LEVELS.flatMap((lv) => (lv === 'soul' || lv === 'user' ? [] : db.listSearchable(lv)))
+      const rows = dedupeRows(dbsFor(workspace, dir).flatMap((db) => LEVELS.flatMap((lv) => (lv === 'soul' || lv === 'user' ? [] : db.listSearchable(lv)))))
       const candidates = rows.filter((r) => r.id !== found.row.id && !seen.has(r.id) && r.source_session !== sessionId)
       const docs = candidates.map((r) => ({
         id: r.id,
@@ -612,6 +681,7 @@ function findSimilarTool(dir: string): ToolDefinition {
         content: r.content,
         keywords: r.keywords,
         importance: r.importance,
+        hit_count: r.hit_count,
         created_at: r.created_at,
         updated_at: r.updated_at,
       }))
@@ -686,7 +756,7 @@ function readTool(dir: string): ToolDefinition {
       if (!id) throw new Error('memory_read: id 不能为空')
       const workspace = workspaceOf(exec)
       if (!workspace) throw new Error('memory_read: 无法确定工作区（会话无 cwd）')
-      const found = getDb(workspace, dir).findById(id)
+      const found = findInAny(id, workspace, dir)
       if (!found) return { found: false }
       const { row } = found
       // 查阅留痕（v0.17.0）：dream 第一轮清单的"查阅过"源（memory_project 全景不标记，第三轮专门复查）。
@@ -755,11 +825,12 @@ function updateTool(dir: string): ToolDefinition {
       if (!id) throw new Error('memory_update: id 不能为空')
       const workspace = workspaceOf(exec)
       if (!workspace) throw new Error('memory_update: 无法确定工作区（会话无 cwd）')
-      const db = getDb(workspace, dir)
       const sessionId = sessionIdOf(exec)
       // 写路径必须歧义拒绝（#62）：findById 取首条 + 拿解析出的全 id 去 update，
       // 会绕过 db.update 内部的 LIKE 歧义守卫、静默改错条目。多命中 → 报错列候选。
-      const matches = db.findByIdAll(id)
+      // 0.33 分层存储：两库都查；命中条目带着所属库，改哪库就写哪库。
+      const dbMatches = dbsFor(workspace, dir).flatMap((db) => db.findByIdAll(id).map((m) => ({ ...m, db })))
+      const matches = dbMatches
       if (matches.length > 1) {
         const list = matches
           .map((m) => `${m.level}:${m.row.id.slice(0, 8)} ${m.row.title || m.row.content.slice(0, 40)}`)
@@ -788,7 +859,7 @@ function updateTool(dir: string): ToolDefinition {
       }
       // 记忆时间戳 = 最后更新时间：db.update 内部自动刷新 updated_at（任何 update 都刷新）。
       // patch 为空（如只想传 keywords:[] 表达"不更新"）→ 视为调用成功、无字段变化。
-      const ok = Object.keys(patch).length > 0 ? db.update(found.level, found.row.id, patch) : true
+      const ok = Object.keys(patch).length > 0 ? found.db.update(found.level, found.row.id, patch) : true
       // 写痕迹（v0.23.0）：实际落库（patch 非空且 update 成功）才记——空 patch 无字段变化不算写。
       if (ok && Object.keys(patch).length > 0) markWritten(workspace, sessionId ?? 'unknown', [found.row.id], dir)
       return { ok, id: found.row.id, level: found.level }
@@ -930,6 +1001,8 @@ function homeTool(allowHomeSwitch: () => boolean): ToolDefinition {
       if (downgraded) {
         return { note: `无法识别的 target："${raw}"（可用预设标记或绝对路径）。当前目录未变：${activeHomeDir()}` }
       }
+      // 0.33：全局记忆库也在 activeHomeDir() 下，搬目录前必须先关连接（Windows EPERM）。
+      closeGlobalDb()
       const sw = switchHomeDir(target)
       if (sw.mode === 'same') return { note: `全局数据目录本就是 ${sw.to}，未变更。` }
       if (sw.mode === 'failed') return { note: `切换失败：${sw.error}。仍使用 ${sw.from}，数据未受影响，可稍后重试。` }
@@ -1002,7 +1075,7 @@ function listTool(dir: string): ToolDefinition {
       const parsed = args as { level?: unknown; project?: unknown; status?: unknown; limit?: unknown; offset?: unknown }
       const workspace = workspaceOf(exec)
       if (!workspace) throw new Error('memory_list: 无法确定工作区（会话无 cwd）')
-      const db = getDb(workspace, dir)
+      const dbs = dbsFor(workspace, dir)
       const parseCsv = (v: unknown): string[] => (typeof v === 'string' ? v.split(',').map((s) => s.trim()).filter(Boolean) : [])
       const levelArg = parseCsv(parsed.level)
       const levels: Level[] = levelArg.length === 0 || levelArg.includes('all')
@@ -1014,7 +1087,7 @@ function listTool(dir: string): ToolDefinition {
       const limit = Number.isFinite(limitRaw) ? Math.min(100, Math.max(1, Math.trunc(limitRaw))) : 20
       const offsetRaw = typeof parsed.offset === 'number' ? parsed.offset : Number(parsed.offset)
       const offset = Number.isFinite(offsetRaw) ? Math.max(0, Math.trunc(offsetRaw)) : 0
-      const rows = levels.flatMap((lv) => db.list(lv, statusArg === 'all' ? {} : { status: statusArg as 'active' | 'archived' | 'stale' }))
+      const rows = dedupeRows(dbs.flatMap((db) => levels.flatMap((lv) => db.list(lv, statusArg === 'all' ? {} : { status: statusArg as 'active' | 'archived' | 'stale' }))))
         .filter((r) => projectArg.length === 0 || projectArg.some((p) => projectCovers(r.project, p)))
         .sort((a, b) => b.updated_at - a.updated_at)
       const page = rows.slice(offset, offset + limit)
@@ -1080,13 +1153,12 @@ function forgetTool(dir: string): ToolDefinition {
       }
       const workspace = workspaceOf(exec)
       if (!workspace) throw new Error('memory_forget: 无法确定工作区（会话无 cwd）')
-      const db = getDb(workspace, dir)
-      const matches = db.findByIdAll(id)
-      if (matches.length === 0) return { note: `未找到 id=${id} 的记忆。`, id }
-      if (matches.length > 1) {
-        throw new Error(`memory_forget: id "${id}" 命中 ${matches.length} 条（短 id 歧义），请改用完整 id：${matches.map((m) => m.row.id).join(', ')}`)
+      const matched = dbsFor(workspace, dir).flatMap((db) => db.findByIdAll(id).map((m) => ({ ...m, db })))
+      if (matched.length === 0) return { note: `未找到 id=${id} 的记忆。`, id }
+      if (matched.length > 1) {
+        throw new Error(`memory_forget: id "${id}" 命中 ${matched.length} 条（短 id 歧义），请改用完整 id：${matched.map((m) => m.row.id).join(', ')}`)
       }
-      const { row, level } = matches[0]
+      const { row, level, db } = matched[0]
       if (mode === 'delete') {
         const ok = db.deleteRow(level, row.id)
         return { note: ok ? `已硬删除记忆 ${row.id}（不可恢复）。` : `删除失败：未找到 id=${row.id}。`, id: row.id }

@@ -17,7 +17,7 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { dshHomeDir } from './home-dir.js'
+import { dshHomeDir, activeHomeDir } from './home-dir.js'
 import { fillTemplate, getPromptLang, keyedValue } from './prompt-loader.js'
 
 export type Level = 'soul' | 'user' | 'project' | 'fact' | 'lesson' | 'topic' | 'rules'
@@ -388,6 +388,56 @@ function probeMemoryStore(dbPath: string): 'absent' | 'empty' | 'nonempty' | 'un
   }
 }
 
+/** 统一信任判定（工作区库 / 全局库共用，0.33.0 抽公共逻辑，不重复三份规则）：
+ *   - 有效标记 → trusted:'marker'；
+ *   - 库文件**不存在** → open() 建 schema+索引 + 落标记 → 'created'
+ *     （已存在的空库也可能是预置 schema+trigger，0.32 review 实证，故只认「不存在」）；
+ *   - 已存在但无有效标记 → 'foreign'，或工作区库在用户显式信任时 'config-trusted'。
+ *  open() 失败按 foreign fail-closed；本函数绝不抛出。 */
+function judgeStoreTrust(
+  storeDir: string,
+  dbPath: string,
+  opts: {
+    /** 标记绑定的工作区路径；'' = 无工作区绑定的全局库。 */
+    workspace: string
+    /** 工作区库专属：config 显式信任非本插件创建的库。全局库恒 false。 */
+    trustWorkspaceMemory: boolean
+    /** 写自忽略 .gitignore（全局库在自己 home 里，不需要）。 */
+    autoGitignore: boolean
+    /** 建库动作（schema+索引；可能抛）。 */
+    open: () => unknown
+    /** 日志里的库类型名。 */
+    label: string
+    /** foreign 时追加的提示（工作区库指向 config 开关）。 */
+    foreignHint: string
+  },
+): StoreTrust {
+  const marker = readOwnerMarker(storeDir)
+  if (marker !== null && markerTrusts(marker, opts.workspace)) {
+    writeStoreGitignore(storeDir, opts.autoGitignore)
+    return { trusted: true, reason: 'marker' }
+  }
+  const state = probeMemoryStore(dbPath)
+  if (state === 'absent') {
+    try {
+      opts.open()
+    } catch (e) {
+      console.warn(`[meow-memory] ${opts.label}创建失败（按不可信处理）：${e instanceof Error ? e.message : String(e)}`)
+      return { trusted: false, reason: 'foreign' }
+    }
+    writeStoreGitignore(storeDir, opts.autoGitignore)
+    writeOwnerMarker(storeDir, opts.workspace) // 失败也仍是本进程刚建的空库
+    return { trusted: true, reason: 'created' }
+  }
+  if (!opts.trustWorkspaceMemory) {
+    console.warn(`[meow-memory] 检测到非本插件创建的${opts.label}（${dbPath}）：默认不注入、不迁移${opts.foreignHint}`)
+    return { trusted: false, reason: 'foreign' }
+  }
+  // 用户显式信任：照常使用；不写标记（库不是我们建的，写标记会混淆归属）。
+  writeStoreGitignore(storeDir, opts.autoGitignore)
+  return { trusted: true, reason: 'config-trusted' }
+}
+
 /** 工作区级信任缓存：键 = 精确 (workspace, dir)，进程生命周期内有效。
  *  ensureMemoryStore 是同步函数（Node 单线程），两个并发 pre-step 实际串行执行，
  *  第一个返回前已写入缓存，第二个直接命中——无需额外 in-flight 锁。 */
@@ -553,6 +603,20 @@ export class MemoryDb {
       updated_at: row.updated_at ?? now,
       last_accessed_at: row.last_accessed_at ?? null,
     }
+    this.writeInsert(full)
+    return full
+  }
+
+  /** 迁移专用（Phase 2）：按调用方给的 id / 时间戳 / 全部字段**原样**落库——
+   *  不补默认值、不改时间戳（工作区库 → 全局库必须保 id 才能去重 + 归档原行）。
+   *  id 已存在会抛（SQLite 主键冲突），由调用方 try/catch 决定跳过。 */
+  insertRow(row: MemoryRow & { level: Level }): MemoryRow {
+    this.writeInsert(row)
+    return row
+  }
+
+  /** insert()/insertRow() 共用的一条 INSERT（差异列按 level 特化；表名来自 LEVELS）。 */
+  private writeInsert(full: MemoryRow): void {
     this.db
       .prepare(
         `INSERT INTO ${full.level} (id, title, content, importance, keywords, status, source_session, hit_count, created_at, updated_at, last_accessed_at
@@ -584,7 +648,6 @@ export class MemoryDb {
         ...(full.level === 'lesson' ? [full.corrected] : []),
         ...(full.level === 'topic' ? [full.goal, full.project] : []),
       )
-    return full
   }
 
   /** 跨表定位（UUID 全局唯一，扫描全部表）。id 支持 8 位前缀匹配
@@ -1058,6 +1121,7 @@ export function getDb(workspace: string, dir = '.dsh-meow'): MemoryDb {
 export function closeAllDbs(): void {
   for (const db of dbCache.values()) db.close()
   dbCache.clear()
+  closeGlobalDb() // 全局库同生命周期（Phase 2）
 }
 
 // ── 工作区库信任入口（HARDENING-PLAN §3 contract；index/inject 消费） ────────
@@ -1080,40 +1144,14 @@ export function ensureMemoryStore(
   if (cached !== undefined) return cached
 
   const projectDir = join(workspace, dir)
-  const dbPath = memoryDbPath(workspace, dir)
-  const marker = readOwnerMarker(projectDir)
-  let trust: StoreTrust
-
-  if (marker !== null && markerTrusts(marker, workspace)) {
-    writeStoreGitignore(projectDir, opts.autoGitignore)
-    trust = { trusted: true, reason: 'marker' }
-  } else {
-    const state = probeMemoryStore(dbPath)
-    if (state === 'absent') {
-      // 只有「库文件根本不存在」才允许本机创建并信任。已存在的空库也可能是攻击者
-      // 预置的 schema+trigger（0.32 review 实证：row-empty + AFTER INSERT trigger
-      // 会绕过 row 计数）；已存在一律按 foreign 处理，除非用户显式信任。
-      try {
-        getDb(workspace, dir)
-      } catch (e) {
-        console.warn(`[meow-memory] 记忆库创建失败（按不可信处理）：${e instanceof Error ? e.message : String(e)}`)
-        const failed: StoreTrust = { trusted: false, reason: 'foreign' }
-        storeTrustCache.set(key, failed)
-        return failed
-      }
-      writeStoreGitignore(projectDir, opts.autoGitignore)
-      writeOwnerMarker(projectDir, workspace) // 失败也仍是本进程刚建的空库
-      trust = { trusted: true, reason: 'created' }
-    } else if (!opts.trustWorkspaceMemory) {
-      console.warn(`[meow-memory] 检测到非本插件创建的记忆库（${dbPath}）：默认不注入、不迁移；如确认可信请在配置中开启 security.trustWorkspaceMemory`)
-      trust = { trusted: false, reason: 'foreign' }
-    } else {
-      // 用户显式信任：照常使用；不写标记（库不是我们建的，写标记会混淆归属）。
-      writeStoreGitignore(projectDir, opts.autoGitignore)
-      trust = { trusted: true, reason: 'config-trusted' }
-    }
-  }
-
+  const trust = judgeStoreTrust(projectDir, memoryDbPath(workspace, dir), {
+    workspace,
+    trustWorkspaceMemory: opts.trustWorkspaceMemory,
+    autoGitignore: opts.autoGitignore,
+    open: () => getDb(workspace, dir),
+    label: '记忆库',
+    foreignHint: '；如确认可信请在配置中开启 security.trustWorkspaceMemory',
+  })
   storeTrustCache.set(key, trust)
   return trust
 }
@@ -1127,6 +1165,58 @@ export function storeTrustOf(workspace: string, dir = '.dsh-meow'): StoreTrust |
 /** 清空进程级信任缓存（测试/热重载显式重置用；正常 dispose 不需要）。 */
 export function resetStoreTrustCache(): void {
   storeTrustCache.clear()
+  globalStoreTrust = null // 全局库信任同源重置（路径 key，homeDir 切换自然重判）
+}
+
+// ── 全局（用户级）记忆库：<activeHomeDir>/global/memory.db（Phase 2 Round 1） ────
+// soul / user / 全局 rules 是「用户级」而非「工作区级」：放全局目录后，换工作区不再
+// 从零开始。标记与工作区库同源（installId + schema 1），但 workspace 绑定为空串——
+// 全局目录本身会随 homeDir 整体搬移，标记不能绑死路径（否则切一次目录就自锁）。
+// 信任判定复用 judgeStoreTrust；已存在的无标记库一律 foreign，没有 config 显式信任
+// 档（这是插件自己的目录，不存在「用户带了可信的旧库」的场景）。
+
+/** 全局记忆库路径：<当前全局目录>/global/memory.db。 */
+export function globalDbPath(): string {
+  return join(activeHomeDir(), 'global', 'memory.db')
+}
+
+let globalDbCache: { path: string; db: MemoryDb } | null = null
+let globalStoreTrust: { path: string; trust: StoreTrust } | null = null
+
+/** 全局库实例（按路径缓存；homeDir 切换后自动关旧开新）。调用方应先 ensureGlobalStore()
+ *  判过信任——本函数只负责连接，不做信任判定。 */
+export function getGlobalDb(): MemoryDb {
+  const path = globalDbPath()
+  if (globalDbCache !== null && globalDbCache.path === path) return globalDbCache.db
+  if (globalDbCache !== null) globalDbCache.db.close()
+  globalDbCache = { path, db: new MemoryDb(path) }
+  return globalDbCache.db
+}
+
+/** 关闭全局库连接（homeDir 切换搬目录前必须调，Windows 上打开的文件会阻塞 rename）。
+ *  幂等；下次 getGlobalDb() 自动重开。 */
+export function closeGlobalDb(): void {
+  if (globalDbCache === null) return
+  globalDbCache.db.close()
+  globalDbCache = null
+}
+
+/** 首次打开/创建全局库：目录 + memory.db（schema/索引由 MemoryDb 建）+ `.owner.json`
+ *  标记（{schema:1, installId, workspace:'', createdAt}）。信任状态按路径缓存（homeDir
+ *  切换后重判）。绝不抛出：建库失败 → foreign。 */
+export function ensureGlobalStore(): StoreTrust {
+  const path = globalDbPath()
+  if (globalStoreTrust !== null && globalStoreTrust.path === path) return globalStoreTrust.trust
+  const trust = judgeStoreTrust(dirname(path), path, {
+    workspace: '', // 无工作区绑定：全局目录会随 homeDir 搬移
+    trustWorkspaceMemory: false, // 全局库没有 config 信任档
+    autoGitignore: false, // 在插件自己的全局目录里，不会进任何仓库
+    open: () => getGlobalDb(),
+    label: '全局记忆库',
+    foreignHint: '；请删除或改名该目录后由插件重建',
+  })
+  globalStoreTrust = { path, trust }
+  return trust
 }
 
 /** 记忆库备份（issue #37 增量②）：memory.db → memory.db.bak 单文件轮转。

@@ -3,12 +3,12 @@
 | [中文](README.md) | [English](README.en.md) | [Português (BR)](README.pt-br.md) | [MIT License](LICENSE) |
 | :---: | :---: | :---: | :---: |
 
-> **O que é isto**: um fork pessoal de endurecimento do `Phant0Meow/dsh-meow-memory` **v0.31.1** (este repositório, versão **0.32.1**, branch `hardening`).
+> **O que é isto**: um fork pessoal de endurecimento do `Phant0Meow/dsh-meow-memory` **v0.31.1** (este repositório, versão **0.33.0**, branch `hardening`).
 > O upstream é MIT: <https://github.com/Phant0Meow/dsh-meow-memory>. Este fork **não tem vínculo com o upstream**, não publica em nome dele e não representa suas posições. Todas as mudanças e problemas restantes estão no [CHANGELOG.md](CHANGELOG.md).
 
 Memória entre sessões para o [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): memória em sete níveis no SQLite, injeção de snapshot na primeira rodada, acertos por palavra-chave a cada mensagem e consolidação automática **com limites de orçamento**.
 
-Versão **0.32.1** ｜ Histórico: [CHANGELOG.md](CHANGELOG.md) ｜ Host verificado: **DSH Desktop 0.2.1-rc.2** (veja [Compatibilidade](#compatibilidade))
+Versão **0.33.0** ｜ Histórico: [CHANGELOG.md](CHANGELOG.md) ｜ Host verificado: **DSH Desktop 0.2.1-rc.2** (veja [Compatibilidade](#compatibilidade))
 
 **Nota de honestidade**: este README só afirma comportamentos que existem no código. A 0.32 removeu várias alegações infladas do upstream ("deduplicação/merge automáticos", "curva de esquecimento de Ebbinghaus", "BM25" nos acertos por mensagem, "compatível com dsh 0.1.5") e declara o limite real em cada ponto.
 
@@ -18,7 +18,7 @@ Versão **0.32.1** ｜ Histórico: [CHANGELOG.md](CHANGELOG.md) ｜ Host verific
 
 Este é o custo mais subestimado do plugin. **Com a configuração padrão ele faz requisições de LLM sem um comando explícito do usuário**; a 0.32 limitou cada tipo, mas não desligou nenhum (o comportamento padrão do upstream foi mantido, só deixou de ser ilimitado).
 
-| Gasto | Quando | Limite 0.32 |
+| Gasto | Quando | Limite 0.33 |
 |---|---|---|
 | **Taxa estática**: manual de memória + descrição/schema de todas as ferramentas no system prompt | **Toda** requisição, mesmo sessão que nunca usa memória | ≈**6,7k tokens/requisição** (medido, pacote chinês; ≈6,3k em inglês; varia com o pacote de idioma e o tamanho das descrições). Não dá para desligar por requisição; para não pagar nada, defina `enabled: false` (ou remova o plugin) |
 | **Snapshot da primeira rodada**: soul / user / regras globais / guia de memória | Uma vez, antes da primeira mensagem real de cada sessão | `budget.snapshotMaxChars` padrão **6000 caracteres** (≈2,7k tokens zh) |
@@ -44,6 +44,30 @@ Ou por janela: menu "…" da linha da sessão → **Participação da memória**
 
 > São **limites**, não promessas. O gasto real depende de número e tamanho das entradas e do tamanho da sessão; o pior caso diário continua limitado em ordem de grandeza (≤1 dream + ≤6 reflexões de contexto completo). Os "tokens estimados" usados pelos portões de contexto são **aproximados**: CJK ≈1,7 caracteres/token, não-CJK ≈4 caracteres/token (superestimado de propósito), não é cobrança exata.
 
+> **O armazenamento em camadas da 0.33 não adiciona tokens por mensagem**: é só mais um banco SQLite local (o global do usuário); as injeções continuam limitadas por `budget.*`. O fuzzy é só CPU (sem tokens); os limites de dream/reflexão e de contexto não mudam.
+
+---
+
+## Onde a memória fica: armazenamento em duas camadas (0.33)
+
+A 0.33 transforma o "global" de "global dentro de um workspace" em armazenamento **de usuário** real:
+
+```
+<activeHomeDir>/global/memory.db        ← escopo do usuário (entre workspaces)
+  soul / user / rules(globais)
+<workspace>/<projectDir>/memory.db      ← escopo do workspace (um por cwd)
+  project / fact / lesson / topic / rules(de projeto)
+```
+
+- **Banco global do usuário**: no diretório global (`activeHomeDir()/global/memory.db`; padrão `~/.dsh-meow/global/memory.db`, mude com `homeDir` / `MEOW_MEMORY_HOME`). Trocas de `homeDir` / `memory_home` o movem junto.
+- **Banco do workspace**: continua um por cwd, com `project` / `fact` / `lesson` / `topic` / `rules` de projeto.
+- **Roteamento de escrita**: `memory_remember` grava `soul` / `user`, ou `rules` com projeto global → **banco global**; o resto → **banco do workspace**. `memory_read` / `memory_update` / `memory_forget` / `memory_search` / `memory_list` / `memory_find_similar` **consultam os dois bancos e deduplicam por id**; em colisão de id **active vence archived** (a cópia arquivada migrada não esconde o original global). `memory_project` continua só no workspace.
+- **Migração automática (uma vez)**: a primeira sessão confiável de cada workspace copia soul / user / regras globais existentes **com os ids originais** para o banco global e depois **arquiva** essas linhas do workspace (recuperáveis; evita contagem dupla em injeção/dream). A marca de idempotência fica no `dream_meta` do workspace (`globalmigrated:v1:<dir>`); só workspaces confiáveis migram, bancos foreign nunca são tocados.
+- **Fallback**: se o banco global estiver ausente / não confiável / indisponível, o plugin volta automaticamente ao comportamento de workspace único da 0.32 (soul/user/regras globais lidos/escritos no banco do workspace), sem erro.
+- **Se o banco global for apagado após a migração**: as linhas originais do workspace continuam archived e **não são reinjetadas automaticamente**. Recuperação: restaurar/fazer backup do diretório global, ou `memory_forget` com `mode:'restore'` por id.
+- **Limite de backup (honesto)**: `backup.enabled` faz backup só do `memory.db` **do workspace**, **não do banco global**; faça backup de `~/.dsh-meow/global/` (ou seu `homeDir`) por conta própria.
+- **dream/reflexão ainda consolidam só o banco do workspace**: entradas globais são mantidas por ferramentas/reflexão, não pelas três rodadas do dream — limitação conhecida.
+
 ---
 
 ## Modelo de segurança
@@ -52,9 +76,11 @@ Ou por janela: menu "…" da linha da sessão → **Participação da memória**
 
 | Dado | Local |
 |---|---|
-| Banco de memória (SQLite em texto puro) | `<workspace>/<projectDir>/memory.db`, `projectDir` padrão `.dsh-meow` |
+| Banco global de memória do usuário (SQLite em texto puro) | `<activeHomeDir>/global/memory.db`: padrão `~/.dsh-meow/global/memory.db` (**fora do `DSH_HOME`**; mude com `homeDir` / `MEOW_MEMORY_HOME`) |
+| Banco de memória do workspace (SQLite em texto puro) | `<workspace>/<projectDir>/memory.db`, `projectDir` padrão `.dsh-meow` |
 | Registro por sessão (vistos / consultados) | `<workspace>/.dsh-meow/sessions/<id>.json` |
-| Marcador de confiança do banco | `<workspace>/.dsh-meow/.owner.json` |
+| Marcador de confiança do banco do workspace | `<workspace>/.dsh-meow/.owner.json` |
+| Marcador de confiança do banco global | `<activeHomeDir>/global/.owner.json` (marcador installId, `workspace: ''`) |
 | `.gitignore` auto-ignorante | `<workspace>/.dsh-meow/.gitignore` (conteúdo `*` — o diretório se ignora, então `git add .` nunca commita memórias) |
 | Diretório global de instância (logs / window index / estado de migração) | padrão `~/.dsh-meow` (**fora do `DSH_HOME`**); mude com `homeDir` ou `MEOW_MEMORY_HOME` |
 | Overrides de prompt por instância | `$DSH_HOME/storages/meow-memory/prompts/<lang>/<slot>.md` (caminho fixo; `$DSH_HOME` padrão `~/.dsh`; **não segue** trocas de `homeDir`/`memory_home`) |
@@ -73,6 +99,7 @@ Regras da 0.32:
 - um banco não confiável **nunca é aberto por rodadas normais de chat**: sem upgrade de schema, sem criação de índices, sem migração, sem leitura — apenas uma sonda readonly toca o arquivo. Seu conteúdo não é injetado, e **todas as ferramentas de memória (leitura e escrita), dream e reflexão são recusados**; um aviso único explica como confiar (`security.trustWorkspaceMemory: true`);
 - até você confiar explicitamente ou apagar/renomear o banco. Só ative a confiança para um banco que você sabe que é seu;
 - `autoMigrate` **agora tem padrão `false`**: o `PROJECT.md` do workspace não é mais importado automaticamente.
+- **O banco global também passa pelo portão de confiança**: `<activeHomeDir>/global/.owner.json` (marcador installId, `workspace: ''` sem vínculo de workspace); ausente → criado e confiado, pré-existente sem marcador válido → **foreign**. Banco global foreign volta automaticamente ao comportamento de workspace único da 0.32 (sem leituras/escritas globais); **não há override de configuração estilo `trustWorkspaceMemory` para o banco global**; um diretório global copiado/sincronizado de outra máquina é julgado foreign.
 
 ### `memory_home` é somente consulta por padrão (correção #64-2)
 
@@ -97,10 +124,9 @@ Desde a 0.32:
 Desinstalar não apaga memórias. Quando não precisar mais:
 
 ```
-<workspace>/.dsh-meow/                      # memory.db, sessions/, .owner.json, .gitignore
-~/.dsh-meow/                                # ou seu homeDir: logs, window-index, migrate-state
-$DSH_HOME/storages/meow-memory/prompts/     # overrides de prompt (se você adicionou)
-~/.dsh/storages/meow-memory-home.json       # ponteiro de troca do memory_home (pode não existir)
+<workspace>/.dsh-meow/                       # memory.db, sessions/, .owner.json, .gitignore
+~/.dsh-meow/                              # ou seu homeDir: global/memory.db, logs, window-index, migrate-state
+$DSH_HOME/storages/meow-memory*           # install-id, overrides de prompt, ponteiro de troca (meow-memory-home.json)
 ```
 
 ---
@@ -108,8 +134,9 @@ $DSH_HOME/storages/meow-memory/prompts/     # overrides de prompt (se você adic
 ## Recursos
 
 - **Sete níveis de memória**: `soul` (a própria IA) / `user` / `project` (com `subcategory`) / `fact` / `lesson` / `topic` (com frase-objetivo) / `rules`. Uma tabela SQLite por nível, ids com prefixo de tempo.
-- **Injeção da primeira rodada**: soul / user / regras globais / guia de memória são injetados antes da primeira mensagem como snapshot de plugin, **sem reescrever o prompt do usuário**; **sem acertos na primeira rodada** (começam na segunda).
-- **Acertos por palavra-chave a cada mensagem**: a partir da segunda mensagem, fact/lesson/rules/topic são casados pelas **palavras-chave da entrada** (não pelo texto inteiro), no escopo global + ancoragem no projeto atual, injetando até `hitTopK`. A 0.32 acrescenta `minScore` (padrão 0.35) e reforço por `hit_count`; **continua sendo casamento por palavra-chave — sem busca vetorial/semântica**, entradas com palavras-chave ruins ficam silenciosamente inalcançáveis.
+- **Armazenamento em duas camadas (0.33)**: `soul` / `user` / `rules` globais ficam no **banco global do usuário**, compartilhado entre workspaces; `project` / `fact` / `lesson` / `topic` / rules de projeto ficam no banco do workspace. Veja [Onde a memória fica](#onde-a-memória-fica-armazenamento-em-duas-camadas-033).
+- **Injeção da primeira rodada**: soul / user / regras globais / guia de memória são injetados antes da primeira mensagem como snapshot de plugin, **sem reescrever o prompt do usuário**; soul / user / regras globais vêm do banco global com o banco do workspace como fallback; **sem acertos na primeira rodada** (começam na segunda).
+- **Acertos por palavra-chave + piso léxico híbrido**: a partir da segunda mensagem, fact/lesson/rules/topic são casados pelas **palavras-chave da entrada**, no escopo global + ancoragem no projeto atual, injetando até `hitTopK`. A 0.33 adiciona um complemento léxico offline — Jaccard de bigramas de caracteres + 0,25×Jaccard de trigramas (seguro para CJK, NFKC) — usado como **piso** quando o BM25 é fraco: `score = max(BM25, 0,55·fuzzy·recency·importance)`, piso de ruído 0,2. Ajuda com variantes / flexões / fronteiras de palavra em CJK; **continua não sendo busca vetorial/semântica** (sem embeddings), e entradas com palavras-chave ruins continuam inalcançáveis silenciosamente.
 - **Ancoragem no projeto atual**: passar `project` ancora o projeto atual da sessão; sem ancoragem os acertos buscam só o global.
 - **Amigável a cache**: a section estática `meow-memory:guide` é registrada uma vez no system prompt, texto constante, não quebra o cache de prefixo do provider.
 - **Reinjeção pós-compactação**: a rodada seguinte reinjeta o snapshot, os panoramas consultados nesta sessão e as entradas escritas nesta sessão (limitado por `reinjectMaxChars`).
@@ -121,8 +148,11 @@ $DSH_HOME/storages/meow-memory/prompts/     # overrides de prompt (se você adic
 
 ### O que ele não faz (não se engane)
 
-- **Memória "global" é global só dentro de um workspace**: o banco é por workspace (cwd). Trocar de workspace = banco vazio; abrir de um subdiretório ou symlink cria outro.
-- **Sem busca semântica**, só palavra-chave. `hit_count` agora afeta o ranking mas nunca reescreve palavras-chave sozinho.
+- **Memória de nível de projeto continua por workspace**: `project` / `fact` / `lesson` / `topic` / rules de projeto seguem o cwd (workspace novo = memória de projeto nova). Só `soul` / `user` / regras globais são compartilhados entre workspaces (banco global do usuário, 0.33).
+- **Sem busca semântica**: o fuzzy da 0.33 é só um piso léxico de n-gramas de caracteres (variantes / flexões / fronteiras de palavra), não embeddings e não entende paráfrases. `hit_count` afeta o ranking mas nunca reescreve palavras-chave sozinho.
+- **O banco global não participa do dream**: as três rodadas do dream continuam consolidando só o banco do workspace; entradas globais são mantidas por ferramentas/reflexão.
+- **Backup exclui o banco global**: `backup.enabled` faz backup só do `memory.db` do workspace.
+- **A migração arquiva as cópias do workspace**: após atualizar para 0.33, as linhas originais de soul/user/regras globais no workspace ficam archived (conteúdo preservado); se o banco global se perder, elas não são reinjetadas automaticamente — restaure o diretório global ou `memory_forget mode=restore` por id.
 - **O esquecimento é uma meia-vida exponencial, não uma curva de revisão de Ebbinghaus**: `retrieval.halfLifeDays` padrão 30 dias, `exp(-ln2 × dias/30)` com piso 0.85 para importance≥3. O dream carimba `updated_at` na consolidação, então a entrada da decaída é afetada pela própria consolidação.
 - **O dream ainda deixa suas instruções/respostas/chamadas no histórico da sessão principal**: dobrar é só visual, os tokens persistem.
 - **A troca do `memory_home` está desligada por padrão**; quando ligada, continua sendo uma ferramenta chamável pelo modelo — avalie o risco.
@@ -144,7 +174,7 @@ $DSH_HOME/storages/meow-memory/prompts/     # overrides de prompt (se você adic
 
 2. Escolha:
    - **diretório local**: GUI **Plugins → Add plugin**, informe o **caminho absoluto** deste repositório;
-   - **tarball**: `npm pack` gera `meow-memory-0.32.1.tgz`; informe o caminho absoluto do `.tgz`.
+   - **tarball**: `npm pack` gera `meow-memory-0.33.0.tgz`; informe o caminho absoluto do `.tgz`.
 3. Reinicie `dsh web` (ou recarregue o plugin). Novas sessões carregam automaticamente.
 
 > Instalações locais `file:`/`link:` não rodam `prepare`, então **compile primeiro**; um tarball já contém `lib/`.
@@ -274,20 +304,22 @@ uma vez por sessão,             compactação → libera vistos + reinjeta   (d
 sem acertos na rodada 1
 ```
 
-### Ferramentas (10 na 0.32)
+> Desde a 0.33 o snapshot da primeira rodada lê soul / user / regras globais do banco global do usuário (`<activeHomeDir>/global/memory.db`), com o banco do workspace como fallback; panorama de projeto e reinjeção continuam somente no workspace.
+
+### Ferramentas (10 na 0.33)
 
 | Ferramenta | Faixa | Uso |
 |---|---|---|
-| `memory_remember` | escrita | Grava uma memória (content/project/keywords/importance obrigatórios; duplicatas quase idênticas fundem) |
-| `memory_search` | leitura | Busca BM25 × recência exponencial, com `explain` e filtros level/project/status/days |
-| `memory_project` | leitura | Recupera o parágrafo de injeção completo de um projeto (`project` obrigatório) |
-| `memory_find_similar` | leitura | Detecção de duplicatas e conflitos |
-| `memory_read` | leitura | Lê os metadados completos de uma entrada por id |
-| `memory_update` | escrita | Corrige status / importance / goal / keywords / content |
-| `memory_list` | leitura | **nova na 0.32**: lista ids/títulos/palavras-chave/status/timestamps, sem corpos; level/project/status/limit/offset |
-| `memory_forget` | escrita | **nova na 0.32**: arquivar/restaurar/apagar por id. Arquivar é o padrão; `mode:'delete'` apaga de vez e exige `confirm:true` |
-| `memory_dream` | escrita | Dispara manualmente a consolidação desta janela (igual a `/dream`) |
-| `memory_home` | diretório | Consulta o diretório global; **só consulta por padrão desde a 0.32**, exige `security.allowHomeSwitch: true` para trocar |
+| `memory_remember` | escrita | Grava uma memória (content/project/keywords/importance obrigatórios; **soul/user/regras globais vão para o banco global do usuário, o resto para o do workspace**; duplicatas quase idênticas fundem) |
+| `memory_search` | leitura | Busca léxica híbrida (BM25 + piso de n-gramas de caracteres) × recência exponencial, com `explain` (opcional `fuzzy`) e filtros level/project/status/days; consulta os dois bancos |
+| `memory_project` | leitura | Recupera o parágrafo de injeção completo de um projeto (`project` obrigatório); **só o banco do workspace** |
+| `memory_find_similar` | leitura | Detecção de duplicatas e conflitos; consulta os dois bancos |
+| `memory_read` | leitura | Lê os metadados completos de uma entrada por id; consulta os dois bancos |
+| `memory_update` | escrita | Corrige status / importance / goal / keywords / content; grava no banco dono da entrada |
+| `memory_list` | leitura | **nova na 0.32**: lista ids/títulos/palavras-chave/status/timestamps, sem corpos; mescla os dois bancos e deduplica por id |
+| `memory_forget` | escrita | **nova na 0.32**: arquivar/restaurar/apagar por id. Arquivar é o padrão; `mode:'delete'` apaga de vez e exige `confirm:true`; consulta os dois bancos |
+| `memory_dream` | escrita | Dispara manualmente a consolidação desta janela (igual a `/dream`; só o banco do workspace) |
+| `memory_home` | diretório | Consulta o diretório global; **só consulta por padrão desde a 0.32**, exige `security.allowHomeSwitch: true` para trocar (na 0.33 a troca move o banco global também, fechando a conexão antes) |
 
 **Parâmetros, retornos e efeitos colaterais: [docs/tool-reference.md](docs/tool-reference.md)**.
 
@@ -302,7 +334,7 @@ npm run test           # build + checagem dos pacotes de idioma + asserções (h
 node scripts/check-lang.mjs en       # checa um pacote de prompt
 ```
 
-Asserções de teste: `npm test` **1032 todas verdes** (host 672 + cliente 360), 0 falhas; mais 29 em `node smoke.mjs`; `scripts/check-lang.mjs` valida os pacotes en/pt-br (11 slots alinhados).
+Asserções de teste: `npm test` **1076 todas verdes** (host 676 + cliente 360), 0 falhas; mais 29 em `node smoke.mjs`; `scripts/check-lang.mjs` valida os pacotes en/pt-br (11 slots alinhados).
 
 Os pacotes `@deepseek-ai/*` ficam no workspace pnpm dsh-meow, não no `node_modules` deste pacote. No Windows, `npm run link-workspace` cria junctions para o esbuild resolver (só em tempo de build).
 
@@ -312,7 +344,8 @@ Os pacotes `@deepseek-ai/*` ficam no workspace pnpm dsh-meow, não no `node_modu
 2. Mude uma configuração → salve → recarregue o plugin → o valor foi aplicado? (Checa o drift de settings do 0.2.x.)
 3. Depois de `/dream`, continue conversando: o número de ferramentas está normal? (Guarda #66.)
 4. Depois de uma rodada de reflexão, veja o seletor de modelo: continua o modelo principal? (#71 só dispara com `delegate.model` definido.)
-5. Abra uma sessão num repositório clonado e não confiável: não deve aparecer memória de longo prazo que você não escreveu (banco não confiável + sem auto-migração).
+5. Abra uma sessão num repositório clonado e não confiável: não deve aparecer memória de longo prazo que você não escreveu (banco não confiável + sem auto-migração);
+6. Abra uma sessão em outro workspace: `soul` / `user` / regras globais devem continuar lá (banco global do usuário), enquanto `project` / `fact` são do novo workspace (verifica as duas camadas).
 
 ---
 

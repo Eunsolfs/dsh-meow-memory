@@ -7,6 +7,8 @@
  * Porter 词干还原，见下方 EN 段）；其他语言维持基线（stemming 扩展点见 prompts/README.md）。
  * 打分：标准 BM25 × 指数遗忘权重（半衰期可配，默认 30 天；importance≥3 只有 0.85 下限，
  *       不再整体豁免）；可选 importance 参与排名（importanceWeight）与 hit_count 加成（hitBoost）。
+ *       混合词法补分（Phase 2）：字符 bigram/trigram Jaccard 相似度只作 BM25 弱命中时的兜底floor
+ *       （effective = max(bm25Score, 0.55·fuzzy·recency·importance)），BM25 命中强时不改排序。
  * 偏离信号：turn 文本向量 vs 各 topic 质心（title+goal+content+keywords 词频
  *       向量）的余弦相似度；top1 相似度过低 → "疑似新话题"提示。topic 数 < 3
  *       （冷启动）不提示。信号只提醒不拍板，归属判定由模型用目标句测试完成。
@@ -232,6 +234,60 @@ function hitBoostWeight(hitCount: number | undefined): number {
 }
 
 const round3 = (n: number): number => Math.round(n * 1000) / 1000
+const EMPTY_SET: ReadonlySet<string> = new Set<string>()
+
+// ── 混合词法补分（Phase 2） ───────────────────────────────────────────────────
+//
+// 目标：BM25 是"整词/整 bigram 精确匹配"，同义变体、词形变化、CJK 词边界差异都会漏召回。
+// 这里加一层纯字符级的相似度兜底（零依赖、离线、确定性）：
+// - 字符 bigram Jaccard：CJK 无需分词，英文天然处理词形（cache/caching 共享 ca/ac/ch/he）；
+// - 小权重 trigram Jaccard 加成：给更长连续片段加分（压低"只偶然共享 1 个 bigram"的噪声）。
+// 它只当 floor 用：BM25 已经命中强时 max() 不会改变排序；BM25 为 0/很弱时才有机会上榜。
+// 噪声地板：随机文本也会共享 1–2 个字符 bigram，相似度低于 FUZZY_MIN_SIMILARITY 视为不相关（返回 0），
+// 否则 memory_search 会给不相关条目极低分而污染尾部结果。
+const FUZZY_CHAR = /[\p{L}\p{N}]/u
+/** 低于该字符 n-gram 相似度视为噪声（不当命中）。 */
+const FUZZY_MIN_SIMILARITY = 0.2
+
+/** 字符 n-gram 集合：NFKC + 小写，只保留字母/数字（标点/空白/emoji 不参与，CJK 安全）。 */
+function charNgrams(text: string, n: number): Set<string> {
+  const chars: string[] = []
+  for (const ch of text.normalize('NFKC').toLowerCase()) if (FUZZY_CHAR.test(ch)) chars.push(ch)
+  const out = new Set<string>()
+  for (let i = 0; i + n <= chars.length; i++) out.add(chars.slice(i, i + n).join(''))
+  return out
+}
+
+function jaccard(a: ReadonlySet<string>, b: ReadonlySet<string>): number {
+  if (a.size === 0 || b.size === 0) return 0
+  let inter = 0
+  const [small, big] = a.size <= b.size ? [a, b] : [b, a]
+  for (const g of small) if (big.has(g)) inter++
+  const union = a.size + b.size - inter
+  return union > 0 ? inter / union : 0
+}
+
+/** 内部：query 的字符 2/3-gram 集合与匹配面的相似度（含噪声地板）。 */
+function fuzzySimilarity(q2: ReadonlySet<string>, q3: ReadonlySet<string>, surface: string): number {
+  if (q2.size === 0 || surface.length === 0) return 0
+  const s2 = charNgrams(surface, 2)
+  if (s2.size === 0) return 0
+  const j2 = jaccard(q2, s2)
+  const j3 = jaccard(q3, charNgrams(surface, 3))
+  const sim = Math.min(1, j2 + 0.25 * j3) // 小权重 trigram 加成，上限 1
+  return sim >= FUZZY_MIN_SIMILARITY ? sim : 0
+}
+
+/**
+ * 离线"混合词法"相似度（Phase 2）：query 与匹配面的字符 bigram Jaccard + 0.25×trigram Jaccard。
+ * 纯字符级（NFKC/小写/只留字母数字），CJK 无需分词、零依赖、确定性。
+ * 无字符重叠、或相似度低于噪声地板（0.2）时返回 0——随机文本的偶发 bigram 共享不算命中。
+ * 在 search/keywordHitScore 里只作为 BM25 的兜底 floor，不参与 BM25 数学、不改强命中排序。
+ */
+export function fuzzyScore(query: string, surface: string): number {
+  if (query.length === 0 || surface.length === 0) return 0
+  return fuzzySimilarity(charNgrams(query, 2), charNgrams(query, 3), surface)
+}
 
 export interface RankedHit {
   id: string
@@ -241,13 +297,14 @@ export interface RankedHit {
   importance: number
   updated_at: number
   score: number
-  /** 分项得分（#51，explain=true 时才有）：bm25=关键词原始分（未乘任何系数）、importance=条目重要度、
+  /** 分项得分（#51/Phase 2，explain=true 时才有）：bm25=关键词原始分（未乘任何系数）、importance=条目重要度、
    *  recencyWeight=该条目的指数遗忘权重（importance≥3 时有 0.85 下限）、
    *  importanceWeight=importance 乘数（importanceWeight 开启时才有）、
    *  hitBoost=hit_count 乘数（hitBoost 开启且该条有 hit_count 时才有）、
-   *  score=最终分（bm25 × recencyWeight × (importanceWeight??1) × (hitBoost??1)）。状态过滤
-   *  （active/stale）是检索前的二值过滤、不进打分，工具层在 explain 里补 status 字段。 */
-  explain?: { bm25: number; importance: number; recencyWeight: number; importanceWeight?: number; hitBoost?: number; score: number }
+   *  fuzzy=混合词法补分（0.55×字符 n-gram 相似度×recencyWeight×importanceWeight；fuzzy 开启时才有，
+   *  score = max(bm25×recencyWeight×importanceWeight×hitBoost, fuzzy)）、
+   *  score=最终分。状态过滤（active/stale）是检索前的二值过滤、不进打分，工具层在 explain 里补 status 字段。 */
+  explain?: { bm25: number; importance: number; recencyWeight: number; importanceWeight?: number; hitBoost?: number; fuzzy?: number; score: number }
 }
 
 export interface SearchOptions {
@@ -264,6 +321,8 @@ export interface SearchOptions {
   hitBoost?: boolean
   /** importance 参与最终分：默认开（传 false 关闭，回退到 importance 不进排名）。 */
   importanceWeight?: boolean
+  /** 混合词法补分（字符 n-gram 兜底 floor）：默认开（传 false 关闭，回到纯 BM25/0.32 行为）。 */
+  fuzzy?: boolean
 }
 
 /**
@@ -271,6 +330,9 @@ export interface SearchOptions {
  * - 遗忘权重按条目自己的 importance 计算（importance≥3 有 0.85 下限，不再整体豁免）；
  * - importanceWeight 默认开：最终分 × (0.85 + 0.05·importance)；
  * - hitBoost 默认开：最终分 × min(2, 1 + 0.15·ln(1+hit_count))（Doc.hit_count 缺省视为 ×1）；
+ * - fuzzy 默认开：混合词法补分只当 floor——effective = max(BM25 最终分, 0.55·fuzzy·recency·importance)，
+ *   BM25 强命中时排序完全不变；BM25 为 0 但字符 n-gram 相似度足够时（同义变体/词形/CJK 词边界差异）
+ *   才补召回。fuzzy 相似度低于噪声地板返回 0，所以零匹配 query 仍然什么都不返回。
  * - minScore 只在显式传入时过滤（search 默认保留全部命中）。
  * 返回按最终分降序。
  */
@@ -279,11 +341,16 @@ export function search(query: string, docs: Doc[], opts: SearchOptions = {}): Ra
   const now = opts.now === undefined ? Date.now() : opts.now
   const useImportance = opts.importanceWeight !== false
   const useHitBoost = opts.hitBoost !== false
+  const useFuzzy = opts.fuzzy !== false
   const q = tokenize(query)
   if (q.length === 0 || docs.length === 0) return []
+  // query 的字符 n-gram 集合只算一次；每条的匹配面也复用同一份文本。
+  const q2: ReadonlySet<string> = useFuzzy ? charNgrams(query, 2) : EMPTY_SET
+  const q3: ReadonlySet<string> = useFuzzy ? charNgrams(query, 3) : EMPTY_SET
 
   const n = docs.length
-  const docToks = docs.map((d) => tokenize(docText(d)))
+  const docTexts = docs.map((d) => docText(d))
+  const docToks = docTexts.map((t) => tokenize(t))
   const avgdl = docToks.reduce((s, t) => s + t.length, 0) / n || 1
 
   const df = new Map<string, number>()
@@ -317,7 +384,6 @@ export function search(query: string, docs: Doc[], opts: SearchOptions = {}): Ra
 
   const hits: RankedHit[] = []
   for (let di = 0; di < docs.length; di++) {
-    if (raw[di] <= 0) continue
     // 遗忘权重按条目自己的 importance 计算（importance≥3 只保 0.85 下限，不再整体豁免）；
     // now=null 是手动检索/测试的"关闭衰减"开关。
     const w = now === null
@@ -325,7 +391,13 @@ export function search(query: string, docs: Doc[], opts: SearchOptions = {}): Ra
       : recencyWeight(now - docs[di].updated_at, { halfLifeDays: opts.halfLifeDays, importance: docs[di].importance })
     const impW = useImportance ? 0.85 + 0.05 * docs[di].importance : 1
     const hitW = useHitBoost ? hitBoostWeight(docs[di].hit_count) : 1
-    const score = raw[di] * w * impW * hitW
+    const bm25Score = raw[di] * w * impW * hitW
+    // 混合词法补分只当 floor（不含 hitBoost/title 加成，BM25 强时 max() 不改变排序）。
+    // 相似度 ≤1，所以 BM25 分已 ≥ 补分上限（0.55·w·impW）时跳过计算（热路径优化，语义不变）。
+    const fuzzyCap = 0.55 * w * impW
+    const fuzzyPart = useFuzzy && bm25Score < fuzzyCap ? fuzzyCap * fuzzySimilarity(q2, q3, docTexts[di]) : 0
+    const score = Math.max(bm25Score, fuzzyPart)
+    if (score <= 0) continue // 零匹配（BM25=0 且 fuzzy 低于噪声地板）→ 不返回
     if (opts.minScore !== undefined && score < opts.minScore) continue
     hits.push({
       id: docs[di].id,
@@ -343,6 +415,7 @@ export function search(query: string, docs: Doc[], opts: SearchOptions = {}): Ra
               recencyWeight: round3(w),
               ...(useImportance ? { importanceWeight: round3(impW) } : {}),
               ...(useHitBoost ? { hitBoost: round3(hitW) } : {}),
+              ...(useFuzzy ? { fuzzy: round3(fuzzyPart) } : {}),
               score: round3(score),
             },
           }
@@ -368,20 +441,28 @@ export function search(query: string, docs: Doc[], opts: SearchOptions = {}): Ra
  * - 遗忘权重 = 指数半衰期（默认 30 天，importance≥3 有 0.85 下限）；
  * - importance 权重（importanceWeight 默认开）= 0.85 + 0.05×importance（3 星 ×1.0，4 星 ×1.05）；
  * - hit_count 加成（hitBoost 默认开）= min(2, 1 + 0.15·ln(1+hit_count))；
- * - title 被命中 ×1.2；minScore（调用方契约默认 0.35）过滤低质量命中，不传不过滤。
+ * - title 被命中 ×1.2；minScore（调用方契约默认 0.35）过滤低质量命中，不传不过滤；
+ * - 混合词法补分（fuzzy 默认开）：relevance = max(上面的 BM25 相关度, 0.55×字符 n-gram 相似度×importance权重)，
+ *   最终分 = relevance × 遗忘权重。它只救 BM25 漏掉的同义变体/词形/CJK 词边界差异，
+ *   相似度低于噪声地板时贡献 0（零匹配 query 不会因为偶发字符而命中）。
  */
 export function keywordHitScore(query: string, docs: Doc[], opts: SearchOptions = {}): RankedHit[] {
   const k = opts.k ?? 2
   const now = opts.now === undefined ? Date.now() : opts.now
   const useImportance = opts.importanceWeight !== false
   const useHitBoost = opts.hitBoost !== false
+  const useFuzzy = opts.fuzzy !== false
   const q = tokenize(query)
   if (q.length === 0 || docs.length === 0) return []
   const qTf = new Map<string, number>()
   for (const t of q) qTf.set(t, (qTf.get(t) ?? 0) + 1)
+  const q2: ReadonlySet<string> = useFuzzy ? charNgrams(query, 2) : EMPTY_SET
+  const q3: ReadonlySet<string> = useFuzzy ? charNgrams(query, 3) : EMPTY_SET
 
   const n = docs.length
-  const docToks = docs.map((d) => tokenize([d.content, d.title ?? ''].join(' ')))
+  // 匹配面 = 调用方给的 content（keywords 串/内容片段）+ title；BM25 分词与 fuzzy 补分共用同一份文本。
+  const surfaces = docs.map((d) => [d.content, d.title ?? ''].join(' '))
+  const docToks = surfaces.map((s) => tokenize(s))
   const df = new Map<string, number>()
   const tf: Array<Map<string, number>> = []
   for (const toks of docToks) {
@@ -411,7 +492,6 @@ export function keywordHitScore(query: string, docs: Doc[], opts: SearchOptions 
   const queryTokens = qTf.size
   const out: RankedHit[] = []
   for (let di = 0; di < docs.length; di++) {
-    if (raw[di] <= 0) continue
     let overlap = 0
     for (const t of qTf.keys()) if (tf[di].has(t)) overlap++
     const coverage = queryTokens > 0 ? overlap / queryTokens : 0
@@ -424,7 +504,13 @@ export function keywordHitScore(query: string, docs: Doc[], opts: SearchOptions 
     // 相关性分（不含遗忘权重）：minScore 只过滤"相关度不够"，不因条目旧而拒召回。
     // 0.32 review：若门槛乘上遗忘权重，importance≤2 的条目约 45 天后即使完整命中也会
     // 被静默丢弃（"自动召回截断"）；旧条目该降的是排序，不是能否被想起。
-    const relevance = (maxRaw > 0 ? raw[di] / maxRaw : 0) * (0.6 + 0.4 * coverage) * impW * (titleHit ? 1.2 : 1) * hitW
+    const bm25Relevance = (maxRaw > 0 ? raw[di] / maxRaw : 0) * (0.6 + 0.4 * coverage) * impW * (titleHit ? 1.2 : 1) * hitW
+    // 混合词法补分（Phase 2）：BM25 相关度弱/为 0 时的兜底（同样不含遗忘权重，minScore 语义不变）。
+    // 相似度 ≤1，所以 BM25 相关度已 ≥ 补分上限时跳过计算（语义不变）。
+    const fuzzyCap = 0.55 * impW
+    const fuzzyRelevance = useFuzzy && bm25Relevance < fuzzyCap ? fuzzyCap * fuzzySimilarity(q2, q3, surfaces[di]) : 0
+    const relevance = Math.max(bm25Relevance, fuzzyRelevance)
+    if (relevance <= 0) continue // 零匹配（BM25=0 且 fuzzy 低于噪声地板）→ 不注入
     if (opts.minScore !== undefined && relevance < opts.minScore) continue
     const score = relevance * w
     out.push({

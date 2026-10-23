@@ -26,7 +26,8 @@ import z from '@deepseek-ai/schemastery'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { backupMemoryDb, closeAllDbs, ensureMemoryStore, getDb, memoryDbPath, storeTrustOf, type Level, type StoreTrust } from './db.js'
+import { backupMemoryDb, closeAllDbs, closeGlobalDb, ensureGlobalStore, ensureMemoryStore, getDb, getGlobalDb, globalDbPath, memoryDbPath, storeTrustOf, type Level, type StoreTrust } from './db.js'
+import { migrateWorkspaceToGlobal } from './global-store.js'
 import { parseModelSpec, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER, type AgentOptionsSpec } from './delegate.js'
 import { CONFIG_DEFAULTS } from './defaults.js'
 import { activeHomeDir, homeDirPresets, resolveHomeDir, switchHomeDir } from './home-dir.js'
@@ -52,7 +53,7 @@ import { buildHitInjection, buildInjection, buildReinjection, clearReinjectPendi
 import { migrateLegacy } from './migrate.js'
 import { buildReflectMessage, checkReflectBudget, consecutiveToolSteps, PLUGIN_SOURCE, recordReflectSent, REFLECT_MARKER, scanTurn } from './reflect.js'
 import { isMeowSource } from './source.js'
-import { registerMemoryTools, setMemoryBudgetOptions, setMemoryRetrievalOptions, setMemoryToolGate } from './tools.js'
+import { registerMemoryTools, setMemoryBudgetOptions, setMemoryGlobalDbProvider, setMemoryRetrievalOptions, setMemoryToolGate } from './tools.js'
 import { authGate, connectionAuthOf } from './auth-gate.js'
 import { resolveSlotText, setPromptLang } from './prompt-loader.js'
 
@@ -869,6 +870,9 @@ function hotSwitchHomeDir(ctx: Context, config: unknown, get: (() => unknown) | 
     if (target === activeHomeDir()) return
     void Promise.resolve().then(() => {
       try {
+        // 0.33：全局库在 activeHomeDir()/global 下——搬目录前先关连接（Windows 打开中的
+        // SQLite 文件会让 rename 失败，退化成跨盘复制/WAL 不一致）。
+        closeGlobalDb()
         const sw = switchHomeDir(target)
         logHomeDirSwitch(ctx, sw)
         if (sw.changed) loadWindowIndex(resolved.projectDir ?? '.dsh-meow')
@@ -1241,6 +1245,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   // 全拒（含手动 /dream）。窗口级三档（#38）写 dream_skip 表：skip_dream（跳过整理）
   // / skip_inject（停止读入）/ skip_write（停止写入，整理轮豁免——写入档只管普通轮）。
   const workspaceDisabled = (ws: string): boolean => workspaceDisabledMatch(readLiveConfig().disabledWorkspaces, ws)
+
   const memoryReadOff = (ws: string, sid: string): boolean => {
     if (workspaceDisabled(ws)) return true
     // 0.32 安全闸：未受信工作区库不打开、不读（连 getDb 触发的 schema 升级/索引写入都不做）。
@@ -1295,6 +1300,42 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   // prompt 语言（实例常量）：setPromptLang 一次，loader/bm25 内部取用——链路零透传。
   // 必须先于工具注册（tools.md 描述也吃这个语言）。未配置时运行时兜底 zh。
   setPromptLang(resolved.promptLang ?? 'zh')
+  // ── 0.33 分层存储（Phase 2）：实例级全局库（soul/user/全局 rules）──────────────
+  // 必须在 switchHomeDir 之后（否则会在旧 home 建库/持锁，Windows 目录搬移 EPERM + WAL 复制）
+  // 且必须在 enabled 检查之后（停用插件不创建任何存储）。不可用/未受信 → 回退单库行为。
+  let globalWarned = false
+  const globalDb = (): ReturnType<typeof getDb> | undefined => {
+    // 自愈 getter：不缓存 trust（homeDir 热切换/目录被移动后 ensure 会重新判定）。
+    try {
+      if (!ensureGlobalStore().trusted) {
+        if (!globalWarned) {
+          globalWarned = true
+          ctx.logger.warn(`meow-memory: 全局记忆库不可用/未受信（${globalDbPath()}），回退工作区单库模式；soul/user 仍按工作区存。`)
+        }
+        return undefined
+      }
+      return getGlobalDb()
+    } catch (e) {
+      if (!globalWarned) {
+        globalWarned = true
+        ctx.logger.warn(`meow-memory: 全局记忆库初始化失败（回退工作区单库）: ${e instanceof Error ? e.message : String(e)}`)
+      }
+      return undefined
+    }
+  }
+  if (globalDb() === undefined) ctx.logger.warn('meow-memory: 0.33 分层存储未启用（全局库不可用）')
+  const globalMigrated = new Set<string>()
+  /** 每个工作区首次可信会话迁移一次（幂等、best-effort）：soul/user/全局 rules → 全局库。 */
+  const ensureGlobalMigration = (ws: string): void => {
+    if (globalDb() === undefined || globalMigrated.has(ws)) return
+    globalMigrated.add(ws)
+    try {
+      const r = migrateWorkspaceToGlobal(ws, resolved.projectDir)
+      if (r.copied > 0) ctx.logger.info(`meow-memory: 全局记忆迁移 ${ws}：复制 ${r.copied} 条，归档 ${r.archived} 条`)
+    } catch (e) {
+      ctx.logger.warn(`meow-memory: 全局记忆迁移失败（不影响主链）: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
   applyCount++
   perf(`apply #${applyCount} pid=${process.pid}`)
   const sweptHome = sweepHomeLogs()
@@ -1342,6 +1383,8 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     hitBoost: resolved.retrieval.hitBoost,
     importanceWeight: resolved.retrieval.importanceWeight,
   })
+  // 0.33 分层存储：工具层读写路由到全局库/工作区库（undefined = 单库回退）。
+  setMemoryGlobalDbProvider(globalDb)
   // 0.32：项目全景输出预算（与重注入同量级；防大项目一次塞满上下文）。
   setMemoryBudgetOptions({ projectMaxChars: Math.max(2000, resolved.budget.reinjectMaxChars) })
   // 会话列表"已 dream"小月牙信号（用户拍板 2026-08-19）：dream 开始推 dreaming、
@@ -1583,6 +1626,8 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     // 记忆门控（issue #38/#28）：本窗口「停止读入」或工作区被配置停用 → 跳过全部
     // 注入路径（重注入/首轮快照/引导/命中链）。读的入口统一在此封口。
     if (ws !== null && memoryReadOff(ws, sid)) return decision
+    // 0.33：可信工作区首次会话把 soul/user/全局 rules 迁入实例级全局库（幂等、best-effort）。
+    if (ws !== null) ensureGlobalMigration(ws)
 
     // 压缩重注入（v0.21.0）：compaction/end 成功后置位的待办——下一个含真实用户
     // 消息的请求在消息前注入「长期记忆快照 + 本会话此前查阅过的项目全景」，然后清待办。
@@ -1595,6 +1640,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
         hitTopK: resolved.hitTopK,
         titleMax: resolved.titleMax,
         trust: trustOf(ws),
+        globalDb: globalDb(),
         reinjectMaxChars: resolved.budget.reinjectMaxChars,
       }, resolved.projectDir)
       clearReinjectPending(ws, sid, resolved.projectDir)
@@ -1634,6 +1680,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
             hitTopK: resolved.hitTopK,
             titleMax: resolved.titleMax,
             trust: trustOf(ws),
+            globalDb: globalDb(),
             snapshotMaxChars: resolved.budget.snapshotMaxChars,
           }, resolved.projectDir)
           if (injected) {
@@ -1700,13 +1747,18 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
           hitTopK: resolved.hitTopK,
           titleMax: resolved.titleMax,
           trust: trustOf(ws),
+          globalDb: globalDb(),
           hitMaxChars: resolved.budget.hitMaxChars,
           minScore: resolved.retrieval.minScore,
           halfLifeDays: resolved.retrieval.halfLifeDays,
           hitBoost: resolved.retrieval.hitBoost,
           importanceWeight: resolved.retrieval.importanceWeight,
           onHit: (level, id) => {
-            try { db.bumpHit(level as Level, id) } catch { /* 反馈失败不影响注入 */ }
+            try {
+              db.bumpHit(level as Level, id)
+              // 0.33：命中可能来自全局库（soul/user/全局 rules），反馈写回所属库。
+              globalDb()?.bumpHit(level as Level, id)
+            } catch { /* 反馈失败不影响注入 */ }
           },
         }, resolved.projectDir)
         dreamLog(`hit-chain pid=${process.pid} sid=${shortSessionId(sid)} textLen=${text.length} hit=${hit === null ? 'null' : 'yes'}`)
@@ -2187,11 +2239,12 @@ function persistWindowIndex(): void {
 export { PLUGIN_SOURCE, REFLECT_MARKER }
 export { parseModelSpec, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER } from './delegate.js'
 export { collectDreamStates, headerOf, type PersistedSessionLike } from './dream-signal.js'
-export { MemoryDb, memoryDbPath, getDb, closeAllDbs, backupMemoryDb, ensureMemoryStore, storeTrustOf, resetStoreTrustCache, type StoreTrust, LEVELS, newId, PROJECT_SUBCATEGORIES, projectList, projectCovers, projectLabel, relativeTime, isGlobalProject, isGlobalScope, globalProjectMarker, GLOBAL_PROJECT_CANON, GLOBAL_PROJECT_CANON_EN } from './db.js'
+export { MemoryDb, memoryDbPath, getDb, getGlobalDb, globalDbPath, closeAllDbs, closeGlobalDb, backupMemoryDb, ensureMemoryStore, ensureGlobalStore, storeTrustOf, resetStoreTrustCache, type StoreTrust, LEVELS, newId, PROJECT_SUBCATEGORIES, projectList, projectCovers, projectLabel, relativeTime, isGlobalProject, isGlobalScope, globalProjectMarker, GLOBAL_PROJECT_CANON, GLOBAL_PROJECT_CANON_EN } from './db.js'
+export { migrateWorkspaceToGlobal, globalStoreRows } from './global-store.js'
 export { migrateLegacy } from './migrate.js'
 export { buildHitInjection, buildInjection, buildReinjection, buildProjectSectionText, readSeen, markSearched, markAccessed, readInjected, markInjected, markProjectQueried, readProjectQueried, markWritten, readWritten, markReinjectPending, clearReinjectPending, isReinjectPending, MAX_REINJECT_PROJECTS, MAX_REINJECT_WRITTEN, sessionsFile, getCurrentProject, setCurrentProject, releaseSeen } from './inject.js'
 export { buildReflectMessage, checkReflectBudget, consecutiveToolSteps, recordReflectSent, resetGlobalReflectCounter, scanTurn } from './reflect.js'
-export { tokenize, stemEn, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
+export { tokenize, stemEn, search, findSimilar, topicDrift, recencyWeight, fuzzyScore } from './bm25.js'
 export { fillTemplate, keyedValue, resolveSlotText, setPromptLang, getPromptLang, DEFAULT_LANG, SLOTS } from './prompt-loader.js'
 export { DEFAULT_HOME_DIR, activeHomeDir, setActiveHomeDir, dshHomeDir, pluginRootDir, homeDirPresets, resolveHomeDir, switchHomeDir, type HomeDirSwitch } from './home-dir.js'
 export { setMemoryToolGate, registerMemoryTools } from './tools.js'

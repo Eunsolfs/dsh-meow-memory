@@ -1,4 +1,4 @@
-# Configuration reference (0.32 fork)
+# Configuration reference (0.33 fork)
 
 Every field is optional. Two ways to set them:
 
@@ -7,7 +7,7 @@ Every field is optional. Two ways to set them:
 
 All changes take effect after a **hot reload or restart of the meow-memory plugin** (config is parsed once at apply).
 
-> 0.32 hardening: default automatic behaviour goes from unbounded to bounded. No feature is silently switched off. To cut cost, see [Turning automatic spend off](#turning-automatic-spend-off).
+> 0.32 hardening: default automatic behaviour goes from unbounded to bounded. No feature is silently switched off. Since 0.33 storage is **two-layer: a user-scope global store + the workspace store** (automatic migration + fallback, no new config fields), and retrieval adds an **offline hybrid lexical floor** (no config toggle). To cut cost, see [Turning automatic spend off](#turning-automatic-spend-off).
 
 ---
 
@@ -72,7 +72,7 @@ All changes take effect after a **hot reload or restart of the meow-memory plugi
 |---|---|---|---|
 | `enabled` | bool | `true` | Master switch. `false` disables injection, reflection and all tools |
 | `projectDir` | string | `.dsh-meow` | Memory directory, **relative to the workspace**: `<workspace>/<projectDir>/memory.db` |
-| `homeDir` | string | `''` (= platform user home) | **Instance-level global directory**: logs / window index / migrate state. Values below. **Prompt overrides are NOT here** (see the `promptLang` section below) |
+| `homeDir` | string | `''` (= platform user home) | **Instance-level global directory**: `global/memory.db` (the user-scope global memory store), logs / window index / migrate state. Values below. **Prompt overrides are NOT here** (see the `promptLang` section below) |
 | `disabledWorkspaces` | string[] | `[]` | Workspace deny-list, normalised exact match on cwd; disables read/consolidate/write (incl. manual `/dream`) |
 
 **`homeDir` values**:
@@ -86,6 +86,20 @@ All changes take effect after a **hot reload or restart of the meow-memory plugi
 | absolute path | Custom directory |
 
 > The default global directory lives **outside `DSH_HOME`** (`~/.dsh-meow`). An isolated `DSH_HOME` still writes the real user directory; use `homeDir` or `MEOW_MEMORY_HOME` to isolate it.
+
+---
+
+## Layered storage (0.33, no new config fields)
+
+| Layer | Path | Contents |
+|---|---|---|
+| User-scope global store | `<activeHomeDir>/global/memory.db` (default `~/.dsh-meow/global/memory.db`) | `soul` / `user` / global `rules` (shared across workspaces) |
+| Workspace store | `<workspace>/<projectDir>/memory.db` | `project` / `fact` / `lesson` / `topic` / project `rules` |
+
+- **Write routing**: `memory_remember` writes `soul`/`user` or global `rules` → global store; everything else → workspace store. Read tools (read/update/forget/search/list/find_similar) query both and dedupe by id (same id: **active wins over archived**); `memory_project` reads the workspace store only.
+- **Automatic migration**: the first **trusted** session in each workspace copies existing soul/user/global rules with their original ids into the global store, then archives the workspace originals (recoverable). Idempotency flag in workspace `dream_meta` (`globalmigrated:v1:<dir>`); foreign workspaces are never migrated.
+- **Fallback**: an absent/untrusted/unavailable global store falls back to 0.32 single-workspace behaviour; there is **no `trustWorkspaceMemory` config override for the global store** (a global dir copied/synced from another machine is foreign).
+- **Note**: the global store moves with `homeDir` / `memory_home` (close the connection first on Windows); `backup.enabled` backs up **only the workspace store**, not the global store.
 
 ---
 
@@ -146,6 +160,8 @@ All changes take effect after a **hot reload or restart of the meow-memory plugi
 
 The per-message hit score is **not BM25**: keyword intersection × IDF × **query coverage** × exponential recency × importance weight × title boost. `memory_search` is BM25 (BM25 × recency).
 
+> **0.33 hybrid lexical floor (fuzzy, no config toggle)**: character bigram Jaccard + 0.25×trigram Jaccard (NFKC, letters/digits only, CJK-safe without segmentation), noise floor 0.2. It is only a **floor** when BM25 is weak: `score = max(BM25, 0.55·fuzzy·recency·importance)` (per-message chain: `relevance = max(BM25 relevance, fuzzy)`); strong BM25 ordering is unchanged; `memory_search explain=true` may include `fuzzy`. Pure BM25 is a test/internal option (`SearchOptions.fuzzy = false`), not a user config field.
+
 > Since 0.32 coverage is `matched query tokens / total query tokens`. The old denominator was the entry's keyword-token count, so writing more keywords (as the prompts demand) *lowered* the score — the exact opposite of the intent. Raise `minScore` (e.g. 0.5) for a quieter chain, lower it for higher recall.
 
 ---
@@ -189,7 +205,7 @@ All conditions must hold for an automatic dream: `dream.enabled` → idle ≥ `i
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `autoMigrate` | bool | **`false`** (since 0.32) | Automatically migrate a legacy `PROJECT.md` when the DB is first opened. Off = unknown `PROJECT.md` in a workspace is never imported without consent |
-| `backup.enabled` | bool | `false` | At each dream's end, snapshot `memory.db` into `memory.db.bak` (`VACUUM INTO`, mtime-based increment). Consumed at registration — reload required |
+| `backup.enabled` | bool | `false` | At each dream's end, snapshot the **workspace** `memory.db` into `memory.db.bak` (`VACUUM INTO`, mtime-based increment). **Does not include the user-scope global store** (`<homeDir>/global/memory.db` must be backed up separately). Consumed at registration — reload required |
 
 ---
 

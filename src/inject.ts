@@ -7,6 +7,10 @@
  *
  * 去重：.dsh-meow/sessions/<sessionId>.json 记录本会话注入过的 memory id，
  * 已注入不重复。
+ *
+ * 分层存储（Phase 2，0.33）：soul/user/全局 rules 可来自 opts.globalDb（用户级全局库，
+ * <activeHomeDir>/global/memory.db），全局优先、工作区库兜底、按 id 去重；项目全景与
+ * 压缩重注入的写入回放始终只读工作区库。不传 globalDb = 纯工作区（0.32 行为不变）。
  */
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -45,6 +49,9 @@ export interface InjectOptions {
   importanceWeight?: boolean
   /** 命中记账回调（index.ts 传 (level,id)=>bumpHitCount(level,id)）：每条实际注入的命中调用一次。 */
   onHit?: (level: Level, id: string) => void
+  /** 用户级全局记忆库（Phase 2 分层存储）：soul/user/全局 rules 优先取它、工作区库兜底；
+   *  不传 = 0.32 纯工作区行为（旧调用方/测试行为不变）。项目全景/重注入第三块始终工作区。 */
+  globalDb?: MemoryDb
 }
 
 /** 预算契约默认值（与 src/defaults.ts 的 budget.* 一致；index.ts 显式传入时以传入为准）。 */
@@ -58,6 +65,38 @@ const DEFAULT_OPTS: InjectOptions = { hitTopK: 2, titleMax: 40, ...BUDGET_DEFAUL
 function capText(text: string, max: number | undefined): string {
   if (max === undefined || max <= 0 || text.length <= max) return text
   return text.slice(0, max - 1) + '…'
+}
+
+/** 分层读取（Phase 2）：全局库行在前、工作区行兜底，按 id 去重（同 id 以全局副本为准，
+ *  迁移保留 id，因此迁移后工作区归档原件的 id 不会重复注入）。 */
+function dedupeRows(...groups: readonly MemoryRow[][]): MemoryRow[] {
+  const seen = new Set<string>()
+  const out: MemoryRow[] = []
+  for (const rows of groups) {
+    for (const r of rows) {
+      if (seen.has(r.id)) continue
+      seen.add(r.id)
+      out.push(r)
+    }
+  }
+  return out
+}
+
+/** 分层读取 soul/user：全局库该层有行 → 全局优先；无论是否有，都并入工作区行兜底（0.32 回退）。
+ *  未信任库（trust.trusted === false）时调用方已传空组，不读任何库内容。 */
+function layeredLevel(db: MemoryDb, globalDb: MemoryDb | undefined, level: 'soul' | 'user'): MemoryRow[] {
+  const globalRows = globalDb ? globalDb.list(level, { status: 'active' }) : []
+  return dedupeRows(globalRows, db.list(level, { status: 'active' }))
+}
+
+/** 分层读取全局 rules（全局作用域规则）：全局库全局规则优先，工作区全局规则兜底。
+ *  不做 importance 过滤——首轮快照只要 importance≥2（调用方再筛），命中链路要全部命中。 */
+function layeredGlobalRules(db: MemoryDb, globalDb: MemoryDb | undefined): MemoryRow[] {
+  const globalRows = globalDb
+    ? globalDb.list('rules', { status: 'active' }).filter((r) => isGlobalScope(r.project))
+    : []
+  const workspaceRows = db.list('rules', { status: 'active' }).filter((r) => isGlobalScope(r.project))
+  return dedupeRows(globalRows, workspaceRows)
 }
 
 export function sessionsFile(workspace: string, sessionId: string, dir = '.dsh-meow'): string {
@@ -284,8 +323,10 @@ void shortTitle
  * v0.32 加固：
  * - trust.trusted === false（外来/未信任记忆库）→ 只输出静态「记忆导引」提示，soul/user/rules/
  *   项目清单等库内内容一律不读不注入（未信任提示由 index.ts 另行注入）；
- * - capChars > 0 → 按字符预算组装（budget.snapshotMaxChars），装不下的条目直接不注入，
- *   末尾补 …；injectedIds 只含真正写进正文的条目（超预算的不会被误记已见）。
+ * - capChars > 0 → 按字符预算组装（budget.snapshotMaxChars），装不下的条目直接不注入
+ *   （预算余量允许时末尾补 …）；injectedIds 只含真正写进正文的条目（超预算的不会被误记已见）。
+ * - v0.33（Phase 2）：o.globalDb 提供时 soul/user/全局 rules 走分层读取（全局库优先、
+ *   工作区库兜底、按 id 去重）；o.globalDb 未传时与 0.32 纯工作区行为完全一致。
  * @returns null = 只有标题头，无任何可注入内容。
  */
 function buildInjectionBody(
@@ -296,8 +337,10 @@ function buildInjectionBody(
   // 框架词外置（v0.19.0）：labels.md 的 inject.* 键；记忆条目正文本身是数据不是文案，不外置。
   const lbl = (key: string, params?: Record<string, string>): string => fillTemplate(keyedValue('labels', key), params)
   const trusted = o.trust?.trusted !== false
-  const soul = trusted ? db.list('soul', { status: 'active' }) : []
-  const user = trusted ? db.list('user', { status: 'active' }) : []
+  // Phase 2 分层存储：soul/user 全局库优先、工作区库兜底（未传 globalDb = 0.32 纯工作区行为）。
+  // 未信任库不读任何库内容（全局库同样不碰——信任门语义不变）。
+  const soul = trusted ? layeredLevel(db, o.globalDb, 'soul') : []
+  const user = trusted ? layeredLevel(db, o.globalDb, 'user') : []
 
   const lines: string[] = [lbl('inject.title'), '']
   const injected: string[] = []
@@ -356,7 +399,8 @@ function buildInjectionBody(
   // 2026-09-19 口径修复（用户拍板）：此前只认 project === null，而文档（tools.md /
   // system-guide.md / dream-atomic.md）教模型写"全局"——按文档写的准则反而永不注入。
   // 未信任库不读 rules（含全局规则）：rules 是命令式文本，注入优先级等同用户指令，风险最高。
-  const globalRules = trusted ? db.list('rules', { status: 'active' }).filter((r) => isGlobalScope(r.project) && r.importance >= 2) : []
+  // 分层存储（Phase 2）：全局库的全局规则优先、工作区全局规则兜底；快照只收 importance≥2。
+  const globalRules = trusted ? layeredGlobalRules(db, o.globalDb).filter((r) => r.importance >= 2) : []
   pushEntries(lbl('inject.rules'), globalRules)
 
   // 记忆导引：说明 + 项目列表（正文/标题一律自取，不列）。
@@ -396,7 +440,10 @@ function buildInjectionBody(
  * 首轮只注入长期记忆，不做关键词命中（命中链路从第二轮起，见 buildHitInjection）；
  * 正文注入的 id 记入已见（命中链路不再重复注入它们）。
  * v0.32：opts.trust.trusted === false 时只回记忆导引提示（库内内容不注入）；
- * 快照正文按 opts.snapshotMaxChars（契约默认 6000）截断预算，超预算条目会被丢弃并补 …。
+ * 快照正文按 opts.snapshotMaxChars（契约默认 6000）截断预算，超预算条目会被丢弃
+ * （预算余量允许时末尾补 …）。
+ * v0.33（Phase 2）：opts.globalDb 提供时 soul/user/全局 rules 走分层读取（全局库优先、
+ * 工作区库兜底、按 id 去重）；不传 globalDb 与 0.32 行为完全一致。
  * @returns { text, injectedIds }；无任何可注入内容返回 null。
  */
 export function buildInjection(
@@ -582,6 +629,8 @@ function buildWrittenSection(
  * - trust.trusted === false → 只保留静态记忆导引快照，项目全景/写入回放一律不输出；
  * - 整体字符预算 opts.reinjectMaxChars（契约默认 8000）：超预算时按 快照 > 写入回放 >
  *   项目全景 的优先级整块保留，装不下的块整块丢弃（不是切半行），末尾补 …。
+ * v0.33（Phase 2）：快照块走与首轮相同的分层读取（opts.globalDb：soul/user/全局 rules
+ * 全局库优先、工作区兜底）；项目全景与写入回放始终只读工作区库。
  * @returns null = 无任何可注入内容（库无快照正文、项目全空且无写入条目）；调用方仍应
  *          清除 reinjectPending，避免每个用户消息轮空转重查。
  */
@@ -664,6 +713,8 @@ export function buildReinjection(
 /** 关键词命中查询（首轮与每条消息链路共用）：active 的 fact/lesson/rules/topic，
  *  范围=全局 或 当前 project 锚定；排除本会话已见（injected+searched）；
  *  不检索本 session 建立的记忆（它们就在上下文里，AI 最清楚，无需命中）。
+ *  Phase 2 分层存储：fact/lesson/topic 只查工作区库；rules 两库都查——全局 rules
+ *  （全局作用域）来自全局库+工作区兜底，项目 rules 来自工作区库；按 id 去重。
  *  命中打分基于条目关键词（keywords，+title）而非全文——全文匹配噪音大
  *  （常见 bigram 如"的时"每条消息都有，长条目一碰词就整条注入）。 */
 function hitQuery(
@@ -678,12 +729,14 @@ function hitQuery(
   if (o.trust?.trusted === false) return []
   const seenState = readSeenFile(workspace, sessionId, dir)
   const currentProject = seenState.currentProject
-  const hitRows = [
-    ...db.list('fact', { status: 'active' }),
-    ...db.list('lesson', { status: 'active' }),
-    ...db.list('rules', { status: 'active' }),
-    ...db.list('topic', { status: 'active' }),
-  ].filter((r) =>
+  // 全局库的全局 rules 在前（迁移副本优先），再并工作区 rules（含项目 rules 与未迁移的全局 rules）。
+  const hitRows = dedupeRows(
+    db.list('fact', { status: 'active' }),
+    db.list('lesson', { status: 'active' }),
+    layeredGlobalRules(db, o.globalDb),
+    db.list('rules', { status: 'active' }),
+    db.list('topic', { status: 'active' }),
+  ).filter((r) =>
     (isGlobalScope(r.project) || (currentProject !== null && projectCovers(r.project, currentProject)))
     && r.source_session !== sessionId // 本 session 建立的记忆在上下文里，不命中
     && !seenState.injected.includes(r.id), // 已注入先排除再截断（#67）：先 hitTopK 后过滤，

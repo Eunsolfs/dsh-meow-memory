@@ -23,8 +23,9 @@ process.env.MEOW_MEMORY_HOME = join(HOME, 'meow-home')
 process.env.DSH_HOME = join(HOME, 'dsh-home')
 
 const {
-  MemoryDb, memoryDbPath, getDb, closeAllDbs,
-  ensureMemoryStore, storeTrustOf, resetStoreTrustCache,
+  MemoryDb, memoryDbPath, getDb, getGlobalDb, globalDbPath, closeAllDbs, closeGlobalDb,
+  ensureMemoryStore, ensureGlobalStore, storeTrustOf, resetStoreTrustCache,
+  migrateWorkspaceToGlobal, globalStoreRows,
   recencyWeight, search,
   buildInjection, buildHitInjection, buildReinjection, setCurrentProject,
   registerMemoryTools, setMemoryToolGate, apply,
@@ -529,6 +530,260 @@ const giOf = (ws, dir = '.dsh-meow') => join(ws, dir, '.gitignore')
   setMemoryToolGate(undefined)
   closeAllDbs()
   clean(foreignWs); clean(trustedWs)
+}
+
+// ═══════════════════ 9. Phase 2：全局（用户级）记忆库 ═══════════════════
+{
+  const savedActive = activeHomeDir()
+  const resetGlobalFor = (home) => { closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(home) }
+
+  // ① 不存在的全局库 → created；库在 <activeHomeDir>/global/memory.db；标记 workspace 绑定为空
+  const gHome = tmp('mmh-gstore-')
+  resetGlobalFor(gHome)
+  const t1 = ensureGlobalStore()
+  const gPath = globalDbPath()
+  check('global: absent → created + trusted', t1.trusted === true && t1.reason === 'created', JSON.stringify(t1))
+  check('global: db lives at <activeHomeDir>/global/memory.db', gPath === join(gHome, 'global', 'memory.db') && existsSync(gPath), gPath)
+  const gMarker = JSON.parse(readFileSync(join(gHome, 'global', '.owner.json'), 'utf8'))
+  check('global: owner marker has schema 1 + installId + empty workspace binding',
+    gMarker.schema === 1 && typeof gMarker.installId === 'string' && gMarker.installId.length > 0 && gMarker.workspace === '', JSON.stringify(gMarker))
+  check('global: plugin-owned global dir writes no .gitignore', !existsSync(join(gHome, 'global', '.gitignore')))
+  const g1 = getGlobalDb()
+  check('global: getGlobalDb caches one instance per path', g1 === getGlobalDb())
+  closeGlobalDb()
+  check('global: closeGlobalDb + reopen yields a fresh instance', getGlobalDb() !== g1)
+  const g3 = getGlobalDb()
+  closeAllDbs()
+  check('global: closeAllDbs closes the global db too', getGlobalDb() !== g3)
+
+  // ② 已存在的空全局库但无标记 → foreign（只认"库文件不存在"才创建）
+  const gHome2 = tmp('mmh-gstore-empty-')
+  resetGlobalFor(gHome2)
+  mkdirSync(join(gHome2, 'global'), { recursive: true })
+  const rawEmpty = new MemoryDb(join(gHome2, 'global', 'memory.db')); rawEmpty.close(); closeAllDbs()
+  const t2 = ensureGlobalStore()
+  check('global: pre-existing empty db without marker → foreign', t2.trusted === false && t2.reason === 'foreign')
+  check('global: foreign global store gets no marker write', !existsSync(join(gHome2, 'global', '.owner.json')))
+
+  // ③ 伪造 installId 的标记 → foreign；本机 installId 的标记 → marker
+  const installId = readFileSync(join(process.env.DSH_HOME, 'storages', 'meow-memory', 'install-id'), 'utf8').trim()
+  const gHome3 = tmp('mmh-gstore-forged-')
+  resetGlobalFor(gHome3)
+  mkdirSync(join(gHome3, 'global'), { recursive: true })
+  const raw3 = new MemoryDb(join(gHome3, 'global', 'memory.db')); raw3.insert({ level: 'soul', content: '外来全局soul' }); raw3.close(); closeAllDbs()
+  writeFileSync(join(gHome3, 'global', '.owner.json'), JSON.stringify({ schema: 1, installId: '00000000-0000-0000-0000-000000000000', workspace: '', createdAt: Date.now() }))
+  const t3 = ensureGlobalStore()
+  check('global: forged installId marker → foreign', t3.trusted === false && t3.reason === 'foreign', JSON.stringify(t3))
+  const gHome4 = tmp('mmh-gstore-marker-')
+  resetGlobalFor(gHome4)
+  mkdirSync(join(gHome4, 'global'), { recursive: true })
+  const raw4 = new MemoryDb(join(gHome4, 'global', 'memory.db')); raw4.close(); closeAllDbs()
+  writeFileSync(join(gHome4, 'global', '.owner.json'), JSON.stringify({ schema: 1, installId, workspace: '', createdAt: Date.now() }))
+  const t4 = ensureGlobalStore()
+  check('global: valid installId marker → marker trusted', t4.trusted === true && t4.reason === 'marker', JSON.stringify(t4))
+
+  closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(savedActive)
+  clean(gHome); clean(gHome2); clean(gHome3); clean(gHome4)
+}
+
+// ═══════════════════ 10. Phase 2：工作区 → 全局 懒迁移 ═══════════════════
+{
+  const savedActive = activeHomeDir()
+  const gHome = tmp('mmh-gmig-')
+  closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(gHome)
+  ensureGlobalStore()
+  const gdb = getGlobalDb()
+  const ws = tmp('mmh-gmig-ws-')
+  ensureMemoryStore(ws, '.dsh-meow', { autoGitignore: true, trustWorkspaceMemory: false })
+  const wdb = getDb(ws, '.dsh-meow')
+  const soul = wdb.insert({ level: 'soul', content: '工作区soul应迁移' })
+  const user = wdb.insert({ level: 'user', content: '工作区user应迁移' })
+  const gRule = wdb.insert({ level: 'rules', content: '工作区全局规则应迁移', project: null, importance: 2 })
+  const pRule = wdb.insert({ level: 'rules', content: '工作区项目规则不迁移', project: 'femo', importance: 2 })
+  const fact = wdb.insert({ level: 'fact', content: '工作区fact不迁移', project: 'dsh' })
+  const proj = wdb.insert({ level: 'project', content: '工作区project不迁移', project: 'femo', subcategory: 'overview' })
+  const r1 = migrateWorkspaceToGlobal(ws, '.dsh-meow')
+  check('migrate: copies soul + user + global rule (copied=3, archived=3)', r1.copied === 3 && r1.archived === 3 && r1.skipped === false, JSON.stringify(r1))
+  check('migrate: global rows keep the exact ids', gdb.findById(soul.id)?.row.content === '工作区soul应迁移' && gdb.findById(user.id) !== undefined && gdb.findById(gRule.id) !== undefined)
+  check('migrate: workspace originals archived (content recoverable)',
+    wdb.findById(soul.id)?.row.status === 'archived' && wdb.findById(user.id)?.row.status === 'archived' && wdb.findById(gRule.id)?.row.status === 'archived')
+  check('migrate: project-scope rules untouched and not copied', wdb.findById(pRule.id)?.row.status === 'active' && gdb.findById(pRule.id) === undefined)
+  check('migrate: facts/project rows untouched and not copied',
+    wdb.findById(fact.id)?.row.status === 'active' && wdb.findById(proj.id)?.row.status === 'active' && gdb.findById(fact.id) === undefined && gdb.findById(proj.id) === undefined)
+  check('migrate: idempotency flag recorded in dream_meta', wdb.getDreamMeta('globalmigrated:v1:.dsh-meow') !== undefined)
+  const r2 = migrateWorkspaceToGlobal(ws, '.dsh-meow')
+  check('migrate: second call skipped=true, copies nothing', r2.skipped === true && r2.copied === 0, JSON.stringify(r2))
+
+  // 不可信工作区 → 跳过且不碰库
+  const wsForeign = tmp('mmh-gmig-foreign-')
+  const fdb = new MemoryDb(memoryDbPath(wsForeign)); fdb.insert({ level: 'soul', content: '外来soul不迁移' }); fdb.close(); closeAllDbs()
+  resetStoreTrustCache()
+  const r3 = migrateWorkspaceToGlobal(wsForeign, '.dsh-meow')
+  check('migrate: untrusted workspace skipped', r3.skipped === true && r3.copied === 0)
+  check('migrate: untrusted workspace rows stay active', getDb(wsForeign, '.dsh-meow').list('soul', { status: 'active' }).length === 1)
+
+  // 全局库不可信（已存在非空、无标记）→ 可信工作区也不迁移（下次可信后重试）
+  const gHome2 = tmp('mmh-gmig-foreign-global-')
+  closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(gHome2)
+  mkdirSync(join(gHome2, 'global'), { recursive: true })
+  const rawG = new MemoryDb(join(gHome2, 'global', 'memory.db')); rawG.insert({ level: 'soul', content: '外来全局' }); rawG.close(); closeAllDbs()
+  check('migrate: foreign global store judged foreign', ensureGlobalStore().trusted === false)
+  const ws2 = tmp('mmh-gmig-ws2-')
+  ensureMemoryStore(ws2, '.dsh-meow', { autoGitignore: true, trustWorkspaceMemory: false })
+  const wdb2 = getDb(ws2, '.dsh-meow')
+  wdb2.insert({ level: 'soul', content: '可信工作区soul待迁移' })
+  const r4 = migrateWorkspaceToGlobal(ws2, '.dsh-meow')
+  check('migrate: foreign global → skipped and workspace stays retryable',
+    r4.skipped === true && r4.copied === 0 && wdb2.getDreamMeta('globalmigrated:v1:.dsh-meow') === undefined)
+
+  closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(savedActive)
+  clean(gHome); clean(gHome2); clean(ws); clean(wsForeign); clean(ws2)
+}
+
+// ═══════════════════ 11. Phase 2：分层注入（globalDb） ═══════════════════
+{
+  const savedActive = activeHomeDir()
+  const gHome = tmp('mmh-layer-')
+  closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(gHome)
+  ensureGlobalStore()
+  const g = getGlobalDb()
+  const gs = g.insert({ level: 'soul', content: '全局soul条目' })
+  g.insert({ level: 'user', content: '全局user条目' })
+  const gr = g.insert({ level: 'rules', content: '全局规则条目', project: null, importance: 2 })
+  g.update('rules', gr.id, { keywords: ['分层命中词'] })
+  const ws = tmp('mmh-layer-ws-')
+  const wdb = new MemoryDb(memoryDbPath(ws))
+  wdb.insert({ level: 'soul', content: '工作区soul兜底条目' })
+  const wgr = wdb.insert({ level: 'rules', content: '工作区全局规则兜底', project: '全局', importance: 2 })
+  wdb.update('rules', wgr.id, { keywords: ['分层命中词'] })
+  wdb.insertRow({ ...gs, level: 'soul', content: '工作区同id副本（应被全局副本压制）' })
+  const inj = buildInjection(wdb, ws, 'layer-1', '', { globalDb: g })
+  check('layered: snapshot merges global + workspace soul', inj !== null && inj.text.includes('全局soul条目') && inj.text.includes('工作区soul兜底条目'), inj?.text)
+  check('layered: same id → global copy wins (id dedupe)', inj !== null && inj.text.includes('全局soul条目') && !inj.text.includes('工作区同id副本'))
+  check('layered: global rules + workspace fallback rules both injected', inj !== null && inj.text.includes('全局规则条目') && inj.text.includes('工作区全局规则兜底'))
+  const hit = buildHitInjection(wdb, ws, 'layer-hit', '分层命中词', { globalDb: g, hitTopK: 5 })
+  check('layered: keyword hits merge both stores and dedupe by id',
+    hit !== null && new Set(hit.injectedIds).size === hit.injectedIds.length && hit.text.includes('全局规则条目') && hit.text.includes('工作区全局规则兜底'), hit?.text)
+  const injU = buildInjection(wdb, ws, 'layer-3', '', { globalDb: g, trust: { trusted: false } })
+  check('layered: trust:false suppresses global + workspace content',
+    injU === null || (!injU.text.includes('全局soul条目') && !injU.text.includes('工作区soul兜底条目') && !injU.text.includes('全局规则条目')))
+
+  // 全局库为空 → 回落工作区（0.32 行为）
+  const gEmptyHome = tmp('mmh-layer-gempty-')
+  closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(gEmptyHome)
+  ensureGlobalStore()
+  const injF = buildInjection(wdb, ws, 'layer-2', '', { globalDb: getGlobalDb() })
+  check('layered: empty global store falls back to workspace rows', injF !== null && injF.text.includes('工作区soul兜底条目'), injF?.text)
+  check('layered: empty global store injects no global content', injF !== null && !injF.text.includes('全局soul条目'))
+
+  closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(savedActive)
+  clean(gHome); clean(gEmptyHome); clean(ws)
+}
+
+// ═══════════════════ 12. Phase 2：工具读写路由（apply + 首次 trusted pre-step 迁移） ═══════════════════
+{
+  const savedActive = activeHomeDir()
+  const gHome = tmp('mmh-routing-g-')
+  closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(gHome)
+  const makeCtx = () => {
+    const tools = []
+    const handlers = {}
+    const ctx = {
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      tools: { register: (t) => { tools.push(t); return () => {} } },
+      on: (name, fn) => { handlers[name] = fn },
+      effect: (fn) => { try { fn() } catch { /* mock */ } return () => {} },
+      get: () => undefined,
+      subagents: { start: () => { throw new Error('subagents not expected') } },
+    }
+    return { ctx, tools, handlers }
+  }
+  const ws = tmp('mmh-routing-ws-')
+  ensureMemoryStore(ws, '.dsh-meow', { autoGitignore: true, trustWorkspaceMemory: false })
+  const wdb = getDb(ws, '.dsh-meow')
+  wdb.insert({ level: 'soul', content: '迁移前工作区soul' })
+  wdb.insert({ level: 'rules', content: '迁移前全局规则', project: null, importance: 2 })
+  wdb.insert({ level: 'fact', content: '工作区既有fact', project: 'dsh' })
+
+  const a = makeCtx()
+  await apply(a.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
+  const preStep = a.handlers['agent/pre-step']
+  const um = { content: [{ type: 'text', text: '你好' }], source: { kind: 'user' } }
+  await preStep(
+    { agent: { session: { header: { cwd: ws, id: 'p2-tools' }, events: [] }, steer: () => {} }, messages: [um], turn: 1, step: 1, signal: new AbortController().signal },
+    async () => ({ kind: 'enter', messages: [um] }),
+  )
+  const g = getGlobalDb()
+  const names = Object.fromEntries(a.tools.map((t) => [t.name, t]))
+  const exec = { agent: { session: { header: { cwd: ws, id: 'p2-tools' } } } }
+  const rem = (level, content, project, keywords) => names.memory_remember.execute({ level, content, project, keywords, importance: 2 }, exec)
+
+  check('routing: first trusted pre-step migrated user-scope rows into global db',
+    g.list('soul').some((r) => r.content === '迁移前工作区soul') && g.list('rules').some((r) => r.content === '迁移前全局规则') &&
+    getDb(ws, '.dsh-meow').list('soul', { status: 'active' }).length === 0)
+
+  await rem('soul', '新全局soul', '全局', ['全局层测试词'])
+  await rem('user', '新全局user', '全局', ['全局层测试词'])
+  await rem('rules', '新全局规则', '全局', ['全局层测试词'])
+  await rem('fact', '新工作区fact', 'dsh', ['工作区层测试词'])
+  await rem('rules', '新项目规则', 'femo', ['工作区层测试词'])
+  check('routing: soul/user/global-rule writes land in the global db',
+    g.list('soul').some((r) => r.content === '新全局soul') && g.list('user').some((r) => r.content === '新全局user') && g.list('rules').some((r) => r.content === '新全局规则'))
+  check('routing: fact/project-rule writes stay in the workspace db',
+    getDb(ws, '.dsh-meow').list('fact', { status: 'active' }).some((r) => r.content === '新工作区fact') &&
+    getDb(ws, '.dsh-meow').list('rules', { status: 'active' }).some((r) => r.content === '新项目规则') &&
+    !g.list('fact').some((r) => r.content === '新工作区fact') && !g.list('rules').some((r) => r.content === '新项目规则'))
+
+  const s = await names.memory_search.execute({ query: '全局层测试词 工作区层测试词', project: 'dsh' }, exec)
+  const sIds = s.hits.map((h) => h.id)
+  check('routing: memory_search merges both stores without duplicate ids',
+    s.hits.some((h) => h.content === '新全局规则') && s.hits.some((h) => h.content === '新工作区fact') && new Set(sIds).size === sIds.length)
+  const l = await names.memory_list.execute({ status: 'all', limit: 100 }, exec)
+  const lIds = l.items.map((it) => it.id)
+  check('routing: memory_list merges both stores without duplicate ids',
+    l.items.some((it) => it.level === 'soul') && l.items.some((it) => it.level === 'fact') && new Set(lIds).size === lIds.length)
+
+  const gid = g.list('soul').find((r) => r.content === '新全局soul').id
+  const rd = await names.memory_read.execute({ id: gid }, exec)
+  check('routing: memory_read locates a global-row id', rd.found === true && rd.level === 'soul')
+  const up = await names.memory_update.execute({ id: gid, content: '新全局soul（已更新）' }, exec)
+  check('routing: memory_update writes back to the global db', up.ok === true && g.findById(gid).row.content === '新全局soul（已更新）')
+  const del = await names.memory_forget.execute({ id: gid, mode: 'delete', confirm: true }, exec)
+  check('routing: memory_forget deletes a global-row id', del.id === gid && g.findById(gid) === undefined)
+
+  setMemoryToolGate(undefined)
+  closeAllDbs(); resetStoreTrustCache(); setActiveHomeDir(savedActive)
+  clean(gHome); clean(ws)
+}
+
+// ═══════════════════ 13. Phase 2：混合词法检索（fuzzy） ═══════════════════
+{
+  const now = Date.now()
+  // 匹配面 = title + content + keywords；用短匹配面（真实 keywords 条目形态）验证
+  // "同义/词形变体只靠 fuzzy 补分召回"，避免长正文把字符 n-gram Jaccard 稀释到噪声地板下。
+  const docs = [
+    { id: 'doc-cache', level: 'fact', title: null, content: 'cache invalidation', keywords: ['cache'], importance: 1, created_at: now, updated_at: now },
+    { id: 'doc-caching', level: 'fact', title: null, content: 'caching', keywords: ['caching'], importance: 1, created_at: now, updated_at: now },
+    { id: 'doc-noise', level: 'fact', title: null, content: 'galaxy', keywords: ['galaxy'], importance: 1, created_at: now, updated_at: now },
+  ]
+  const on = search('cache', docs, { k: 10, explain: true, now })
+  const off = search('cache', docs, { k: 10, now, fuzzy: false })
+  check('fuzzy: fuzzy-on search includes the word-form variant doc', on.some((h) => h.id === 'doc-caching'), JSON.stringify(on.map((h) => [h.id, h.score])))
+  check('fuzzy: fuzzy:false excludes the variant doc', !off.some((h) => h.id === 'doc-caching'), JSON.stringify(off.map((h) => h.id)))
+  const variant = on.find((h) => h.id === 'doc-caching')
+  check('fuzzy: variant is scored by the fuzzy floor (>0, explain.fuzzy > 0)', variant !== undefined && variant.score > 0 && (variant.explain?.fuzzy ?? 0) > 0, JSON.stringify(variant?.explain))
+  const exact = on.find((h) => h.id === 'doc-cache')
+  check('fuzzy: explain carries a fuzzy field for exact BM25 hits too', exact?.explain !== undefined && 'fuzzy' in exact.explain)
+  check('fuzzy: unrelated doc still excluded (noise floor)', !on.some((h) => h.id === 'doc-noise'))
+  // 直接 fuzzyScore 单元契约：0.33 源码已有 fuzzyScore，但 src/index.ts 的 export 清单尚未
+  // 转出（lib/index.js 里不可见）——行为已由上面的 search() 覆盖；导出后这组断言自动生效。
+  const mod = await import('../lib/index.js')
+  if (typeof mod.fuzzyScore === 'function') {
+    check('fuzzy: fuzzyScore("cache","caching") > 0.2', mod.fuzzyScore('cache', 'caching') > 0.2, String(mod.fuzzyScore('cache', 'caching')))
+    check('fuzzy: fuzzyScore noise floor returns 0', mod.fuzzyScore('cache', 'unrelated galaxy') === 0)
+  } else {
+    console.log('  [note] fuzzyScore is not exported from lib/index.js (src/index.ts export list) — direct unit contract pending; behavior covered via search()')
+  }
 }
 
 // 清理

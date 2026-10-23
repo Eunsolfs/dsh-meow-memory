@@ -1,8 +1,10 @@
-# Tool reference (0.32 fork)
+# Tool reference (0.33 fork)
 
 meow-memory registers **10** memory tools. Three bands: **read** (search / read / find_similar / project / list), **write** (remember / update / forget / dream), **directory** (home).
 
 > Tool descriptions and returned copy follow the `promptLang` language pack. Parameter schemas do not change with language.
+>
+> Since 0.33 storage is **two-layer** (user-scope global store + workspace store); write routing, read merging and migration are in [Layered storage and tool routing](#layered-storage-and-tool-routing-033).
 
 ---
 
@@ -10,18 +12,38 @@ meow-memory registers **10** memory tools. Three bands: **read** (search / read 
 
 | Tool | Band | Purpose |
 |---|---|---|
-| `memory_remember` | write | Write one memory: content / project / keywords / importance required |
-| `memory_search` | read | BM25 × recency search (with optional `explain`) |
-| `memory_project` | read | Fetch a project's whole-project injection paragraph |
-| `memory_find_similar` | read | Duplicate & conflict detection |
-| `memory_read` | read | Read one entry's complete metadata by id |
-| `memory_update` | write | Fix status / importance / goal / keywords / content |
-| `memory_list` | read | **new in 0.32**: list entry metadata (no text) to take stock and find ids |
-| `memory_forget` | write | **new in 0.32**: archive / restore / hard-delete one entry by id |
-| `memory_dream` | write | Manually trigger this window's consolidation (same as `/dream`) |
-| `memory_home` | directory | Inspect the global data directory; **query-only by default since 0.32** |
+| `memory_remember` | write | Write one memory: content / project / keywords / importance required; soul/user/global rules → global store, everything else → workspace store |
+| `memory_search` | read | Hybrid lexical search (BM25 × recency + character n-gram floor; optional `explain` incl. `fuzzy`); queries both stores |
+| `memory_project` | read | Fetch a project's whole-project injection paragraph (**workspace store only**) |
+| `memory_find_similar` | read | Duplicate & conflict detection; queries both stores |
+| `memory_read` | read | Read one entry's complete metadata by id; queries both stores |
+| `memory_update` | write | Fix status / importance / goal / keywords / content (writes back to the owning store) |
+| `memory_list` | read | **new in 0.32**: metadata inventory (no text), merged across both stores and deduped by id |
+| `memory_forget` | write | **new in 0.32**: archive / restore / hard-delete by id; queries both stores |
+| `memory_dream` | write | Manually trigger this window's consolidation (same as `/dream`; workspace store only) |
+| `memory_home` | directory | Inspect the global data directory; **query-only by default since 0.32** (0.33 switches move the global store too) |
 
 There is also the `/dream` command: type it in the composer to consolidate this window right away, immune to peak-hour suppression.
+
+---
+
+## Layered storage and tool routing (0.33)
+
+```
+<activeHomeDir>/global/memory.db        ← user-scope: soul / user / rules(global)
+<workspace>/<projectDir>/memory.db      ← workspace-scope: project / fact / lesson / topic / rules(project)
+```
+
+| Operation | Behaviour |
+|---|---|
+| Write (`memory_remember`) | `level=soul` / `user`, or `level=rules` with a global project → **global store**; everything else → **workspace store**. Dedupe/merge happens only inside the target store |
+| Read / update / forget / search / list / find_similar | **Query both stores**, dedupe by id; same id → **active wins over archived**. `update` / `forget` write back to the store that owns the entry |
+| Project panorama | `memory_project` reads the **workspace store only** |
+| Migration | The first **trusted** session in each workspace copies existing soul/user/global rules by original id into the global store, then archives the workspace originals (recoverable); the idempotency flag `globalmigrated:v1:<dir>` lives in the workspace `dream_meta` |
+| Fallback | An absent/untrusted/unavailable global store falls back to 0.32 single-store behaviour; there is **no `trustWorkspaceMemory` config override** for the global store |
+| Backup | `backup.enabled` backs up **only the workspace store**, not the global store |
+
+> If the global store is lost after migration: the workspace originals stay archived and are **not re-injected automatically**; restore them per id with `memory_forget` (`mode:'restore'`), or restore a backup of the global directory.
 
 ---
 
@@ -42,13 +64,15 @@ There is also the `/dream` command: type it in the composer to consolidate this 
 
 **Returns**: `ok` / `id` / `level` / `merged` / `keywords` / `project`.
 
+**Write target (0.33)**: `level=soul` / `user`, or `level=rules` with a global project → **user-scope global store**; everything else → **workspace store**. Dedupe/merge happens only inside the target store.
+
 **Dedupe reality**: only **same level**, bigram **Jaccard ≥ 0.8** (near-identical wording) merges. Paraphrases and cross-level duplicates do **not** merge. Merging overwrites keywords with the new list and takes `max(importance)`.
 
 ---
 
 ## `memory_search` — search
 
-**BM25 × recency weight** (the per-message keyword hit uses a different scorer, below). Default `k=10`: the first 5 by relevance (seen entries not excluded), then 5 more from the remaining ranking skipping seen entries, re-sorted old → new by memory timestamp.
+**BM25 × recency weight + the 0.33 hybrid lexical floor** (the per-message keyword hit uses a different scorer, below). Default `k=10`: the first 5 by relevance (seen entries not excluded), then 5 more from the remaining ranking skipping seen entries, re-sorted old → new by memory timestamp. **Queries both stores**, deduped by id.
 
 | Parameter | Type | Default | Meaning |
 |---|---|---|---|
@@ -59,15 +83,17 @@ There is also the `/dream` command: type it in the composer to consolidate this 
 | `days` | integer 1–3650 | — | Only entries created within the last N days |
 | `k` | integer 1–50 | `10` | Max hits |
 | `content_max` | integer 0–5000 | `300` | Truncation per hit; `0` = full text |
-| `explain` | boolean | `false` | Attach a score breakdown per hit (bm25 raw / importance / recencyWeight / status); does not change the order |
+| `explain` | boolean | `false` | Attach a score breakdown per hit (bm25 raw / importance / recencyWeight / status; since 0.33 optionally `fuzzy`, plus `importanceWeight` / `hitBoost` when enabled); does not change the order |
 
 **Returns**: `note` + `hits[]` (project, full id, relative time, keywords, truncated content). Use `memory_project` for the project panorama, and `memory_list` for a metadata-only inventory.
+
+> **0.33 hybrid lexical floor**: character bigram Jaccard + 0.25×trigram Jaccard (noise floor 0.2), used only as a floor when BM25 is weak (`score = max(BM25, 0.55·fuzzy·recency·importance)`); strong BM25 ordering is unchanged. **Not semantic/embedding retrieval** — paraphrases may still be missed. No config toggle (pure BM25 is a test/internal option).
 
 ---
 
 ## `memory_project` — project panorama
 
-Fetches a project's complete injection paragraph. `project` is **required**.
+Fetches a project's complete injection paragraph. `project` is **required**. **Workspace store only** (user-scope global entries are not part of a project panorama).
 
 - non-`todo` subcategories: all `active` entries (the automatic-injection path is budget-bound; this tool returns per call, but the whole output has its own cap — see below);
 - `todo`: active entries under "To do list:" plus the 5 most recently completed (`stale`) under "Done:";
@@ -87,7 +113,7 @@ Fetches a project's complete injection paragraph. `project` is **required**.
 | `k` | integer 1–20 | `5` | Number of similar entries |
 | `content_max` | integer 0–5000 | `200` | Truncation per entry |
 
-Ranks by bigram cosine similarity; entries already seen in this session are excluded.
+Ranks by bigram cosine similarity; entries already seen in this session are excluded. **Queries both stores** (deduped by id).
 
 ---
 
@@ -97,7 +123,7 @@ Ranks by bigram cosine similarity; entries already seen in this session are excl
 |---|---|---|---|
 | `id` | string | yes | Full id or first 12 characters |
 
-Returns the complete metadata (keywords / status / importance / goal / timestamps).
+Returns the complete metadata (keywords / status / importance / goal / timestamps). **Queries both stores**; the owning store is used for a later update/forget.
 
 ---
 
@@ -119,7 +145,7 @@ Returns the complete metadata (keywords / status / importance / goal / timestamp
 
 ## `memory_list` — list entries (new in 0.32)
 
-A low-token inventory view: **metadata only, no body text** (the key difference from `memory_search` / `memory_read`). Use it to answer "what do I actually have stored" and to find ids to clean up.
+A low-token inventory view: **metadata only, no body text** (the key difference from `memory_search` / `memory_read`). **Merged across both stores and deduped by id** (same id: active wins). Use it to answer "what do I actually have stored" and to find ids to clean up.
 
 | Parameter | Type | Default | Meaning |
 |---|---|---|---|
@@ -179,14 +205,14 @@ With `security.allowHomeSwitch: true`:
 | `dsh-storage` | `<DSH home>/storages/meow-memory` |
 | `plugin-root` | `<plugin root>/storage` |
 
-Switching moves (same disk) or copies (cross disk); the old directory is **never deleted automatically**; an existing target is used without overwriting. The result is persisted in `<DSH_HOME>/storages/meow-memory-home.json`.
+Switching moves (same disk) or copies (cross disk); the old directory is **never deleted automatically**; an existing target is used without overwriting. Since 0.33 the global data directory also contains the **user-scope global memory store** (`global/memory.db`), so a switch moves it too; the global DB connection is closed first (on Windows an open SQLite file blocks the rename). The result is persisted in `<DSH_HOME>/storages/meow-memory-home.json`.
 
 ---
 
 ## Automatic injection vs. manual tools
 
-- **Injection** (first-turn snapshot, per-message hits, post-compaction re-injection) is bounded by `budget.*` and **skips untrusted stores**;
-- **Manual tools** (search / project / read / list, etc.) return on demand and are not subject to the injection budget, but on an untrusted store they are **refused** (explicit error, not empty results); dream and reflection are refused too.
+- **Injection** (first-turn snapshot, per-message hits, post-compaction re-injection) is bounded by `budget.*` and **skips untrusted stores**; since 0.33 the first-turn snapshot's soul/user/global rules come from the global store (workspace store as fallback), while project panorama/re-injection stay workspace-only;
+- **Manual tools** (search / project / read / list, etc.) return on demand and are not subject to the injection budget, but on an untrusted store they are **refused** (explicit error, not empty results); dream and reflection are refused too. Read tools query both stores (except `memory_project`).
 - `memory_list` is the only low-cost "whole store without bodies" view; `memory_forget` is the only delete/archive entry point (equivalent to `memory_update status=archived` for archiving).
 
 ---

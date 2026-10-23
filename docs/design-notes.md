@@ -41,6 +41,8 @@ keyword intersection × IDF × query coverage × exponential recency × importan
 
 `memory_search` is a separate **BM25** scorer (`ln(1+(N−df+.5)/(df+.5))`, k1=1.5, b=0.75, length normalisation + recency). The docs no longer conflate the two.
 
+**0.33 hybrid lexical floor (fuzzy)**: BM25 is exact whole-word/bigram matching, so morphological variants, inflections and CJK word-boundary differences are missed. A pure character-level similarity is added (zero-dependency, offline, deterministic): character bigram Jaccard + **0.25×trigram Jaccard** (NFKC, lowercased, letters/digits only; CJK needs no segmentation), noise floor 0.2. It is only a **floor**: `score = max(BM25, 0.55·fuzzy·recency·importance)`; strong BM25 hits keep their ordering, and the complement only rescues recall when BM25 is 0/weak (per-message chain: `relevance = max(BM25 relevance, fuzzy)`, then multiplied by recency). **Not embedding/semantic retrieval** — it covers lexical variants/inflections/word boundaries only; paraphrases can still be missed. No config toggle (pure BM25 is a test/internal option).
+
 ---
 
 ## 4. "Seen" is tracked per session
@@ -138,16 +140,39 @@ Three gates fix #64-1 / #64-2:
 2. **`memory_home` query-only by default**: the tool is model-callable, and moving the global directory changes where logs / window index / migrate state live — a filesystem side effect the model should not have. Switching now requires `security.allowHomeSwitch: true`.
 3. **Fixed prompt-override directory**: overrides resolve only from `$DSH_HOME/storages/meow-memory/prompts/` (`$DSH_HOME` defaults to `~/.dsh`), which does **not** follow `homeDir` / `memory_home` / `MEOW_MEMORY_HOME`; the old location is no longer read (no fallback).
 
-Also: workspace paths are compared after **realpath normalisation** (junction / mapped-drive / subst aliases no longer look foreign; unresolvable aliases still fail closed), and the trust gate covers **HTTP data routes, session window-activity tracking and startup window-index restore** (0.32.1: none of them open/upgrade an untrusted store just for bookkeeping; POST `skip-dreams` returns 403 for untrusted). Creating the memory directory writes a self-ignoring `.gitignore` (`*`; if a pre-existing one lacks a `*` line, one is appended to block `!*` re-inclusion) so `git add .` cannot commit plaintext memories. `security.debugLogs` gates `perf.log` and settings/configEditor dumps; `dream-debug.log` is still written by default with minimal info (session ids/counts/skip reasons, no memory text; 48h cleanup, 5MB rotation), and error logs are error-only. Uninstall leaves data on purpose (the plugin must not delete memories for the user). The store is **not encrypted** — plaintext SQLite; disk/backups/sync remain the trust boundary.
+Also: workspace paths are compared after **realpath normalisation** (junction / mapped-drive / subst aliases no longer look foreign; unresolvable aliases still fail closed), and the trust gate covers **HTTP data routes, session window-activity tracking and startup window-index restore** (0.32.1: none of them open/upgrade an untrusted store just for bookkeeping; POST `skip-dreams` returns 403 for untrusted). The global store is trust-gated too (`<activeHomeDir>/global/.owner.json`, installId marker, `workspace: ''`; a copied/synced global dir is foreign, and there is no `trustWorkspaceMemory`-style override — see §16). Creating the memory directory writes a self-ignoring `.gitignore` (`*`; if a pre-existing one lacks a `*` line, one is appended to block `!*` re-inclusion) so `git add .` cannot commit plaintext memories. `security.debugLogs` gates `perf.log` and settings/configEditor dumps; `dream-debug.log` is still written by default with minimal info (session ids/counts/skip reasons, no memory text; 48h cleanup, 5MB rotation), and error logs are error-only. Uninstall leaves data on purpose (the plugin must not delete memories for the user). The store is **not encrypted** — plaintext SQLite; disk/backups/sync remain the trust boundary.
 
 ---
 
-## 16. Known design debt (not fixed in 0.32)
+## 16. 0.33 user-scope global memory and layered storage
+
+0.32's "global" was global only inside one workspace; 0.33 makes it a **user-scope** two-layer store:
+
+```
+<activeHomeDir>/global/memory.db        ← user-scope: soul / user / rules(global), across workspaces
+<workspace>/<projectDir>/memory.db      ← workspace-scope: project / fact / lesson / topic / rules(project)
+```
+
+- **Why not move everything into the global store**: project/fact/lesson/topic are workspace semantics (the project context of one cwd); putting them in the global store would cross-contaminate projects. soul/user/global rules are "who the user is" and naturally cross-workspace. Layering puts each kind of memory at the right lifetime.
+- **Migration**: the first trusted session in each workspace copies existing soul/user/global rules **by original id** into the global store (ids/timestamps preserved so injection dedupe and links keep working), then **archives the workspace originals** (recoverable; otherwise snapshot and dream would double-count). Idempotency flag in workspace `dream_meta` (`globalmigrated:v1:<dir>`); only trusted workspaces are migrated, foreign stores are never touched (migration never reads across a trust boundary).
+- **Fallback**: an absent/untrusted/unavailable global store falls back to 0.32 single-workspace behaviour, so a deleted global store or one synced from another machine can neither break the plugin nor inject foreign data as user memory.
+- **Global store trust gate**: `<activeHomeDir>/global/.owner.json` (installId marker, `workspace: ''` — no workspace binding); absent → created, pre-existing without a valid marker → foreign; there is **no `trustWorkspaceMemory` config override** (the global store is "the user's own" data; no "trust an unknown store" switch).
+- **Tool routing**: writes are routed by level (soul/user/global rules → global store); reads query both stores and dedupe by id (same id: **active wins over archived**, so a migration archive copy cannot shadow the original); `memory_project` reads the workspace store only (project panorama is workspace semantics).
+- **Windows EPERM**: `homeDir` / `memory_home` switches move the global store; the connection is closed first via `closeGlobalDb()` (on Windows an open SQLite file blocks the rename).
+
+**Known boundaries**: `backup.enabled` backs up the workspace store only (not the global store); dream/reflection still consolidate the workspace DB only (global entries are maintained via tools/reflection); migration archives workspace originals and a lost global store is not re-injected automatically.
+
+---
+
+## 17. Known design debt (updated in 0.33)
 
 | Issue | Impact | Why |
 |---|---|---|
-| **Per-workspace DB** | "Global" is global only within one cwd; subdirectory/symlink opens create new stores | Data-model change, too risky for this hardening pass |
-| **Keyword recall ceiling** | No semantic retrieval; badly keyworded entries are silently unreachable | Needs embeddings/indexing, out of scope |
+| **Project-level memory is still workspace-scoped** | `project` / `fact` / `lesson` / `topic` follow the cwd; a new workspace starts with fresh project memory (soul/user/global rules are cross-workspace since 0.33) | Sharing project memory needs a store-ownership model; left for later |
+| **Semantic recall still missing** | fuzzy covers lexical variants/inflections/word boundaries only; paraphrases can still be missed | Needs embeddings/vector indexing; no embedding provider on this host |
+| **Global store is not backed up** | `backup.enabled` backs up the workspace `memory.db` only | The backup path was designed per workspace DB; back up the global store manually |
+| **Dream does not consolidate the global store** | Global entries are maintained via tools/reflection, not dream rounds | Dream is per-window workspace semantics; global consolidation needs its own scheduler |
+| **Migration archives workspace originals** | A lost global store does not re-inject them automatically (content still archived) | Auto-restoring would conflict with "user deleted the global store"; provide `memory_forget mode=restore` |
 | **Scans without indexes (upstream)** | 4 full scans per message; fine at hundreds of entries, a cliff at thousands | T1 added indexes; large-scale behaviour still needs measuring |
 | **#66 host-side tool lock** | After a manual dream the tool set may shrink until restart | Host issue; plugin can only avoid the automatic path |
 | **#71 delegate model leak** | Only with `delegate.model` set | Host projection bug; empty default does not trigger |

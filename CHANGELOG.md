@@ -1,10 +1,40 @@
 # Changelog
 
-本文件从上游 `Phant0Meow/dsh-meow-memory` v0.31.1 接续。**0.32.0 起为本仓库（hardened fork）的版本，当前 0.32.1**，与上游无隶属关系；上游变更历史见 <https://github.com/Phant0Meow/dsh-meow-memory/blob/main/CHANGELOG.md>。
+本文件从上游 `Phant0Meow/dsh-meow-memory` v0.31.1 接续。**0.32.0 起为本仓库（hardened fork）的版本，当前 0.33.0**，与上游无隶属关系；上游变更历史见 <https://github.com/Phant0Meow/dsh-meow-memory/blob/main/CHANGELOG.md>。
+
+## v0.33.0 (2026-10-23) — Phase 2：用户级全局记忆 + 分层检索
+
+Phase 2 Round 1（用户授权的大改动）。0.32.x 的加固内容全部保留；本版在**存储模型**与**检索**上做结构性升级。完整计划见 `docs/PHASE2-PLAN.md`。
+
+### 存储：用户级全局库 + 工作区库（两层）
+
+- 新增**用户级全局记忆库** `<activeHomeDir>/global/memory.db`：`soul` / `user` / 全局 `rules` 跨工作区共享；`project` / `fact` / `lesson` / `topic` / 项目 `rules` 仍在 `<workspace>/<projectDir>/memory.db`。全局库随 `homeDir` / `memory_home` 切换搬移。
+- **自动迁移（懒、幂等、只对可信工作区）**：每个工作区首个可信会话把原有 soul/user/全局 rules **按原 id** 复制进全局库（全局已有同 id 则 global wins），随后把工作区原件 **归档**（可恢复；避免注入/dream 双计）。完成标记写在工作区库 `dream_meta`（`globalmigrated:v1:<dir>`）。
+- **回退**：全局库缺失 / 未受信 / 不可用时自动退回 0.32 单工作区行为（soul/user/全局 rules 仍走工作区库，不报错）。
+- **全局库信任闸**：`<activeHomeDir>/global/.owner.json`（installId 标记、`workspace: ''`）；不存在→创建，已存在无有效标记→foreign；**全局库没有 `trustWorkspaceMemory` 配置信任档**；他机复制/同步的全局目录判 foreign。
+- **工具路由**：`memory_remember` 写 soul/user/全局 rules → 全局库，其余 → 工作区库；`memory_read` / `update` / `forget` / `search` / `list` / `find_similar` 两库并查、按 id 去重（同 id **active 优先于 archived**）；`memory_project` 只读工作区库。
+- **Windows EPERM**：`memory_home` / 设置页热切换全局目录前先 `closeGlobalDb()` 再搬移（Windows 上打开的 SQLite 文件会阻塞 rename）。
+
+### 检索：离线混合词法补分（fuzzy）
+
+- 新增字符级 n-gram 兜底（CJK 安全、NFKC、零依赖）：`fuzzy = 字符 bigram Jaccard + 0.25×trigram Jaccard`，噪声地板 0.2；仅在 BM25 弱命中时作为 floor：`score = max(BM25, 0.55·fuzzy·recency·importance)`，不改强命中排序；每消息命中链路同理（`relevance = max(BM25 relevance, fuzzy)`）。**不是 embedding/语义检索**。
+- `memory_search` 的 `explain=true` 增加可选 `fuzzy` 字段（另有 `importanceWeight` / `hitBoost` 当启用时）。无配置开关；纯 BM25 仅是测试/内部选项。
+
+### 测试
+
+- 全量 `npm test` 通过：**1076 条断言全绿**（host 676 + client 360），0 失败；其中 `tests/hardening.mjs` **140 条**。`node smoke.mjs` 另行 29 条通过；`check-lang` en/pt-br 两个语言包通过。隔离实例 live load on DSH 0.2.1-rc.2 通过（全局库在隔离 meow home 下自动创建，未写真实 home）。
+
+### 已知限制
+
+- 全局库**不在 `backup.enabled` 备份范围**（只备份工作区 `memory.db`）。
+- **dream/反思仍只整理工作区库**；全局条目靠工具/反思维护。
+- **迁移会把工作区原件归档**；全局库丢失不会自动回灌，需恢复全局目录或 `memory_forget mode=restore` 逐条恢复。
+- **设置页仍未暴露 0.32 新增的 `security` / `budget` / `retrieval` 配置字段**，需手编 profile patch。
+- **没有语义 embedding**：fuzzy 只覆盖词法变体/词形/词边界；同义改写仍可能召回不到。
 
 ## v0.32.1 (2026-10-23) — 审计后第二轮修复
 
-第二轮独立审计后的修复；代码从本版起冻结。0.32.0 的完整内容保留在下方。
+第二轮独立审计后的修复；该轮结束后代码曾冻结，0.33.0 起继续 Phase 2。0.32.0 的完整内容保留在下方。
 
 ### 安全
 

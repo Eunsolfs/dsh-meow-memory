@@ -1,4 +1,4 @@
-# Troubleshooting (0.32 fork)
+# Troubleshooting (0.33 fork)
 
 Start here when installation fails, recall is poor, or behaviour is unexpected.
 
@@ -36,9 +36,9 @@ It is declared as a **peerDependency** and kept external at build time so the co
 **No.** Uninstalling only removes the code. Clean up manually if desired:
 
 ```
-<workspace>/.dsh-meow/
-~/.dsh-meow/                    # or your configured homeDir
-~/.dsh/storages/meow-memory-home.json
+<workspace>/.dsh-meow/                       # workspace memory.db, sessions/, .owner.json, .gitignore
+~/.dsh-meow/                              # or your homeDir: global/memory.db (user-scope global store), logs, window-index
+$DSH_HOME/storages/meow-memory*           # install-id, prompt overrides, memory_home switch pointer
 ```
 
 ### After upgrading from upstream 0.31 my memories don't work / the store is "not trusted"
@@ -47,6 +47,8 @@ The old `memory.db` has no `.owner.json` marker, so this fork classifies it as *
 
 - set `security.trustWorkspaceMemory: true` in the profile config and reload the plugin (only after confirming the store is yours); or
 - delete/rename the old store and start fresh (back it up first — deletion is irreversible).
+
+> **0.33 upgrade note**: once the workspace store is trusted, the first session **migrates existing soul/user/global rules into the user-scope global store** (workspace originals are archived, recoverable). If the global store itself is absent/untrusted, the plugin automatically falls back to 0.32 single-workspace behaviour (no error); there is no `trustWorkspaceMemory` override for the global store, and a global dir copied from another machine is foreign.
 
 ---
 
@@ -103,7 +105,7 @@ Type `/dream` in the composer (same as the `memory_dream` tool; **not** subject 
 Most likely causes:
 
 1. **`promptLang` not set explicitly** — it shapes the entry language and keywords are extracted per entry language. The value is matched verbatim against a subdirectory name; a typo silently falls back to Chinese.
-2. **Hits match keywords, not full text** — fix keywords with `memory_update`, or find the entry with `memory_list` and rewrite it. Since 0.32 `minScore` (default 0.35) filters weak hits; raise it for a quieter chain, lower for more recall.
+2. **Hits match keywords, not full text** — fix keywords with `memory_update`, or find the entry with `memory_list` and rewrite it. Since 0.32 `minScore` (default 0.35) filters weak hits; raise it for a quieter chain, lower for more recall. 0.33's fuzzy floor rescues lexical variants/inflections/word boundaries (not paraphrases).
 3. **`hit_count` feedback needs time** — since 0.32 hit counts participate in ranking, but they cannot make an entry precise on their own.
 4. **`pt-br` has no Portuguese stemming/stopwords**, so Portuguese recall is weaker than English (known limitation).
 
@@ -133,6 +135,8 @@ If the workspace already contains a `.dsh-meow/memory.db` that this plugin did n
 
 A valid marker requires: `schema=1`, `installId` equal to this machine's random install id, and `workspace` matching the current path. If the store is yours: set `security.trustWorkspaceMemory: true` and reload, or delete/rename the file and rebuild.
 
+> **0.33 global store**: `<homeDir>/global/memory.db` has the same trust gate (`.owner.json`, `workspace: ''`). A foreign global store does not error; the plugin **falls back to 0.32 single-workspace behaviour** (soul/user/global rules go to the workspace store). It has no `trustWorkspaceMemory` override.
+
 ### Is my old `PROJECT.md` migrated automatically?
 
 **Not since 0.32** (`autoMigrate` defaults to `false`). Enable it explicitly and only for a workspace you trust.
@@ -141,13 +145,18 @@ A valid marker requires: `schema=1`, `installId` equal to this machine's random 
 
 Since 0.32 it is query-only by default (`security.allowHomeSwitch: false`): the tool is model-callable and the directory is also the prompt-override root, so the model must not be able to move it (#64-2). Enable it explicitly in the config if you need switching.
 
-### Where does the data live?
+### Where does the data live (two layers)? Will a new workspace remember me?
 
-- Workspace: `<workspace>/<projectDir>/memory.db` (`projectDir` default `.dsh-meow`)
+Since 0.33 storage is two-layer:
+
+- **User-scope global store**: `<homeDir>/global/memory.db` (default `~/.dsh-meow/global/memory.db`), holding `soul` / `user` / global `rules` — **shared across workspaces**; these survive switching workspaces.
+- **Workspace store**: `<workspace>/<projectDir>/memory.db` (`projectDir` default `.dsh-meow`), holding `project` / `fact` / `lesson` / `topic` / project rules — a new workspace starts with fresh project memory.
 - Session bookkeeping: `<workspace>/.dsh-meow/sessions/<id>.json`
-- Trust marker: `<workspace>/.dsh-meow/.owner.json`
-- Instance-level global directory (logs / window index / migrate state): default `~/.dsh-meow` (**outside `DSH_HOME`**), or `homeDir` / `MEOW_MEMORY_HOME`
-- Prompt instance overrides: `$DSH_HOME/storages/meow-memory/prompts/<lang>/<slot>.md` (fixed; does not follow `homeDir`/`memory_home` switches)
+- Trust markers: `.owner.json` in each store directory (global store uses `workspace: ''`).
+- Instance-level global directory (global store, logs / window index / migrate state): default `~/.dsh-meow` (**outside `DSH_HOME`**), or `homeDir` / `MEOW_MEMORY_HOME`; `homeDir`/`memory_home` switches move the global store too.
+- Prompt instance overrides: `$DSH_HOME/storages/meow-memory/prompts/<lang>/<slot>.md` (fixed; does not follow `homeDir`/`memory_home` switches).
+
+> On first upgrade to 0.33, the first trusted session per workspace **migrates old workspace soul/user/global rules into the global store and archives the workspace originals** (recoverable); `backup.enabled` backs up the workspace store only, not the global store.
 
 ---
 
