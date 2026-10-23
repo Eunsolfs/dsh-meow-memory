@@ -14,7 +14,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { dshHomeDir } from './home-dir.js'
@@ -295,16 +295,28 @@ function readOwnerMarker(projectDir: string): OwnerMarker | null {
   }
 }
 
+/** 工作区路径归一（review Q2）：先 realpath（解 junction/映射盘/subst 别名），再统一
+ *  斜杠/大小写——否则同一目录换个入口就把本机合法标记判成 foreign（静默锁死）。 */
+function normalizeStorePath(p: string): string {
+  let real = p
+  try {
+    real = realpathSync.native(p)
+  } catch {
+    /* 路径不存在/无权限：用原样字符串比较 */
+  }
+  return real.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+}
+
 /** 标记是否可信：schema=1 **且 installId 等于本机随机安装 id**；install-id 未落盘
  *  （persisted=false）时无法跨进程校验 → fail-closed。另校验 workspace 归属：把别的
- *  路径的标记连库一起搬过来（或仓库自带他机标记）都会被拒。 */
+ *  路径的标记连库一起搬过来（或仓库自带他机标记）都会被拒；路径经 realpath 归一，
+ *  同一目录的 junction/映射盘入口不会误锁。 */
 function markerTrusts(marker: OwnerMarker, workspace: string): boolean {
   if (typeof marker.installId !== 'string' || marker.installId.length === 0) return false
   const me = installId()
   if (!me.persisted || marker.installId !== me.id) return false
   if (typeof marker.workspace === 'string' && marker.workspace.length > 0) {
-    const norm = (p: string): string => p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
-    if (norm(marker.workspace) !== norm(workspace)) return false
+    if (normalizeStorePath(marker.workspace) !== normalizeStorePath(workspace)) return false
   }
   return true
 }
@@ -314,7 +326,7 @@ function writeOwnerMarker(projectDir: string, workspace: string): boolean {
   try {
     const me = installId()
     mkdirSync(projectDir, { recursive: true })
-    const payload = { schema: OWNER_SCHEMA, installId: me.id, workspace, createdAt: Date.now() }
+    const payload = { schema: OWNER_SCHEMA, installId: me.id, workspace: normalizeStorePath(workspace), createdAt: Date.now() }
     writeFileSync(join(projectDir, OWNER_MARKER_FILE), JSON.stringify(payload, null, 1) + '\n', {
       encoding: 'utf8',
       mode: 0o600,

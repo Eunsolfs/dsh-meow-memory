@@ -78,11 +78,13 @@ Or per window: session row "…" menu → **Memory participation** → turn off 
 | **No live agent** | Since 0.32 automatic dream never `agents.resume()`s a bare agent (#49) |
 | Context too large | Estimated context > `budget.dreamMaxContextTokens` (default 40000) |
 | Already dreamt today | `budget.dreamMaxPerWindowPerDay` default 1 |
+| **Process-wide quota used up** | `budget.dreamMaxPerDayTotal` default 12/day (process-scoped rolling 24h, reset on restart); `0` = automatic dream off |
+| Context grew mid-dream | Later rounds re-estimate and finish early above `dreamMaxContextTokens` (entries stay unsealed; can be re-dreamed later) |
 | Window marked skipped | Restore from the session row "…" menu |
 | Too old / archived | No live agent and >24h old, or archived sessions, are skipped |
 | Last message older than last dream | Only windows whose last message is newer than the last dream are consolidated |
 
-Reflection additionally has `budget.reflectMinIntervalMinutes` (default 20) and `budget.reflectMaxPerDay` (default 6). With `security.debugLogs: true` the skip reason is logged.
+Reflection additionally has `budget.reflectMinIntervalMinutes` (default 20), `budget.reflectMaxPerDay` (default 6/window/day) and the process-wide `budget.reflectMaxPerDayTotal` (default 24/day, reset on restart). With `security.debugLogs: true` the skip reason is logged.
 
 ### How do I consolidate right now?
 

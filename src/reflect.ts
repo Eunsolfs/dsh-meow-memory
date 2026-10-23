@@ -27,6 +27,21 @@ import { PLUGIN_SOURCE, isMeowSource } from './source.js'
 
 export const REFLECT_DEFAULT_MAX_PER_DAY = 6
 export const REFLECT_DEFAULT_MIN_INTERVAL_MINUTES = 20
+/** 进程级全局每日自动反思上限默认值（review Q3）。 */
+export const REFLECT_DEFAULT_MAX_PER_DAY_TOTAL = 24
+
+/** 进程级自动反思时间戳（滚动 24h；重启清零，文档已说明）。 */
+let globalReflects: number[] = []
+
+/** 测试用：清空进程级反思计数。 */
+export function resetGlobalReflectCounter(): void {
+  globalReflects = []
+}
+
+function globalReflectsInWindow(now: number): number {
+  globalReflects = globalReflects.filter((t) => now - t < 24 * 3600_000)
+  return globalReflects.length
+}
 /** 反思计数/时间戳的 dream_meta 键前缀（每 workspace 库、每 session 一条）。 */
 const REFLECT_STAT_META_PREFIX = 'reflectstat:'
 
@@ -132,6 +147,15 @@ export function checkReflectBudget(input: {
   }
   const limit = budgetNumber(cfg?.budget?.dreamMaxContextTokens)
   const maxTokens = limit !== undefined && limit > 0 ? limit : DREAM_DEFAULT_MAX_CONTEXT_TOKENS
+  // 0.32 review Q3：进程级全局上限（N 个会话不再 = N 倍自动反思）。
+  const maxTotal = budgetNumber(cfg?.budget?.reflectMaxPerDayTotal) ?? REFLECT_DEFAULT_MAX_PER_DAY_TOTAL
+  if (maxTotal <= 0 || globalReflectsInWindow(now) >= maxTotal) {
+    return {
+      allowed: false,
+      reason: 'daily-cap',
+      message: `reflect skipped: 进程级今日自动反思已达上限 budget.reflectMaxPerDayTotal=${maxTotal}`,
+    }
+  }
   const estimate = estimateContextTokens(input.events)
   if (estimate.tokens > maxTokens) {
     return {
@@ -149,6 +173,7 @@ export function checkReflectBudget(input: {
  *（否则失败会白占频次额度）。异常吞掉：统计失败绝不阻塞反思链路。
  */
 export function recordReflectSent(workspace: string, sessionId: string, dir = '.dsh-meow', now = Date.now()): void {
+  globalReflects.push(now)
   try {
     const db = getDb(workspace, dir)
     const prev = readReflectStat(db, sessionId)

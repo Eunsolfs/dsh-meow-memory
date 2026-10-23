@@ -1,6 +1,32 @@
 # Changelog
 
-本文件从上游 `Phant0Meow/dsh-meow-memory` v0.31.1 接续。**0.32.0 起为本仓库（hardened fork）的版本**，与上游无隶属关系；上游变更历史见 <https://github.com/Phant0Meow/dsh-meow-memory/blob/main/CHANGELOG.md>。
+本文件从上游 `Phant0Meow/dsh-meow-memory` v0.31.1 接续。**0.32.0 起为本仓库（hardened fork）的版本，当前 0.32.1**，与上游无隶属关系；上游变更历史见 <https://github.com/Phant0Meow/dsh-meow-memory/blob/main/CHANGELOG.md>。
+
+## v0.32.1 (2026-10-23) — 审计后第二轮修复
+
+第二轮独立审计后的修复；代码从本版起冻结。0.32.0 的完整内容保留在下方。
+
+### 安全
+
+- **HTTP 数据路由接入信任闸**：`GET /meow-memory/dreamed-sessions`、`GET/POST /meow-memory/skip-dreams` 不再打开 untrusted / 尚未判定 trust 的工作区库；POST 对 untrusted 工作区返回 **403**（不暴露记忆内容；鉴权闸不变）。
+- **标记 `workspace` 比较 realpath 归一**：同一目录经 junction / 映射盘 / subst 别名打开不再被误判 foreign（修掉"换个入口就 fail-closed 锁死"）；realpath 解析不了的别名仍 fail-closed（尽力而为）。
+- **信任闸覆盖扩展**：会话窗口活动跟踪与启动期 window-index 恢复不再为记账去打开/升级 untrusted 库（此前可能在陌生库上建 schema/索引）。
+- `.dsh-meow/.gitignore` 写入器在已有文件缺少 `*` 行时追加一行 `*`（防 `!*` 类重新包含规则把 `memory.db` 提交进 git）。
+
+### 成本
+
+- 新增**进程级全局每日上限**：`budget.dreamMaxPerDayTotal`（默认 **12**；`0` = 关闭自动 dream）与 `budget.reflectMaxPerDayTotal`（默认 **24**；`0` = 关闭自动反思）——N 个窗口不再等于 N 倍自动花费。计数为**进程生命周期内滚动 24h，重启/热重载清零**；每窗口 `dreamMaxPerWindowPerDay` / `reflectMaxPerDay` 仍独立生效。
+- **dream 后续轮次重新估算上下文**：增长后超过 `budget.dreamMaxContextTokens` 则提前收尾（条目不封存，之后可再 dream），不再烧掉剩余轮次。
+- dream 第 1/2 轮清单改为按 **`updated_at` 最新**取（不再按 `created_at`），近期更新过的老条目不会被 60 条上限饿死。
+
+### 测试
+
+- 全量 `npm test` 通过：**1032 条断言全绿**（host 672 + client 360），0 失败；其中 `tests/hardening.mjs` **96 条**。`node smoke.mjs` 另行 29 条通过；`check-lang` en/pt-br 两个语言包通过。第二轮审计后的完整跑通。
+
+### 已知限制
+
+- 进程级全局上限计数是**进程级**的（滚动 24h，重启清零）——不是跨进程/持久配额。
+- 设置页仍未暴露 0.32 新增的 `security` / `budget` / `retrieval` 配置字段，需手编 profile patch（`cordis.patch.yml`）。
 
 ## v0.32.0 (2026-10-23) — 加固 fork
 
@@ -77,12 +103,12 @@
   - 三语 dream 文案新增**归档纪律**：设 `status=archived` 必须能指出具体依据，禁止无证据归档；
   - `tools.md` 三语键集同步（新增 `memory_list.*` / `memory_forget.*`，更新 `memory_home`）；`node scripts/check-lang.mjs en` 与 `pt-br` 均通过。
 - `src/prompts/README.md`：槽位 9 → 10（新增 `untrusted-store`），注明新增槽位需同步 `src/prompt-loader.ts` 的 `SLOTS` / `SLOT_PARAMS`。
-- 独立审计后第二轮修正（1028 断言时点）：删除"手动 dream 仍受上下文检查"的错误表述（手动不吃自动成本闸）；静态税按实测改为 ≈6.7k（zh）/ ≈6.3k（en）；补 `memory_project` 输出上限；补上游 0.31 升级的信任陷阱（旧库无 `.owner.json` → 默认 untrusted，需 `security.trustWorkspaceMemory: true` 或删库重建）；`minScore` 澄清为只过滤相关性。
-- **外部审计后的收尾安全加固（1028 断言时点）文档同步**：信任模型按新行为重写（仅缺失库自动创建、已存在空库也 untrusted、installId 随机 UUID + workspace 绑定、untrusted 库不打开且 dream/反思拒绝、`.gitignore` 追加 `*`）；诊断日志口径改为"perf/settings 受闸 + dream-debug 默认最小日志并轮转 + error-only 日志"；上下文估算补充 CJK 感知；升级陷阱补充"空旧库也算已存在"。
+- 独立审计后第二轮修正（v0.32.0 时点）：删除"手动 dream 仍受上下文检查"的错误表述（手动不吃自动成本闸）；静态税按实测改为 ≈6.7k（zh）/ ≈6.3k（en）；补 `memory_project` 输出上限；补上游 0.31 升级的信任陷阱（旧库无 `.owner.json` → 默认 untrusted，需 `security.trustWorkspaceMemory: true` 或删库重建）；`minScore` 澄清为只过滤相关性。
+- **外部审计后的收尾安全加固（v0.32.0 时点）文档同步**：信任模型按新行为重写（仅缺失库自动创建、已存在空库也 untrusted、installId 随机 UUID + workspace 绑定、untrusted 库不打开且 dream/反思拒绝、`.gitignore` 追加 `*`）；诊断日志口径改为"perf/settings 受闸 + dream-debug 默认最小日志并轮转 + error-only 日志"；上下文估算补充 CJK 感知；升级陷阱补充"空旧库也算已存在"。
 
 ### 测试
 
-- 全量 `npm test` 通过：**1028 条断言全绿**（host 668 + client 360），0 失败；其中新增 `tests/hardening.mjs` 92 条。`node smoke.mjs` 另行 29 条通过；`scripts/check-lang.mjs` 校验 en/pt-br 两个语言包（11 槽位对齐）通过。
+- 全量 `npm test` 通过：**1028 条断言**（v0.32.0 发布时点：host 668 + client 360），0 失败；其中 `tests/hardening.mjs` 92 条。`node smoke.mjs` 另行 29 条通过；`scripts/check-lang.mjs` 校验 en/pt-br 两个语言包（11 槽位对齐）通过。（v0.32.1 为 1032，见上。）
 - 既有测试按新不变量重写/收紧（T5）：自动 dream **不得** `agents.resume()`（no-resume）、上下文/频次上限、archived 排除、注入字符预算、untrusted 库读写拒绝、`memory_home` 默认只读、`memory_list` / `memory_forget` 语义、覆盖率/半衰/阈值口径；CHANGELOG 旧断言不再代表 0.32 行为。
 - 新增 `tests/hardening.mjs`（T5）：信任闸、预算上限、指数半衰/覆盖率/阈值、`memory_list` / `memory_forget`、`memory_home` 只读闸、无 live agent 不 dream、反思频次上限。
 

@@ -3,12 +3,12 @@
 | [中文](README.md) | [English](README.en.md) | [Português (BR)](README.pt-br.md) | [MIT License](LICENSE) |
 | :---: | :---: | :---: | :---: |
 
-> **What this is**: a personal hardening fork of `Phant0Meow/dsh-meow-memory` **v0.31.1** (this repository, version **0.32.0**, branch `hardening`).
+> **What this is**: a personal hardening fork of `Phant0Meow/dsh-meow-memory` **v0.31.1** (this repository, version **0.32.1**, branch `hardening`).
 > Upstream is MIT-licensed: <https://github.com/Phant0Meow/dsh-meow-memory>. This fork is **not affiliated with upstream**, does not publish on upstream's behalf, and does not represent upstream's views. All changes and remaining issues are in [CHANGELOG.md](CHANGELOG.md).
 
 Cross-session memory for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): seven-layer SQLite memory, first-turn snapshot injection, per-message keyword hits, and automatic consolidation **with budget caps**.
 
-Version **0.32.0** ｜ Changelog: [CHANGELOG.md](CHANGELOG.md) ｜ Verified host: **DSH Desktop 0.2.1-rc.2** (see [Compatibility](#compatibility))
+Version **0.32.1** ｜ Changelog: [CHANGELOG.md](CHANGELOG.md) ｜ Verified host: **DSH Desktop 0.2.1-rc.2** (see [Compatibility](#compatibility))
 
 **Honesty note**: this README only claims behaviour that exists in the code. 0.32 removed several inflated upstream claims ("automatic dedupe/merge", "Ebbinghaus forgetting curve", per-message "BM25", "supports dsh 0.1.5") and states the real boundary at each point.
 
@@ -24,8 +24,8 @@ This is the plugin's most under-estimated cost. **With default settings it issue
 | **First-turn snapshot**: soul / user / global rules / memory guide | Once, before the first real user message of each session | `budget.snapshotMaxChars` default **6000 chars** (≈2.7k tokens zh) |
 | **Per-message keyword hits** | From the second message on, when keywords match | `hitTopK` default 2 × `budget.hitMaxChars` default **1500 chars/entry** (≈1.4k tokens/message worst case) |
 | **Post-compaction re-injection** | The turn after a session compaction | `budget.reinjectMaxChars` default **8000 chars** (≈3.6k tokens) |
-| **Automatic dream** | Window idle ≥ `dream.idleMinutes` (default 180), off-peak, **window has a live agent**, estimated context ≤ `budget.dreamMaxContextTokens` (default 40000) | Up to **3 full-context rounds**; `budget.dreamMaxPerWindowPerDay` default **1 per window/day**. A 30k-token session costs ≈90k input tokens per dream; the session history permanently gains ≈8–15k durable tokens |
-| **Reflection** | After a task with ≥ `reflectTurns` (default 7) consecutive tool steps | **1 full-context request**; `budget.reflectMaxPerDay` default 6/day/window (session), `budget.reflectMinIntervalMinutes` default 20; skipped when context exceeds `dreamMaxContextTokens` |
+| **Automatic dream** | Window idle ≥ `dream.idleMinutes` (default 180), off-peak, **window has a live agent**, estimated context ≤ `budget.dreamMaxContextTokens` (default 40000) | Up to **3 full-context rounds** (later rounds re-estimate and finish early if oversized); `budget.dreamMaxPerWindowPerDay` default **1 per window/day**, plus a **process-wide** `budget.dreamMaxPerDayTotal` default **12/day** (N windows no longer mean N× spend; counters roll 24h per process lifetime, reset on restart). A 30k-token session costs ≈90k input tokens per dream; the session history permanently gains ≈8–15k durable tokens |
+| **Reflection** | After a task with ≥ `reflectTurns` (default 7) consecutive tool steps | **1 full-context request**; `budget.reflectMaxPerDay` default 6/day/window (session), `budget.reflectMinIntervalMinutes` default 20, plus a **process-wide** `budget.reflectMaxPerDayTotal` default **24/day** (rolling 24h, reset on restart); skipped when context exceeds `dreamMaxContextTokens` |
 
 **How to stop the automatic spend** (manual tools keep working):
 
@@ -68,6 +68,7 @@ Workspaces are often `git clone`d repositories — someone can drop a `.dsh-meow
 0.32 rules:
 
 - the plugin trusts only stores **it created**, or those carrying a valid `.owner.json` marker. The marker must satisfy all of: `schema=1`; `installId` equal to this machine's **random install id** (persisted at `$DSH_HOME/storages/meow-memory/install-id`, not a machine fingerprint); and a recorded `workspace` matching the current workspace. Forged markers, other-machine markers and markers moved to another workspace path are rejected; if the install id cannot be persisted, marker verification is **fail-closed**;
+- `workspace` paths are compared after **realpath normalisation**: opening the same store through a junction / mapped drive / subst alias is no longer misjudged as foreign (fixes the "lockout after entering via another path" bug); aliases that realpath cannot resolve still fail closed (best-effort);
 - **only when the `memory.db` file does not exist at all** is it created and trusted. **Any pre-existing `memory.db` — even a schema-only / row-empty one — is untrusted by default** (closes the "pre-seeded empty DB + SQLite triggers" poisoning path);
 - an untrusted store is **never opened by normal chat turns**: no schema upgrade, no index creation, no migration, no read — only one read-only trust probe touches the file. Its content is not injected, and **all memory tools (read and write), dream and reflection are refused**; a one-time notice explains how to trust it (`security.trustWorkspaceMemory: true`);
 - until you explicitly trust it or delete/rename it. Only enable trust for a store you know is yours;
@@ -87,6 +88,8 @@ Since 0.32:
 
 - The plugin makes **no outbound network requests** (no telemetry, no egress). Dream/reflection model requests go through the host's existing agent turns, not the plugin itself.
 - The 3 client-side local routes (`/meow-memory/dreamed-sessions` etc.) go through the host `connection.requestRejection` auth gate since 0.31.1: cross-site requests get 401/403; 503 when the auth service is missing.
+- **Data routes also go through the trust gate (0.32.1)**: `GET /meow-memory/dreamed-sessions` and `GET/POST /meow-memory/skip-dreams` do not open untrusted / not-yet-judged workspace stores; POST returns **403** for an untrusted workspace (no memory content exposed; auth unchanged).
+- The trust gate also covers **window activity tracking and startup window-index restore**: they never open/upgrade an untrusted store just to record window bookkeeping; only the read-only trust probe and the injection chain's own judgment touch it.
 - `security.debugLogs` defaults to `false`: `perf.log` and settings/configEditor diagnostic dumps are not written by default (enable `security.debugLogs: true` or `MEOW_MEMORY_DEBUG=1` when troubleshooting). `dream-debug.log` **is still written by default**, but only minimal info (session ids / counts / skip reasons, no memory text), with 48h cleanup and 5MB rotation at startup; `apply-error.log` / `settings-register-error.log` are error-only. **Do not read this as "zero logs by default".**
 
 ### Uninstalling leaves data behind (clean up manually)
@@ -141,7 +144,7 @@ $DSH_HOME/storages/meow-memory/prompts/     # prompt instance overrides (if you 
 
 2. Either:
    - **local directory**: GUI **Plugins → Add plugin**, enter the **absolute path** of this repository (the plugin manager accepts absolute local paths);
-   - **tarball**: `npm pack` produces `meow-memory-0.32.0.tgz`; enter the absolute path of that `.tgz`.
+   - **tarball**: `npm pack` produces `meow-memory-0.32.1.tgz`; enter the absolute path of that `.tgz`.
 3. Restart `dsh web` (or hot-reload the plugin). New sessions load it automatically.
 
 > Local `file:`/`link:` installs do not run `prepare`, so **build first**; a tarball already contains `lib/`.
@@ -229,8 +232,10 @@ All fields are optional. **The new 0.32 `security` / `budget` / `retrieval` grou
       hitMaxChars: 1500             # per keyword-hit entry cap (chars)
       reinjectMaxChars: 8000        # post-compaction re-injection cap (chars)
       dreamMaxContextTokens: 40000  # skip automatic dream/reflection above this context estimate
-      dreamMaxPerWindowPerDay: 1    # automatic dream frequency cap
-      reflectMaxPerDay: 6           # daily reflection cap
+      dreamMaxPerWindowPerDay: 1    # automatic dream frequency cap (per window/day)
+      dreamMaxPerDayTotal: 12       # process-wide automatic dream cap/day (rolling 24h; resets on restart; 0 = off)
+      reflectMaxPerDay: 6           # daily reflection cap (per window)
+      reflectMaxPerDayTotal: 24     # process-wide automatic reflection cap/day (rolling 24h; resets on restart)
       reflectMinIntervalMinutes: 20 # minimum interval between reflections
     retrieval:
       halfLifeDays: 30              # exponential half-life (days)
@@ -297,7 +302,7 @@ npm run test           # build + language-pack check + full assertions (host + c
 node scripts/check-lang.mjs en       # check one prompt language pack
 ```
 
-Test assertions: `npm test` **1028 all green** (host 668 + client 360), 0 failed; plus 29 in `node smoke.mjs`; `scripts/check-lang.mjs` validates the en/pt-br packs (11 slots aligned).
+Test assertions: `npm test` **1032 all green** (host 672 + client 360), 0 failed; plus 29 in `node smoke.mjs`; `scripts/check-lang.mjs` validates the en/pt-br packs (11 slots aligned).
 
 The `@deepseek-ai/*` packages live in the dsh-meow pnpm workspace, not in this package's `node_modules`. On Windows, `npm run link-workspace` creates junction mirrors so esbuild can resolve them (build-time only).
 

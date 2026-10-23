@@ -92,8 +92,12 @@ export function dreamLogPath(): string {
 export interface DreamBudget {
   dreamMaxContextTokens?: number
   dreamMaxPerWindowPerDay?: number
+  /** 进程级全局每日自动 dream 上限（review Q3；N 个窗口不再 = N 倍）。 */
+  dreamMaxPerDayTotal?: number
   reflectMaxPerDay?: number
   reflectMinIntervalMinutes?: number
+  /** 进程级全局每日自动反思上限。 */
+  reflectMaxPerDayTotal?: number
 }
 
 export const DREAM_DEFAULT_MAX_CONTEXT_TOKENS = 40_000
@@ -251,8 +255,27 @@ export function autoDreamStartsInWindow(db: ReturnType<typeof getDb>, sessionId:
   }
 }
 
+/** 0.32 review Q3：进程级自动 dream 启动时间戳（滚动 24h；重启清零，文档已说明）。 */
+let globalAutoDreamStarts: number[] = []
+
+/** 进程级全局自动 dream 上限（默认 12/天；0 = 关闭自动 dream）。 */
+export function dreamMaxPerDayTotal(cfg: DreamConfig | undefined): number {
+  return budgetNumber(cfg?.budget?.dreamMaxPerDayTotal) ?? 12
+}
+
+function globalDreamStartsInWindow(now: number): number {
+  globalAutoDreamStarts = globalAutoDreamStarts.filter((t) => now - t < 24 * 3600_000)
+  return globalAutoDreamStarts.length
+}
+
+/** 测试/热重载用：清空进程级成本计数。 */
+export function resetGlobalCostCounters(): void {
+  globalAutoDreamStarts = []
+}
+
 /** 记一次自动 dream 启动（dream_meta dreamauto:<sid> → {starts: [...]}）。 */
 export function recordAutoDreamStart(db: ReturnType<typeof getDb>, sessionId: string, now = Date.now()): void {
+  globalAutoDreamStarts.push(now)
   const starts = [...autoDreamStartsInWindow(db, sessionId, now), now]
   try {
     db.setDreamMeta(DREAM_AUTO_META_PREFIX + sessionId, JSON.stringify({ starts }))
@@ -406,7 +429,9 @@ export const DREAM_MAX_ROWS_PER_ROUND = 60
 /** 取最新 N 条（created_at 降序；db.list 已按 level 分组返回，跨 level 必须自己排序）。 */
 function newestRows(rows: MemoryRow[], max = DREAM_MAX_ROWS_PER_ROUND): MemoryRow[] {
   if (rows.length <= max) return rows
-  return [...rows].sort((a, b) => b.created_at - a.created_at).slice(0, max)
+  // review：按"最后更新时间"取最新，而不是创建时间——长期窗口里刚被改过的旧条目
+  // 优先进入整理，避免只整理新条目、旧条目永远轮不到。
+  return [...rows].sort((a, b) => b.updated_at - a.updated_at).slice(0, max)
 }
 
 /** dream 记忆范围（用户拍板 2026-08-19，v0.17.0 扩展）：本窗口建立的 ∪ 本窗口
@@ -723,7 +748,13 @@ export function startWindowDream(ctx: Context, agent: { session?: { header?: { i
  * 多组不分轮——只有第 0 组经 sendMemoryTurn 另起 turn，整个 dream 任务一个
  * turn、一根折叠横条）；steer 失败同旧行为：租约 30min 过期自愈兜底。
  */
-export function advanceDream(agent: unknown, dir = '.dsh-meow', onDreamState?: DreamStateCallback, rulesReviewDays: number = DEFAULT_RULES_REVIEW_DAYS): void {
+export function advanceDream(
+  agent: unknown,
+  dir = '.dsh-meow',
+  onDreamState?: DreamStateCallback,
+  rulesReviewDays: number = DEFAULT_RULES_REVIEW_DAYS,
+  budget?: DreamBudget,
+): void {
   const sessionId = (agent as { session?: { header?: { id?: string } } })?.session?.header?.id
   const ws = (agent as { session?: { header?: { cwd?: string } } })?.session?.header?.cwd
   if (typeof sessionId !== 'string' || typeof ws !== 'string' || ws.length === 0) return
@@ -750,6 +781,19 @@ export function advanceDream(agent: unknown, dir = '.dsh-meow', onDreamState?: D
     : collectDreamRounds(db, sessionId, ws, dir, rulesReviewDays)
   const nextIdx = lease.group_idx + 1
   if (nextIdx < rounds.length) {
+    // 0.32 review Q4：后续轮开跑前复查上下文大小（整理本身会变长）；超限提前收尾，
+    // 不再把剩下的轮次继续喂进去（entry 未封存，下次有活动可重新整理）。
+    const maxTokens = budgetNumber(budget?.dreamMaxContextTokens) ?? DREAM_DEFAULT_MAX_CONTEXT_TOKENS
+    if (estimateContextTokens(agentSessionEvents(agent)).tokens > maxTokens) {
+      try {
+        db.finishDream(sessionId, Date.now())
+      } catch {
+        /* 收尾失败：租约过期自愈兜底 */
+      }
+      dreamLog(`dream early-finish context-oversize session=${shortSessionId(sessionId)} next=${nextIdx}/${rounds.length}`)
+      onDreamState?.(sessionId, 'active')
+      return
+    }
     // CAS 推进：多实例同收 turn-stopping 时只有一个成功，其余跳过
     if (db.advanceDreamLease(sessionId, lease.group_idx, DREAM_LEASE_MS)) {
       armDreamHeartbeat(sessionId, ws, dir) // 热重载后新模块实例没有旧心跳：推进时补挂（幂等）
@@ -1210,6 +1254,12 @@ export function dreamSweepOnce(ctx: Context, cfg: DreamConfig, dir: string, wind
     const gate = evaluateAutoDreamGate(db, sessionId, agent, cfg)
     if (!gate.allowed) {
       logAutoDreamGate(sessionId, gate)
+      continue
+    }
+    // 0.32 review Q3：进程级全局每日上限（N 个窗口不再等于 N 倍自动花费）。
+    const maxTotal = dreamMaxPerDayTotal(cfg)
+    if (maxTotal <= 0 || globalDreamStartsInWindow(Date.now()) >= maxTotal) {
+      dreamLog(`check global-daily-cap sid=${shortSessionId(sessionId)} cap=${maxTotal}`)
       continue
     }
     const started = startWindowDream(ctx, agent as never, workspace, dir, onDreamState, cfg.rulesReviewDays)

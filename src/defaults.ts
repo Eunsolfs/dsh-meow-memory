@@ -47,8 +47,11 @@ export const CONFIG_DEFAULTS = {
     reinjectMaxChars: 8000,
     dreamMaxContextTokens: 40000,
     dreamMaxPerWindowPerDay: 1,
+    /** 0.32 review Q3：进程级全局每日上限（N 个窗口不再 = N 倍自动花费）。 */
+    dreamMaxPerDayTotal: 12,
     reflectMaxPerDay: 6,
     reflectMinIntervalMinutes: 20,
+    reflectMaxPerDayTotal: 24,
   },
   /** 检索/遗忘参数（0.32）：真指数半衰 + 命中反馈 + 查询覆盖率 + 最低分门槛。 */
   retrieval: {

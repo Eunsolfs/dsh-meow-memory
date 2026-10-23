@@ -3,12 +3,12 @@
 | [中文](README.md) | [English](README.en.md) | [Português (BR)](README.pt-br.md) | [MIT License](LICENSE) |
 | :---: | :---: | :---: | :---: |
 
-> **O que é isto**: um fork pessoal de endurecimento do `Phant0Meow/dsh-meow-memory` **v0.31.1** (este repositório, versão **0.32.0**, branch `hardening`).
+> **O que é isto**: um fork pessoal de endurecimento do `Phant0Meow/dsh-meow-memory` **v0.31.1** (este repositório, versão **0.32.1**, branch `hardening`).
 > O upstream é MIT: <https://github.com/Phant0Meow/dsh-meow-memory>. Este fork **não tem vínculo com o upstream**, não publica em nome dele e não representa suas posições. Todas as mudanças e problemas restantes estão no [CHANGELOG.md](CHANGELOG.md).
 
 Memória entre sessões para o [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): memória em sete níveis no SQLite, injeção de snapshot na primeira rodada, acertos por palavra-chave a cada mensagem e consolidação automática **com limites de orçamento**.
 
-Versão **0.32.0** ｜ Histórico: [CHANGELOG.md](CHANGELOG.md) ｜ Host verificado: **DSH Desktop 0.2.1-rc.2** (veja [Compatibilidade](#compatibilidade))
+Versão **0.32.1** ｜ Histórico: [CHANGELOG.md](CHANGELOG.md) ｜ Host verificado: **DSH Desktop 0.2.1-rc.2** (veja [Compatibilidade](#compatibilidade))
 
 **Nota de honestidade**: este README só afirma comportamentos que existem no código. A 0.32 removeu várias alegações infladas do upstream ("deduplicação/merge automáticos", "curva de esquecimento de Ebbinghaus", "BM25" nos acertos por mensagem, "compatível com dsh 0.1.5") e declara o limite real em cada ponto.
 
@@ -24,8 +24,8 @@ Este é o custo mais subestimado do plugin. **Com a configuração padrão ele f
 | **Snapshot da primeira rodada**: soul / user / regras globais / guia de memória | Uma vez, antes da primeira mensagem real de cada sessão | `budget.snapshotMaxChars` padrão **6000 caracteres** (≈2,7k tokens zh) |
 | **Acertos por palavra-chave** | Da segunda mensagem em diante, quando há acerto | `hitTopK` padrão 2 × `budget.hitMaxChars` padrão **1500 caracteres/entrada** (≈1,4k tokens/mensagem no pior caso) |
 | **Reinjeção pós-compactação** | A rodada seguinte a uma compactação | `budget.reinjectMaxChars` padrão **8000 caracteres** (≈3,6k tokens) |
-| **Dream automático** | Janela ociosa ≥ `dream.idleMinutes` (padrão 180), fora do pico, **com live agent**, contexto estimado ≤ `budget.dreamMaxContextTokens` (padrão 40000) | Até **3 rodadas de contexto completo**; `budget.dreamMaxPerWindowPerDay` padrão **1 por janela/dia**. Uma sessão de 30k tokens custa ≈90k input tokens por dream; o histórico ganha ≈8–15k tokens duráveis |
-| **Reflexão** | Depois de uma tarefa com ≥ `reflectTurns` (padrão 7) passos de ferramenta seguidos | **1 requisição de contexto completo**; `budget.reflectMaxPerDay` padrão 6/dia/janela (sessão), `budget.reflectMinIntervalMinutes` padrão 20; pulada quando o contexto excede `dreamMaxContextTokens` |
+| **Dream automático** | Janela ociosa ≥ `dream.idleMinutes` (padrão 180), fora do pico, **com live agent**, contexto estimado ≤ `budget.dreamMaxContextTokens` (padrão 40000) | Até **3 rodadas de contexto completo** (as rodadas seguintes reestimam e encerram cedo se estourar); `budget.dreamMaxPerWindowPerDay` padrão **1 por janela/dia**, mais um limite **de processo** `budget.dreamMaxPerDayTotal` padrão **12/dia** (N janelas não são mais N× gasto; contadores rolam 24h por vida do processo e zeram no restart). Uma sessão de 30k tokens custa ≈90k input tokens por dream; o histórico ganha ≈8–15k tokens duráveis |
+| **Reflexão** | Depois de uma tarefa com ≥ `reflectTurns` (padrão 7) passos de ferramenta seguidos | **1 requisição de contexto completo**; `budget.reflectMaxPerDay` padrão 6/dia/janela (sessão), `budget.reflectMinIntervalMinutes` padrão 20, mais um limite **de processo** `budget.reflectMaxPerDayTotal` padrão **24/dia** (rolagem 24h, zera no restart); pulada quando o contexto excede `dreamMaxContextTokens` |
 
 **Como parar o gasto automático** (as ferramentas manuais continuam funcionando):
 
@@ -68,6 +68,7 @@ Workspaces costumam ser repositórios `git clone` — alguém pode colocar um `.
 Regras da 0.32:
 
 - o plugin confia só em bancos **que ele criou**, ou que têm um marcador `.owner.json` válido. O marcador precisa satisfazer tudo: `schema=1`; `installId` igual ao **id de instalação aleatório** desta máquina (persistido em `$DSH_HOME/storages/meow-memory/install-id`, não é fingerprint de máquina); e `workspace` registrado igual ao workspace atual. Marcadores forjados, de outra máquina ou movidos para outro caminho de workspace são rejeitados; se o install-id não puder ser persistido, a verificação é **fail-closed**;
+- caminhos de `workspace` são comparados após **normalização por realpath**: abrir o mesmo banco por junction / unidade mapeada / alias subst não é mais julgado foreign (corrige o "lockout ao entrar por outro caminho"); aliases que o realpath não resolve continuam fail-closed (melhor esforço);
 - **só quando o arquivo `memory.db` não existe mesmo** ele é criado e confiado. **Qualquer `memory.db` pré-existente — mesmo schema-only / sem linhas — é não confiável por padrão** (fecha o caminho de envenenamento "banco vazio pré-instalado + triggers do SQLite");
 - um banco não confiável **nunca é aberto por rodadas normais de chat**: sem upgrade de schema, sem criação de índices, sem migração, sem leitura — apenas uma sonda readonly toca o arquivo. Seu conteúdo não é injetado, e **todas as ferramentas de memória (leitura e escrita), dream e reflexão são recusados**; um aviso único explica como confiar (`security.trustWorkspaceMemory: true`);
 - até você confiar explicitamente ou apagar/renomear o banco. Só ative a confiança para um banco que você sabe que é seu;
@@ -87,6 +88,8 @@ Desde a 0.32:
 
 - O plugin **não faz requisições de rede de saída** (sem telemetria). As requisições de modelo do dream/reflexão passam pelas rodadas de agent existentes do host, não pelo plugin.
 - As 3 rotas locais do cliente (`/meow-memory/dreamed-sessions` etc.) passam pelo portão de autenticação `connection.requestRejection` desde 0.31.1: requisições cross-site recebem 401/403; 503 quando o serviço de auth falta.
+- **As rotas de dados também passam pelo portão de confiança (0.32.1)**: `GET /meow-memory/dreamed-sessions` e `GET/POST /meow-memory/skip-dreams` não abrem bancos untrusted / ainda não julgados; POST retorna **403** para workspace untrusted (nenhum conteúdo de memória é exposto; auth inalterada).
+- O portão de confiança também cobre **o rastreio de atividade de janelas e a restauração do window-index no boot**: nada abre/atualiza um banco untrusted só para registrar bookkeeping de janela; só a sonda readonly e o julgamento da cadeia de injeção tocam nele.
 - `security.debugLogs` padrão `false`: `perf.log` e dumps de diagnóstico de settings/configEditor não são gravados por padrão (ative `security.debugLogs: true` ou `MEOW_MEMORY_DEBUG=1` ao investigar). `dream-debug.log` **continua sendo gravado por padrão**, mas só com info mínima (ids de sessão / contagens / motivos de skip, sem texto de memória), com limpeza de 48h e rotação em 5MB na inicialização; `apply-error.log` / `settings-register-error.log` são error-only. **Não leia isto como "zero logs por padrão".**
 
 ### Desinstalar deixa dados (limpe manualmente)
@@ -141,7 +144,7 @@ $DSH_HOME/storages/meow-memory/prompts/     # overrides de prompt (se você adic
 
 2. Escolha:
    - **diretório local**: GUI **Plugins → Add plugin**, informe o **caminho absoluto** deste repositório;
-   - **tarball**: `npm pack` gera `meow-memory-0.32.0.tgz`; informe o caminho absoluto do `.tgz`.
+   - **tarball**: `npm pack` gera `meow-memory-0.32.1.tgz`; informe o caminho absoluto do `.tgz`.
 3. Reinicie `dsh web` (ou recarregue o plugin). Novas sessões carregam automaticamente.
 
 > Instalações locais `file:`/`link:` não rodam `prepare`, então **compile primeiro**; um tarball já contém `lib/`.
@@ -229,8 +232,10 @@ Todos os campos são opcionais. **Os novos grupos `security` / `budget` / `retri
       hitMaxChars: 1500             # limite por entrada de acerto (caracteres)
       reinjectMaxChars: 8000        # limite da reinjeção pós-compactação (caracteres)
       dreamMaxContextTokens: 40000  # pular dream/reflexão automáticos acima deste contexto estimado
-      dreamMaxPerWindowPerDay: 1    # frequência máxima de dream automático
-      reflectMaxPerDay: 6           # limite diário de reflexões
+      dreamMaxPerWindowPerDay: 1    # frequência máxima de dream automático (por janela/dia)
+      dreamMaxPerDayTotal: 12       # limite de processo do dream automático/dia (24h rolantes; zera no restart; 0 = off)
+      reflectMaxPerDay: 6           # limite diário de reflexões (por janela)
+      reflectMaxPerDayTotal: 24     # limite de processo de reflexões automáticas/dia (24h rolantes; zera no restart)
       reflectMinIntervalMinutes: 20 # intervalo mínimo entre reflexões
     retrieval:
       halfLifeDays: 30              # meia-vida exponencial (dias)
@@ -297,7 +302,7 @@ npm run test           # build + checagem dos pacotes de idioma + asserções (h
 node scripts/check-lang.mjs en       # checa um pacote de prompt
 ```
 
-Asserções de teste: `npm test` **1028 todas verdes** (host 668 + cliente 360), 0 falhas; mais 29 em `node smoke.mjs`; `scripts/check-lang.mjs` valida os pacotes en/pt-br (11 slots alinhados).
+Asserções de teste: `npm test` **1032 todas verdes** (host 672 + cliente 360), 0 falhas; mais 29 em `node smoke.mjs`; `scripts/check-lang.mjs` valida os pacotes en/pt-br (11 slots alinhados).
 
 Os pacotes `@deepseek-ai/*` ficam no workspace pnpm dsh-meow, não no `node_modules` deste pacote. No Windows, `npm run link-workspace` cria junctions para o esbuild resolver (só em tempo de build).
 

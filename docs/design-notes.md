@@ -66,9 +66,10 @@ Cost: each round is a **full-context request** — ≈90k input tokens for a 30k
 | Gate | Default | Fixes |
 |---|---|---|
 | Window has a **live agent**; never `agents.resume()` | `dream.requireLiveAgent: true` | #49 (resumed bare agent loses 26 host tools) |
-| Estimated context ≤ `budget.dreamMaxContextTokens` | 40000 | prevents oversized dream / bill blow-up |
+| Estimated context ≤ `budget.dreamMaxContextTokens` | 40000 | prevents oversized dream / bill blow-up; **later rounds re-estimate** and finish early if oversized (entries stay unsealed, can be re-dreamed later) |
 | Per window per day ≤ `budget.dreamMaxPerWindowPerDay` | 1 | unbounded frequency |
-| Exclude `archived`; cap each round's list at 60 | fixed | archived rows were re-fed forever and prompts grew monotonically |
+| Process-wide per day ≤ `budget.dreamMaxPerDayTotal` | 12 | N windows no longer mean N× automatic spend (process-scoped rolling 24h, reset on restart) |
+| Exclude `archived`; cap each round's list at 60 (newest `updated_at`) | fixed | archived rows were re-fed forever and prompts grew monotonically; recently-touched old entries are no longer starved |
 | Skip reason logged | — | explainability |
 
 Manual `/dream` / `memory_dream` bypass all of these automatic gates (manual = explicit intent; only the automatic path calls `evaluateAutoDreamGate`): peak/frequency/live-agent/context gates do not apply, and they run up to 3 rounds over the **full session context** (atomic / topic / project summary). If the context is large, run `/compact` first.
@@ -137,7 +138,7 @@ Three gates fix #64-1 / #64-2:
 2. **`memory_home` query-only by default**: the tool is model-callable, and moving the global directory changes where logs / window index / migrate state live — a filesystem side effect the model should not have. Switching now requires `security.allowHomeSwitch: true`.
 3. **Fixed prompt-override directory**: overrides resolve only from `$DSH_HOME/storages/meow-memory/prompts/` (`$DSH_HOME` defaults to `~/.dsh`), which does **not** follow `homeDir` / `memory_home` / `MEOW_MEMORY_HOME`; the old location is no longer read (no fallback).
 
-Also: creating the memory directory writes a self-ignoring `.gitignore` (`*`; if a pre-existing one lacks a `*` line, one is appended to block `!*` re-inclusion) so `git add .` cannot commit plaintext memories. `security.debugLogs` gates `perf.log` and settings/configEditor dumps; `dream-debug.log` is still written by default with minimal info (session ids/counts/skip reasons, no memory text; 48h cleanup, 5MB rotation), and error logs are error-only. Uninstall leaves data on purpose (the plugin must not delete memories for the user). The store is **not encrypted** — plaintext SQLite; disk/backups/sync remain the trust boundary.
+Also: workspace paths are compared after **realpath normalisation** (junction / mapped-drive / subst aliases no longer look foreign; unresolvable aliases still fail closed), and the trust gate covers **HTTP data routes, session window-activity tracking and startup window-index restore** (0.32.1: none of them open/upgrade an untrusted store just for bookkeeping; POST `skip-dreams` returns 403 for untrusted). Creating the memory directory writes a self-ignoring `.gitignore` (`*`; if a pre-existing one lacks a `*` line, one is appended to block `!*` re-inclusion) so `git add .` cannot commit plaintext memories. `security.debugLogs` gates `perf.log` and settings/configEditor dumps; `dream-debug.log` is still written by default with minimal info (session ids/counts/skip reasons, no memory text; 48h cleanup, 5MB rotation), and error logs are error-only. Uninstall leaves data on purpose (the plugin must not delete memories for the user). The store is **not encrypted** — plaintext SQLite; disk/backups/sync remain the trust boundary.
 
 ---
 

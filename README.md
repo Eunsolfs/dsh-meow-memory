@@ -3,12 +3,12 @@
 | [中文](README.md) | [English](README.en.md) | [Português (BR)](README.pt-br.md) | [MIT License](LICENSE) |
 | :---: | :---: | :---: | :---: |
 
-> **这是什么**：`Phant0Meow/dsh-meow-memory` **v0.31.1** 的个人加固 fork（本仓库，版本 **0.32.0**，分支 `hardening`）。
+> **这是什么**：`Phant0Meow/dsh-meow-memory` **v0.31.1** 的个人加固 fork（本仓库，版本 **0.32.1**，分支 `hardening`）。
 > 上游是 MIT 授权，上游仓库：<https://github.com/Phant0Meow/dsh-meow-memory>。本 fork **与上游无隶属关系**，不代上游发布、也不代表上游立场；所有改动与剩余问题见 [CHANGELOG.md](CHANGELOG.md)。
 
 为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）打造的跨会话记忆插件：七层 SQLite 记忆、首轮快照注入、每消息关键词命中，以及**有预算上限**的自动整理。
 
-当前版本 **0.32.0** ｜ 变更见 [CHANGELOG.md](CHANGELOG.md) ｜ 已实测宿主 **DSH Desktop 0.2.1-rc.2**（见[兼容性](#兼容性)）
+当前版本 **0.32.1** ｜ 变更见 [CHANGELOG.md](CHANGELOG.md) ｜ 已实测宿主 **DSH Desktop 0.2.1-rc.2**（见[兼容性](#兼容性)）
 
 **诚实声明**：本 README 只写代码里确实存在的行为。0.32 删掉了上游 README 里若干夸大表述（"自动去重合并"、"艾宾浩斯遗忘曲线"、每消息命中"BM25"、"兼容 dsh 0.1.5"），并在每处注明真实边界。
 
@@ -24,8 +24,8 @@
 | **首轮快照**：soul / user / 全局 rules / 记忆导引 | 每个会话第一条真实用户消息前，一次 | `budget.snapshotMaxChars` 默认 **6000 字符**（≈2.7k tokens 中文） |
 | **每消息关键词命中** | 第二条消息起，命中关键词时 | `hitTopK` 默认 2 条 × `budget.hitMaxChars` 默认 **1500 字符/条**（≈1.4k tokens/消息上限） |
 | **压缩后重注入** | 会话压缩后的下一轮 | `budget.reinjectMaxChars` 默认 **8000 字符**（≈3.6k tokens） |
-| **dream 自动整理** | 窗口空闲 ≥ `dream.idleMinutes`（默认 180 分钟）、非峰时、**该窗口有 live agent**、估算上下文 ≤ `budget.dreamMaxContextTokens`（默认 40000） | 最多 **3 轮全上下文请求**；`budget.dreamMaxPerWindowPerDay` 默认 **1 次/窗口/天**。30k token 的会话一次 dream ≈ 90k input tokens；会话历史永久 +8–15k durable tokens |
-| **反思（reflection）** | 单任务连续 ≥ `reflectTurns`（默认 7）个工具步后，任务结束 | **1 轮全上下文请求**；`budget.reflectMaxPerDay` 默认 6 次/天/窗口（会话），`reflectMinIntervalMinutes` 默认 20 分钟；上下文超 `dreamMaxContextTokens` 时跳过 |
+| **dream 自动整理** | 窗口空闲 ≥ `dream.idleMinutes`（默认 180 分钟）、非峰时、**该窗口有 live agent**、估算上下文 ≤ `budget.dreamMaxContextTokens`（默认 40000） | 最多 **3 轮全上下文请求**（后续轮次会重新估算上下文，超限提前收尾）；`budget.dreamMaxPerWindowPerDay` 默认 **1 次/窗口/天**，另有**进程级全局** `budget.dreamMaxPerDayTotal` 默认 **12 次/天**（N 个窗口不再 = N 倍；计数为进程生命周期滚动 24h，重启清零）。30k token 的会话一次 dream ≈ 90k input tokens；会话历史永久 +8–15k durable tokens |
+| **反思（reflection）** | 单任务连续 ≥ `reflectTurns`（默认 7）个工具步后，任务结束 | **1 轮全上下文请求**；`budget.reflectMaxPerDay` 默认 6 次/天/窗口（会话），`reflectMinIntervalMinutes` 默认 20 分钟，另有**进程级全局** `budget.reflectMaxPerDayTotal` 默认 **24 次/天**（进程滚动 24h，重启清零）；上下文超 `dreamMaxContextTokens` 时跳过 |
 
 **怎么关掉自动花费**（只关自动、手动工具仍可用）：
 
@@ -68,6 +68,7 @@
 0.32 的规则：
 
 - 插件只会信任**自己创建的**库，或带有效 `.owner.json` 标记的库。标记必须同时满足：`schema=1`、`installId` 等于本机**随机安装 id**（持久化在 `$DSH_HOME/storages/meow-memory/install-id`，不是机器指纹）、且记录的 `workspace` 与当前工作区一致。伪造标记、他机标记、被搬到别的工作区的标记一律拒绝；install-id 无法持久化时标记校验 **fail-closed**；
+- `workspace` 路径比较经 **realpath 归一**：通过 junction / 映射盘 / subst 别名打开同一个库不再被误判 foreign（修掉"换个入口就锁死"）；realpath 解析不了的别名仍按 fail-closed 拒绝（尽力而为）；
 - **只有库文件根本不存在时**才自动创建并信任。**任何已存在的 `memory.db`——哪怕是空表/schema-only——都按 untrusted 处理**（防止"预置空库 + SQLite trigger"在写入时投毒）；
 - untrusted 库**不会被正常聊天轮打开**：不升级 schema、不建索引、不迁移、不读；只有一次只读探针会碰文件。它的内容不注入，**所有记忆工具（读和写）、dream 与反思全部拒绝**，会话里提示一次如何信任（`security.trustWorkspaceMemory: true`）；
 - 直到你显式信任、或删除/改名该库。确认库是你自己的再打开；
@@ -87,6 +88,8 @@
 
 - 插件**不主动发起任何网络请求**（无外联、无遥测）。dream/反思的模型请求走 DSH 宿主现有的 agent 轮次，不是插件自己连网。
 - 客户端 3 条本地路由（`/meow-memory/dreamed-sessions` 等）在 0.31.1 起接入宿主 `connection.requestRejection` 鉴权闸：跨站请求 401/403；鉴权服务缺失时保守 503。
+- **数据路由同样过信任闸（0.32.1）**：`GET /meow-memory/dreamed-sessions`、`GET/POST /meow-memory/skip-dreams` 不打开 untrusted / 尚未判定 trust 的工作区库；POST 对 untrusted 工作区返回 **403**（不暴露记忆内容；鉴权不变）。
+- 信任闸覆盖**窗口活动跟踪与启动期 window-index 恢复**：不会为了记窗口账本去打开/升级 untrusted 库；只有只读信任探针与注入链的判定会碰它。
 - `security.debugLogs` 默认 `false`：`perf.log` 与 settings/configEditor 诊断 dump 默认不写（排障时开 `security.debugLogs: true` 或环境变量 `MEOW_MEMORY_DEBUG=1`）。`dream-debug.log` **默认仍写**，但只含会话 id / 计数 / 跳过原因等最小信息（不含记忆正文），启动时清理 48 小时前的日志、超 5MB 轮转；`apply-error.log` / `settings-register-error.log` 只在出错时写。**不要理解为"默认零日志"**。
 
 ### 卸载会留下数据（需手动清）
@@ -141,7 +144,7 @@ $DSH_HOME/storages/meow-memory/prompts/  # prompt 实例覆盖层（若手工加
 
 2. 任选其一：
    - **本地目录**：GUI 左侧 **Plugins → Add plugin**，填**本仓库的绝对路径**（插件管理器接受绝对本地路径）；
-   - **tarball**：`npm pack` 生成 `meow-memory-0.32.0.tgz`，Plugins → Add plugin 填该 `.tgz` 的绝对路径。
+   - **tarball**：`npm pack` 生成 `meow-memory-0.32.1.tgz`，Plugins → Add plugin 填该 `.tgz` 的绝对路径。
 3. 重启 `dsh web`（或热重载插件）。新会话自动加载。
 
 > 本地 `file:`/`link:` 安装不会执行 `prepare`，所以**必须先构建**；tarball 里已含 `lib/`，装上即可用。
@@ -229,8 +232,10 @@ dsh plugin --profile <profile> remove meow-memory
       hitMaxChars: 1500             # 单条关键词命中字符上限
       reinjectMaxChars: 8000        # 压缩后重注入字符上限
       dreamMaxContextTokens: 40000  # 上下文估算超过则跳过自动 dream/反思
-      dreamMaxPerWindowPerDay: 1    # 自动 dream 频次上限
-      reflectMaxPerDay: 6           # 反思每日上限
+      dreamMaxPerWindowPerDay: 1    # 自动 dream 频次上限（每窗口/天）
+      dreamMaxPerDayTotal: 12       # 进程级全局自动 dream 上限/天（滚动 24h；重启清零；0=关闭自动 dream）
+      reflectMaxPerDay: 6           # 反思每日上限（每窗口）
+      reflectMaxPerDayTotal: 24     # 进程级全局自动反思上限/天（滚动 24h；重启清零）
       reflectMinIntervalMinutes: 20 # 两次反思最小间隔
     retrieval:
       halfLifeDays: 30              # 指数半衰半衰期（天）
@@ -296,7 +301,7 @@ npm run test           # build + 语言包自查 + 全量断言（host + client 
 node scripts/check-lang.mjs en       # 只查某个 prompt 语言包
 ```
 
-测试断言数：`npm test` **1028 条全绿**（host 668 + client 360），0 失败；另 `node smoke.mjs` 29 条；`scripts/check-lang.mjs` 校验 en/pt-br 两个语言包（11 槽位对齐）。
+测试断言数：`npm test` **1032 条全绿**（host 672 + client 360），0 失败；另 `node smoke.mjs` 29 条；`scripts/check-lang.mjs` 校验 en/pt-br 两个语言包（11 槽位对齐）。
 
 `@deepseek-ai/*` 包位于 dsh-meow pnpm workspace，不在本包 `node_modules` 里。Windows 上 `npm run link-workspace` 创建 workspace 包的 junction 镜像供 esbuild 解析；仅构建期需要。
 

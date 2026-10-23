@@ -40,7 +40,9 @@ All changes take effect after a **hot reload or restart of the meow-memory plugi
       reinjectMaxChars: 8000
       dreamMaxContextTokens: 40000
       dreamMaxPerWindowPerDay: 1
+      dreamMaxPerDayTotal: 12
       reflectMaxPerDay: 6
+      reflectMaxPerDayTotal: 24
       reflectMinIntervalMinutes: 20
     retrieval:                   # new in 0.32
       halfLifeDays: 30
@@ -102,6 +104,8 @@ All changes take effect after a **hot reload or restart of the meow-memory plugi
 - store exists with a valid `.owner.json`: `schema=1`, `installId` equal to this machine's **random install id** (`$DSH_HOME/storages/meow-memory/install-id`), and `workspace` matching the current workspace → **trusted (marker)**; missing/mismatched `installId`, other-machine markers and markers moved to another path are untrusted; if the install id cannot be persisted, verification is **fail-closed**;
 - **store exists (even schema-only / row-empty) without a valid marker** → `trustWorkspaceMemory` decides `config-trusted` / **foreign**; a foreign store is never opened by normal chat turns (read-only probe only): no upgrade, no index creation, no migration, no read;
 - the marker always lives inside the memory directory, never in the workspace root.
+- `workspace` paths are compared after **realpath normalisation** (opening the same store through a junction / mapped drive / subst alias is no longer misjudged as foreign; aliases that cannot be resolved still fail closed).
+- Trust-gate coverage (0.32.1): HTTP data routes (`GET /meow-memory/dreamed-sessions`, `GET/POST /meow-memory/skip-dreams`; POST returns 403 for untrusted), session window-activity tracking, and startup window-index restore — none of them open/upgrade an untrusted store just for bookkeeping.
 
 > Why untrusted by default: workspaces are often `git clone`d repositories. The old behaviour auto-injected `.dsh-meow/memory.db` / `PROJECT.md` shipped by the repo as "user long-term memory", a persistent prompt-injection channel (#64-1). Confirm the store is yours, then trust it or delete/rebuild it. Since 0.32, calls to an untrusted store are **refused** (not "return empty"), so the model cannot keep using untrusted data as if it were trusted context.
 >
@@ -116,14 +120,18 @@ All changes take effect after a **hot reload or restart of the meow-memory plugi
 | `budget.snapshotMaxChars` | number 500–60000 | `6000` | Character budget for the first-turn long-term snapshot; entries that do not fit are skipped (an ellipsis is appended) |
 | `budget.hitMaxChars` | number 200–20000 | `1500` | Character cap per keyword-hit entry |
 | `budget.reinjectMaxChars` | number 500–60000 | `8000` | Character cap for the post-compaction re-injection |
-| `budget.dreamMaxContextTokens` | number 4000–400000 | `40000` | Estimated session context before **automatic** dream/reflection (**CJK-aware approximation**: Chinese ≈1.7 chars/token, other ≈4); above it the automatic run is **skipped** (manual `/dream` bypasses this gate) |
+| `budget.dreamMaxContextTokens` | number 4000–400000 | `40000` | Estimated session context before **automatic** dream/reflection (**CJK-aware approximation**: Chinese ≈1.7 chars/token, other ≈4); above it the automatic run is **skipped** (manual `/dream` bypasses this gate). Later dream rounds **re-estimate** and finish early if the context has grown (entries stay unsealed and can be re-dreamed later) |
 | `budget.dreamMaxPerWindowPerDay` | number 0–24 | `1` | Automatic dreams per window per day; `0` = never automatic |
+| `budget.dreamMaxPerDayTotal` | number 0–200 | `12` | **Process-wide** automatic dream cap per day (rolling 24h; N windows no longer mean N× spend); `0` = automatic dream off. Counters live for the process lifetime and **reset on restart** |
 | `budget.reflectMaxPerDay` | number 0–100 | `6` | Automatic reflections **per window (session)** per day; `0` = never automatic |
+| `budget.reflectMaxPerDayTotal` | number 0–500 | `24` | **Process-wide** automatic reflection cap per day (rolling 24h, reset on restart); `0` = automatic reflection off |
 | `budget.reflectMinIntervalMinutes` | number 0–1440 | `20` | Minimum interval between automatic reflections (minutes) |
 
 > These are **character** caps, not token caps: zh ≈ chars/2.2, en ≈ chars/4. They bound one injection / one consolidation; daily totals are bounded by the frequency fields.
 >
 > The `memory_project` tool has its own output cap: `max(2000, budget.reinjectMaxChars)` (default **8000 chars**), truncated with `…`. It shares the paragraph builder with post-compaction re-injection, but this cap applies only to the tool output.
+>
+> The two `*MaxPerDayTotal` fields are **process-scoped** counters (rolling 24h): they only last for this process lifetime and **reset on restart/hot reload**. The per-window `dreamMaxPerWindowPerDay` / `reflectMaxPerDay` caps still apply independently. Manual `/dream` / `memory_dream` do not consume automatic quotas.
 
 ---
 
@@ -149,6 +157,7 @@ The per-message hit score is **not BM25**: keyword intersection × IDF × **quer
 | `reflect` | bool | `true` | Automatic reflection after a task |
 | `reflectTurns` | number 1–50 | `7` | Consecutive tool steps needed to trigger at task end |
 | `budget.reflectMaxPerDay` | number | `6` | See budget table; `0` = never automatic |
+| `budget.reflectMaxPerDayTotal` | number | `24` | Process-wide automatic reflection cap/day (rolling 24h, reset on restart); see budget table |
 | `budget.reflectMinIntervalMinutes` | number | `20` | See budget table |
 | `budget.dreamMaxContextTokens` | number | `40000` | Reflection reuses this context-size gate |
 
@@ -167,7 +176,7 @@ The per-message hit score is **not BM25**: keyword intersection × IDF × **quer
 | `dream.rulesReviewDays` | number ≥0 | `2` | Stable rules older than this skip dream round 1; `0` = no filter |
 | `dream.requireLiveAgent` | bool | `true` | Automatic dream only runs for windows with a live agent; it **never** calls `agents.resume()` (#49). Manual `/dream` / `memory_dream` bypass this automatic gate (manual invocation already requires a live window) |
 
-All conditions must hold for an automatic dream: `dream.enabled` → idle ≥ `idleMinutes` → not in a suppression window → a **live agent** exists → estimated context ≤ `budget.dreamMaxContextTokens` → today's count < `budget.dreamMaxPerWindowPerDay`. Every skip reason is logged (`security.debugLogs` for detail).
+All conditions must hold for an automatic dream: `dream.enabled` → idle ≥ `idleMinutes` → not in a suppression window → a **live agent** exists → estimated context ≤ `budget.dreamMaxContextTokens` → today's count < `budget.dreamMaxPerWindowPerDay` → process-wide today's count < `budget.dreamMaxPerDayTotal`. Later rounds re-estimate the context and finish early if oversized (entries stay unsealed, can be re-dreamed later); round 1/2 entry lists are ordered by the newest **`updated_at`** (not `created_at`), so recently-touched old entries are not starved by the 60-row cap. Every skip reason is logged (`security.debugLogs` for detail).
 
 **Manual `/dream` / `memory_dream` bypass these cost gates** (manual = explicit intent; only the automatic path calls `evaluateAutoDreamGate`): they run up to 3 rounds over the **full session context** (atomic / topic / project summary) and are never skipped for being oversized. If the context is large, run `/compact` first.
 

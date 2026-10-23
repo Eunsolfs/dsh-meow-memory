@@ -13,7 +13,7 @@
  * No LLM, no harness. Every mutable path is a temp dir; DSH_HOME/MEOW_MEMORY_HOME are
  * redirected before the plugin module is imported so nothing lands in the real home.
  */
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -30,7 +30,8 @@ const {
   registerMemoryTools, setMemoryToolGate, apply,
   activeHomeDir, setActiveHomeDir,
   evaluateAutoDreamGate, dreamSweepOnce, dreamLogPath, collectDreamRounds, DREAM_MAX_ROWS_PER_ROUND,
-  checkReflectBudget, recordReflectSent, estimateContextTokens,
+  checkReflectBudget, recordReflectSent, estimateContextTokens, dreamMaxPerDayTotal,
+  resetGlobalCostCounters, resetGlobalReflectCounter,
 } = await import('../lib/index.js')
 
 let passed = 0
@@ -89,6 +90,20 @@ const giOf = (ws, dir = '.dsh-meow') => join(ws, dir, '.gitignore')
   writeFileSync(ownerOf(wsForged), JSON.stringify({ schema: 1, installId: 'another-machine-id', workspace: wsForged, createdAt: Date.now() }))
   const tOther = ensureMemoryStore(wsForged, '.dsh-meow', { autoGitignore: true, trustWorkspaceMemory: false })
   check('trust: foreign installId → foreign', tOther.trusted === false && tOther.reason === 'foreign')
+  // ③d 路径别名（junction/映射盘类入口）：realpath 归一下同一库仍可信（review Q2）
+  const wsReal = tmp('mmh-trust-alias-')
+  resetStoreTrustCache()
+  ensureMemoryStore(wsReal, '.dsh-meow', { autoGitignore: false, trustWorkspaceMemory: false })
+  try {
+    const linkDir = tmp('mmh-link-')
+    const alias = join(linkDir, 'alias')
+    symlinkSync(wsReal, alias, 'junction')
+    resetStoreTrustCache()
+    const tAlias = ensureMemoryStore(alias, '.dsh-meow', { autoGitignore: false, trustWorkspaceMemory: false })
+    check('trust: junction path alias stays trusted (realpath-normalized marker)', tAlias.trusted === true, JSON.stringify(tAlias))
+  } catch {
+    check('trust: junction path alias (skipped: junction unavailable)', true)
+  }
   // ④ 非空且无标记 → foreign：不注入、不迁移、不写任何文件、库字节不变
   const wsForeign = tmp('mmh-trust-foreign-')
   resetStoreTrustCache()
@@ -373,6 +388,19 @@ const giOf = (ws, dir = '.dsh-meow') => join(ws, dir, '.gitignore')
   const zeroCfg = { ...cfg, budget: { dreamMaxPerWindowPerDay: 0 } }
   check('dream: dreamMaxPerWindowPerDay=0 disables auto dream', evaluateAutoDreamGate(db, 'winh-zero', lightAgent, zeroCfg).reason === 'cap')
 
+  // ③b 进程级全局每日上限（review Q3）：cap=1，两个 live 窗口只允许启动一个
+  resetGlobalCostCounters()
+  const sidG1 = 'winh-global-1'
+  const sidG2 = 'winh-global-2'
+  addWindow(sidG1); addWindow(sidG2)
+  const gCfg = { ...cfg, budget: { dreamMaxPerDayTotal: 1 } }
+  const gAgent = (id) => ({ session: { header: { id }, events: [{ type: 'user/message', data: { content: [{ type: 'text', text: 'hi' }] } }] }, steer: () => {} })
+  dreamSweepOnce({ get: (n) => (n === 'agents' ? { get: () => gAgent(sidG1) } : undefined) }, gCfg, '.dsh-meow', new Map([[sidG1, ws]]))
+  dreamSweepOnce({ get: (n) => (n === 'agents' ? { get: () => gAgent(sidG2) } : undefined) }, gCfg, '.dsh-meow', new Map([[sidG2, ws]]))
+  check('dream: process-wide daily cap allows only one window', db.getDreamLease(sidG1) !== null && db.getDreamLease(sidG2) === null)
+  check('dream: dreamMaxPerDayTotal defaults/helper sane', dreamMaxPerDayTotal(undefined) > 0 && dreamMaxPerDayTotal({ budget: { dreamMaxPerDayTotal: 0 } }) === 0)
+  resetGlobalCostCounters()
+
   // ④ dream 清单：排除 archived + 每轮上限 60
   const wsR = tmp('mmh-dream-rounds-')
   const dbR = new MemoryDb(memoryDbPath(wsR))
@@ -429,6 +457,13 @@ const giOf = (ws, dir = '.dsh-meow') => join(ws, dir, '.gitignore')
   recordReflectSent(ws, 'r-5', '.dsh-meow', base + 1000)
   const stat = JSON.parse(getDb(ws, '.dsh-meow').getDreamMeta('reflectstat:r-5'))
   check('reflect: recordReflectSent increments same-day count', stat.count === 2 && stat.lastAt === base + 1000, JSON.stringify(stat))
+  // 进程级全局上限（review Q3）：与 per-session 独立
+  resetGlobalReflectCounter()
+  const gCfg = { reflect: true, budget: { reflectMaxPerDayTotal: 1, reflectMinIntervalMinutes: 0, reflectMaxPerDay: 6, dreamMaxContextTokens: 40000 } }
+  recordReflectSent(ws, 'r-global-a', '.dsh-meow', base)
+  const gGlobal = checkReflectBudget({ workspace: ws, sessionId: 'r-global-b', events: [], dir: '.dsh-meow', cfg: gCfg, now: base + 1000 })
+  check('reflect: process-wide daily cap blocks a fresh session', gGlobal.allowed === false && gGlobal.reason === 'daily-cap', JSON.stringify(gGlobal))
+  resetGlobalReflectCounter()
   closeAllDbs()
   clean(ws)
 }

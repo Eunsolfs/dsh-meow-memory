@@ -51,7 +51,11 @@ export type DreamState = 'dreamed' | 'dreaming'
  * @returns { dreamed, dreaming } 两个会话 id 数组（可能包含传入列表之外的 id——
  *   windows 表记录过该工作区所有会话；client 按行实际 id 比对，多余的自动忽略）。
  */
-export function collectDreamStates(sessions: ReadonlyArray<PersistedSessionLike>, dir = '.dsh-meow'): { dreamed: string[]; dreaming: string[] } {
+export function collectDreamStates(
+  sessions: ReadonlyArray<PersistedSessionLike>,
+  dir = '.dsh-meow',
+  isTrusted?: (workspace: string) => boolean,
+): { dreamed: string[]; dreaming: string[] } {
   const dreamed: string[] = []
   const dreaming: string[] = []
   const opened = new Set<string>()
@@ -60,6 +64,8 @@ export function collectDreamStates(sessions: ReadonlyArray<PersistedSessionLike>
     if (typeof cwd !== 'string' || cwd.length === 0 || opened.has(cwd)) continue
     opened.add(cwd)
     if (!existsSync(memoryDbPath(cwd, dir))) continue
+    // 0.32（review Q1）：路由也走信任门——未受信/未判定的工作区库不打开、不升级 schema。
+    if (isTrusted !== undefined && !isTrusted(cwd)) continue
     try {
       const db = getDb(cwd, dir)
       for (const w of db.listWindows()) {

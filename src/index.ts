@@ -273,8 +273,10 @@ const config = z.object({
       reinjectMaxChars: z.number().min(500).max(60000).default(8000),
       dreamMaxContextTokens: z.number().min(4000).max(400000).default(40000),
       dreamMaxPerWindowPerDay: z.number().min(0).max(24).default(1),
+      dreamMaxPerDayTotal: z.number().min(0).max(200).default(12),
       reflectMaxPerDay: z.number().min(0).max(100).default(6),
       reflectMinIntervalMinutes: z.number().min(0).max(1440).default(20),
+      reflectMaxPerDayTotal: z.number().min(0).max(500).default(24),
     })
     .default({}),
   /** 检索/遗忘参数（0.32）：指数半衰、命中反馈、查询覆盖率、最低分门槛。 */
@@ -493,8 +495,10 @@ interface ResolvedConfig {
     reinjectMaxChars: number
     dreamMaxContextTokens: number
     dreamMaxPerWindowPerDay: number
+    dreamMaxPerDayTotal: number
     reflectMaxPerDay: number
     reflectMinIntervalMinutes: number
+    reflectMaxPerDayTotal: number
   }
   /** 检索/遗忘参数（0.32）。 */
   retrieval: {
@@ -562,8 +566,10 @@ function resolveConfig(config: unknown): ResolvedConfig {
       reinjectMaxChars: bud.reinjectMaxChars ?? 8000,
       dreamMaxContextTokens: bud.dreamMaxContextTokens ?? 40000,
       dreamMaxPerWindowPerDay: bud.dreamMaxPerWindowPerDay ?? 1,
+      dreamMaxPerDayTotal: bud.dreamMaxPerDayTotal ?? 12,
       reflectMaxPerDay: bud.reflectMaxPerDay ?? 6,
       reflectMinIntervalMinutes: bud.reflectMinIntervalMinutes ?? 20,
+      reflectMaxPerDayTotal: bud.reflectMaxPerDayTotal ?? 24,
     },
     retrieval: {
       halfLifeDays: ret.halfLifeDays ?? 30,
@@ -1765,7 +1771,9 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
         } catch { /* 释放失败不阻塞（租约 30min 过期自愈兜底） */ }
         return
       }
-      advanceDream(agent, resolved.projectDir, signalDreamState, resolved.dream.rulesReviewDays) // dream 轮：推进下一组或收尾（含孤儿收尾）
+      advanceDream(agent, resolved.projectDir, signalDreamState, resolved.dream.rulesReviewDays, {
+        dreamMaxContextTokens: resolved.budget.dreamMaxContextTokens,
+      }) // dream 轮：推进下一组或收尾（含孤儿收尾/上下文超限提前收尾）
       return
     }
 
@@ -1898,7 +1906,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
                 | { list?: () => Promise<ReadonlyArray<PersistedSessionLike>> }
                 | undefined
               const sessions = typeof sessionPersistence?.list === 'function' ? await sessionPersistence.list() : []
-              const states = collectDreamStates(sessions, resolved.projectDir)
+              const states = collectDreamStates(sessions, resolved.projectDir, (w) => trustOf(w).trusted)
               writeJson(res, 200, { sessionIds: states.dreamed, dreamingIds: states.dreaming })
             } catch (e) {
               writeJson(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) })
@@ -1941,6 +1949,8 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
                 }
                 const ws = await resolveWorkspaceForSession(ctx, sessionId)
                 if (ws === null) return writeJson(res, 404, { ok: false, error: 'unknown session (no workspace)' })
+                // 0.32（review Q1）：未受信工作区库不写（路由也会打开/升级陌生库）。
+                if (!trustOf(ws).trusted) return writeJson(res, 403, { ok: false, error: 'workspace memory store is untrusted' })
                 getDb(ws, resolved.projectDir).setMemoryScopeField(sessionId, field, value)
                 if (field === 'dream') broadcast.broadcast(sessionId, value ? 'skip' : 'unskip') // dream 图标旧通道
                 broadcast.broadcastScope(sessionId, field, value) // 面板/新客户端通道
@@ -1955,6 +1965,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
               const scopes: Array<{ sessionId: string; dream: boolean; inject: boolean; write: boolean }> = []
               for (const w of workspaces) {
                 if (!existsSync(memoryDbPath(w, resolved.projectDir))) continue // 无记忆库不新建（collectDreamStates 同款）
+                if (!trustOf(w).trusted) continue // 0.32（review Q1）：未受信库不打开
                 try {
                   for (const sc of getDb(w, resolved.projectDir).listMemoryScopes()) {
                     scopes.push({ sessionId: sc.session_id, dream: sc.dream, inject: sc.inject, write: sc.write })
@@ -2179,10 +2190,10 @@ export { collectDreamStates, headerOf, type PersistedSessionLike } from './dream
 export { MemoryDb, memoryDbPath, getDb, closeAllDbs, backupMemoryDb, ensureMemoryStore, storeTrustOf, resetStoreTrustCache, type StoreTrust, LEVELS, newId, PROJECT_SUBCATEGORIES, projectList, projectCovers, projectLabel, relativeTime, isGlobalProject, isGlobalScope, globalProjectMarker, GLOBAL_PROJECT_CANON, GLOBAL_PROJECT_CANON_EN } from './db.js'
 export { migrateLegacy } from './migrate.js'
 export { buildHitInjection, buildInjection, buildReinjection, buildProjectSectionText, readSeen, markSearched, markAccessed, readInjected, markInjected, markProjectQueried, readProjectQueried, markWritten, readWritten, markReinjectPending, clearReinjectPending, isReinjectPending, MAX_REINJECT_PROJECTS, MAX_REINJECT_WRITTEN, sessionsFile, getCurrentProject, setCurrentProject, releaseSeen } from './inject.js'
-export { buildReflectMessage, checkReflectBudget, consecutiveToolSteps, recordReflectSent, scanTurn } from './reflect.js'
+export { buildReflectMessage, checkReflectBudget, consecutiveToolSteps, recordReflectSent, resetGlobalReflectCounter, scanTurn } from './reflect.js'
 export { tokenize, stemEn, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
 export { fillTemplate, keyedValue, resolveSlotText, setPromptLang, getPromptLang, DEFAULT_LANG, SLOTS } from './prompt-loader.js'
 export { DEFAULT_HOME_DIR, activeHomeDir, setActiveHomeDir, dshHomeDir, pluginRootDir, homeDirPresets, resolveHomeDir, switchHomeDir, type HomeDirSwitch } from './home-dir.js'
 export { setMemoryToolGate, registerMemoryTools } from './tools.js'
 export { authGate, connectionAuthOf } from './auth-gate.js'
-export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, handleMemoryTurnFailure, dreamSweepTick, dreamCommandDefinition, isSubagentAgent, dreamSweepOnce, estimateContextTokens, evaluateAutoDreamGate, dreamMaxContextTokens, dreamLogPath, DREAM_MAX_ROWS_PER_ROUND, type DreamConfig } from './dream.js'
+export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, handleMemoryTurnFailure, dreamSweepTick, dreamCommandDefinition, isSubagentAgent, dreamSweepOnce, estimateContextTokens, evaluateAutoDreamGate, dreamMaxContextTokens, dreamMaxPerDayTotal, resetGlobalCostCounters, dreamLogPath, DREAM_MAX_ROWS_PER_ROUND, type DreamConfig } from './dream.js'
