@@ -39,6 +39,8 @@ const {
   ISOLATED_DREAM_META_PREFIX, ISOLATED_DEFAULT_TIMEOUT_MINUTES, ISOLATED_DEFAULT_MAX_PROMPT_CHARS,
   CONFIG_DEFAULTS, factoryDefaultOf, abortDream,
   embedTexts, semanticEnabled, semanticWeightOf, cosine, clearEmbeddingCache, setMemorySemanticOptionsForTests,
+  listGlobalMemory, saveGlobalMemory, GLOBAL_EDIT_LEVELS, GLOBAL_STORE_UNTRUSTED_ERROR,
+  globalProjectMarker, readSeen, sessionsFile, isReinjectPending,
 } = await import('../lib/index.js')
 
 let passed = 0
@@ -1604,8 +1606,11 @@ const tick = (ms = 10) => new Promise((r) => setTimeout(r, ms))
 {
   const srcDir = new URL('../src/', import.meta.url)
   const files = readdirSync(srcDir).filter((f) => f.endsWith('.ts'))
-  const hostFiles = files.filter((f) => !f.startsWith('client'))
-  const clientFiles = files.filter((f) => f.startsWith('client'))
+  // settings-page.ts 是浏览器侧 UI（settings.section 组件），不是 host 逻辑；它和
+  // client-*.ts 一样只 fetch 本插件同源路由。
+  const isUiFile = (f) => f.startsWith('client') || f === 'settings-page.ts'
+  const hostFiles = files.filter((f) => !isUiFile(f))
+  const clientFiles = files.filter(isUiFile)
   const reads = (f) => readFileSync(new URL(f, srcDir), 'utf8')
   const hostFetchFiles = hostFiles.filter((f) => /\bfetch\s*\(/.test(reads(f)))
   check('static audit: only src/semantic.ts performs host-side fetch', JSON.stringify(hostFetchFiles) === JSON.stringify(['semantic.ts']), JSON.stringify(hostFetchFiles))
@@ -1615,6 +1620,449 @@ const tick = (ms = 10) => new Promise((r) => setTimeout(r, ms))
   const backfillCallers = files.filter((f) => f !== 'db.ts' && /\blistMissingEmbedding\s*\(/.test(reads(f)))
   console.log(`  [note] listMissingEmbedding callers outside db.ts: ${JSON.stringify(backfillCallers)} (0.35 wires apply-time backfill through semantic.backfillEmbeddings)`)
   check('static audit: embedding backfill is wired (semantic.ts backfillEmbeddings)', backfillCallers.includes('semantic.ts'))
+}
+
+// ═══════════════════ 23. 0.36：global-edit 模块单元（用户级记忆可视化编辑逻辑） ═══════════════════
+{
+  const savedActive = activeHomeDir()
+  const home = tmp('mmh-gm-edit-')
+  closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(home)
+  ensureGlobalStore()
+  const db = getGlobalDb()
+  try {
+    const marker = globalProjectMarker()
+    // 种子：soul / user / user(archived) / 全局 rules / 项目 rules / fact（不可编辑）
+    const soul = db.insert({ level: 'soul', content: 'AI 是喵', updated_at: 100 })
+    const user1 = db.insert({ level: 'user', content: '用户偏好中文', updated_at: 300 })
+    const userArch = db.insert({ level: 'user', content: '归档的用户条目', updated_at: 200 })
+    db.update('user', userArch.id, { status: 'archived' })
+    const ruleGlobal = db.insert({ level: 'rules', content: '全局铁律', project: marker, updated_at: 400 })
+    const ruleProject = db.insert({ level: 'rules', content: '项目规则不该出现', project: 'femo', updated_at: 500 })
+    const factRow = db.insert({ level: 'fact', content: 'fact 不可编辑', project: 'dsh', updated_at: 600 })
+
+    const listed = listGlobalMemory()
+    check('global-edit list: trusted store reports trusted + homePath', listed.trusted === true && listed.homePath === home)
+    check('global-edit list: only soul/user/global-rules entries (no project rules / facts)',
+      listed.entries.some((e) => e.id === soul.id) && listed.entries.some((e) => e.id === user1.id) &&
+      listed.entries.some((e) => e.id === ruleGlobal.id) && !listed.entries.some((e) => e.id === ruleProject.id) &&
+      !listed.entries.some((e) => e.id === factRow.id), JSON.stringify(listed.entries.map((e) => [e.level, e.id])))
+    check('global-edit list: grouping soul → user → rules and newest-first inside a level',
+      listed.entries.map((e) => e.level).join(',') === 'soul,user,user,rules' &&
+      listed.entries.filter((e) => e.level === 'user').map((e) => e.id).join(',') === `${userArch.id},${user1.id}`,
+      JSON.stringify(listed.entries.map((e) => [e.level, e.updated_at])))
+    check('global-edit list: entries expose the global marker', listed.entries.every((e) => e.project === marker))
+
+    // create：默认值 + 来源标记 + 派生关键词
+    const created = saveGlobalMemory({ action: 'create', level: 'user', content: '新用户偏好：喜欢简短回答' })
+    check('global-edit create: defaults (importance 2, active, global marker)', created.ok === true && created.entry.importance === 2 &&
+      created.entry.status === 'active' && created.entry.project === marker)
+    check('global-edit create: keywords derived from content when omitted', created.ok && created.entry.keywords.length >= 1 && created.entry.keywords.length <= 10, JSON.stringify(created.entry?.keywords))
+    check('global-edit create: source_session marked as ui', db.findById(created.entry.id)?.row.source_session === 'ui')
+    const ruleCreated = saveGlobalMemory({ action: 'create', level: 'rules', content: '新的全局准则', keywords: ['准则', '新'] })
+    check('global-edit create: rules rows are written with the global project marker',
+      ruleCreated.ok === true && db.findById(ruleCreated.entry.id)?.row.project === marker)
+    const kwComma = saveGlobalMemory({ action: 'create', level: 'user', content: '关键词规整', keywords: '甲, 乙、丙,甲' })
+    check('global-edit create: comma/、 keyword string normalized + deduped',
+      kwComma.ok === true && JSON.stringify(kwComma.entry.keywords) === JSON.stringify(['甲', '乙', '丙']), JSON.stringify(kwComma.entry?.keywords))
+    const kwNumbers = saveGlobalMemory({ action: 'create', level: 'user', content: '数字关键词', keywords: [1, '二'] })
+    check('global-edit create: keyword array accepts numbers', kwNumbers.ok === true && JSON.stringify(kwNumbers.entry.keywords) === JSON.stringify(['1', '二']))
+
+    // 校验错误
+    const errOf = (input) => saveGlobalMemory(input)
+    check('global-edit create: rejects non-editable level', errOf({ action: 'create', level: 'fact', content: 'x' }).error.includes('level must be one of soul, user, rules'))
+    check('global-edit create: rejects empty/blank content', errOf({ action: 'create', level: 'user', content: '   ' }).ok === false && errOf({ action: 'create', level: 'user', content: 'x'.repeat(4001) }).error.includes('4000'))
+    check('global-edit create: rejects importance 0 / 1.5 / 101',
+      errOf({ action: 'create', level: 'user', content: 'x', importance: 0 }).error.includes('importance') &&
+      errOf({ action: 'create', level: 'user', content: 'x', importance: 1.5 }).error.includes('importance') &&
+      errOf({ action: 'create', level: 'user', content: 'x', importance: 101 }).error.includes('importance'))
+    check('global-edit create: rejects >30 keywords',
+      errOf({ action: 'create', level: 'user', content: 'x', keywords: Array.from({ length: 31 }, (_, i) => `k${i}`) }).error.includes('1-30'))
+    check('global-edit create: rejects invalid status', errOf({ action: 'create', level: 'user', content: 'x', status: 'bogus' }).error.includes('status'))
+    check('global-edit: invalid input/action never throws',
+      errOf(null).ok === false && errOf({ action: 'bogus' }).error.includes('action') && errOf({ action: 'save' }).error.includes('id is required'))
+
+    // save：内容/关键词变化清 embedding；仅 importance 保留
+    db.setEmbedding('user', user1.id, [1, 2, 3])
+    const savedContent = saveGlobalMemory({ action: 'save', id: user1.id, content: '用户偏好中文（更新）' })
+    check('global-edit save: content update applied', savedContent.ok === true && db.findById(user1.id)?.row.content === '用户偏好中文（更新）')
+    check('global-edit save: content change clears stale embedding', db.findById(user1.id)?.row.embedding === null)
+    db.setEmbedding('user', user1.id, [4, 5])
+    const savedImp = saveGlobalMemory({ action: 'save', id: user1.id, importance: 9 })
+    check('global-edit save: importance-only update keeps embedding', savedImp.ok === true &&
+      db.findById(user1.id)?.row.importance === 9 && JSON.stringify(db.findById(user1.id)?.row.embedding) === JSON.stringify([4, 5]))
+    db.setEmbedding('user', user1.id, [7])
+    const savedKw = saveGlobalMemory({ action: 'save', id: user1.id, keywords: '新词一,新词二' })
+    check('global-edit save: keyword change clears embedding', savedKw.ok === true &&
+      JSON.stringify(savedKw.entry.keywords) === JSON.stringify(['新词一', '新词二']) && db.findById(user1.id)?.row.embedding === null)
+    check('global-edit save: project stays the global marker', savedKw.entry.project === marker)
+    check('global-edit save: unknown id rejected', errOf({ action: 'save', id: 'no-such-id', content: 'x' }).error.includes('not found'))
+    check('global-edit save: non-editable (fact) id rejected', errOf({ action: 'save', id: factRow.id, content: 'x' }).error.includes('not found'))
+    check('global-edit save: project-scoped rule rejected as not global-scoped',
+      errOf({ action: 'save', id: ruleProject.id, content: 'x' }).error.includes('not global-scoped'))
+    check('global-edit save: short unique id works', saveGlobalMemory({ action: 'save', id: user1.id.slice(0, 30), importance: 3 }).ok === true)
+
+    // 歧义短 id
+    const baseRow = { level: 'user', title: null, importance: 1, keywords: [], status: 'active', corrected: 0, project: null, subcategory: null, goal: null, source_session: 'ui', hit_count: 0, created_at: 1, updated_at: 1, last_accessed_at: null }
+    db.insertRow({ ...baseRow, id: 'ambig0000-aaaaaaaaaaaaaaaaaaaaaaaaaa', content: '歧义甲' })
+    db.insertRow({ ...baseRow, id: 'ambig0000-bbbbbbbbbbbbbbbbbbbbbbbbbb', content: '歧义乙' })
+    check('global-edit save: ambiguous short id rejected', errOf({ action: 'save', id: 'ambig0000', content: 'x' }).error.includes('not found'))
+
+    // archive / restore
+    const archived = saveGlobalMemory({ action: 'archive', id: user1.id })
+    check('global-edit archive: status archived returned', archived.ok === true && archived.entry.status === 'archived')
+    check('global-edit list: archived rows still listed for restore', listGlobalMemory().entries.some((e) => e.id === user1.id && e.status === 'archived'))
+    const restored = saveGlobalMemory({ action: 'restore', id: user1.id })
+    check('global-edit restore: status active returned', restored.ok === true && restored.entry.status === 'active')
+
+    // 未受信全局库
+    const homeForeign = tmp('mmh-gm-edit-foreign-')
+    closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(homeForeign)
+    mkdirSync(join(homeForeign, 'global'), { recursive: true })
+    const raw = new MemoryDb(globalDbPath())
+    raw.insert({ level: 'soul', content: '外来全局条目' })
+    raw.close(); closeAllDbs()
+    check('global-edit: untrusted global store → trusted:false, empty list',
+      listGlobalMemory().trusted === false && listGlobalMemory().entries.length === 0)
+    check('global-edit: untrusted save returns the exact trust error',
+      saveGlobalMemory({ action: 'create', level: 'user', content: 'x' }).error === GLOBAL_STORE_UNTRUSTED_ERROR)
+    check('global-edit: exported level contract is soul/user/rules', JSON.stringify([...GLOBAL_EDIT_LEVELS]) === JSON.stringify(['soul', 'user', 'rules']))
+  } finally {
+    closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(savedActive)
+    clean(home)
+  }
+}
+
+// ═══════════════════ 24. 0.36：/meow-memory/global-memory 路由 + 会话重注入传播 ═══════════════════
+{
+  const savedActive = activeHomeDir()
+  const savedMeowEnv = process.env.MEOW_MEMORY_HOME
+  const home = tmp('mmh-gm-route-')
+  // apply 首步会 switchHomeDir(resolveHomeDir(resolved.homeDir))，而 resolveHomeDir 的
+  // 回落链 env > 指针 > 默认——必须把 MEOW_MEMORY_HOME 也指到本测试 home，否则 apply
+  // 会把 active 切回顶层隔离 home，window-index.json 读不到。
+  process.env.MEOW_MEMORY_HOME = home
+  closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(home)
+  const marker = globalProjectMarker()
+  // 传播目标：可信窗口 / 外来窗口 / 无库窗口 + 三个 persisted 会话
+  const wsTrusted = tmp('mmh-gm-ws-trusted-')
+  ensureMemoryStore(wsTrusted, '.dsh-meow', { autoGitignore: true, trustWorkspaceMemory: false })
+  const dbTrusted = getDb(wsTrusted, '.dsh-meow')
+  dbTrusted.touchWindow('sid-trusted', wsTrusted, Date.now())
+  const wsForeign = tmp('mmh-gm-ws-foreign-')
+  const fdb = new MemoryDb(memoryDbPath(wsForeign)); fdb.insert({ level: 'fact', content: '外来库' }); fdb.close(); closeAllDbs()
+  resetStoreTrustCache()
+  ensureMemoryStore(wsForeign, '.dsh-meow', { autoGitignore: true, trustWorkspaceMemory: false })
+  const wsPersisted = tmp('mmh-gm-ws-persisted-')
+  ensureMemoryStore(wsPersisted, '.dsh-meow', { autoGitignore: true, trustWorkspaceMemory: false })
+  const wsPersistedForeign = tmp('mmh-gm-ws-persisted-foreign-')
+  const pfd = new MemoryDb(memoryDbPath(wsPersistedForeign)); pfd.insert({ level: 'fact', content: '外来库2' }); pfd.close(); closeAllDbs()
+  ensureMemoryStore(wsPersistedForeign, '.dsh-meow', { autoGitignore: true, trustWorkspaceMemory: false })
+  const wsNoDb = tmp('mmh-gm-ws-nodb-')
+  mkdirSync(join(home), { recursive: true })
+  writeFileSync(join(home, 'window-index.json'), JSON.stringify({ 'sid-trusted': wsTrusted, 'sid-foreign': wsForeign, 'sid-nodb': wsNoDb }))
+
+  const routes = []
+  const handlers = {}
+  const logs = []
+  const ctx = {
+    logger: { info: (m) => { logs.push(String(m)) }, warn: () => {}, error: () => {} },
+    tools: { register: (t) => { void t; return () => {} } },
+    on: (name, fn) => { handlers[name] = fn },
+    effect: (fn) => { try { fn() } catch { /* mock */ } return () => {} },
+    get: (name) => {
+      if (name === 'webServer') return { register: (route) => { routes.push(route); return () => {} } }
+      if (name === 'connection') return { requestRejection: (req) => ((req?.headers?.cookie ?? '').includes('dsh-auth=ok') ? undefined : 401) }
+      if (name === 'sessionPersistence') {
+        return {
+          list: async () => [
+            { id: 'persisted-trusted', cwd: wsPersisted },
+            { id: 'persisted-foreign', cwd: wsPersistedForeign },
+            { id: 'persisted-nodb', cwd: wsNoDb },
+            { id: 'persisted-no-cwd' },
+          ],
+        }
+      }
+      return undefined
+    },
+    subagents: { start: () => { throw new Error('subagents not expected') } },
+  }
+  await apply(ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
+  const route = routes.find((r) => r.path === '/meow-memory/global-memory')
+  check('global-memory route: registered as an exact auth-gated route', route !== undefined && route.kind === 'exact')
+
+  const invoke = async ({ method = 'GET', body, cookie } = {}) => {
+    const state = { code: 0, body: '' }
+    let done
+    const finished = new Promise((r) => { done = r })
+    const res = { writeHead(code) { state.code = code }, end(chunk) { state.body = chunk ?? ''; done() } }
+    const reqHandlers = {}
+    const req = { method, headers: cookie === undefined ? {} : { cookie }, on(ev, cb) { (reqHandlers[ev] ??= []).push(cb); return req } }
+    route.handler(req, res)
+    if (method === 'POST' && body !== undefined) {
+      for (const cb of reqHandlers.data ?? []) cb(Buffer.from(JSON.stringify(body)))
+    }
+    for (const cb of reqHandlers.end ?? []) cb()
+    await Promise.race([finished, tick(2000)])
+    let json = null
+    try { json = JSON.parse(state.body) } catch { json = null }
+    return { code: state.code, json, raw: state.body }
+  }
+
+  const noCookie = await invoke({ method: 'GET' })
+  check('global-memory GET: 401 without auth cookie', noCookie.code === 401)
+  const listed0 = await invoke({ method: 'GET', cookie: 'dsh-auth=ok' })
+  check('global-memory GET: 200 + trusted list with auth cookie', listed0.code === 200 && listed0.json.trusted === true && Array.isArray(listed0.json.entries))
+
+  const created = await invoke({ method: 'POST', cookie: 'dsh-auth=ok', body: { action: 'create', level: 'soul', content: 'GLOBAL-EDIT-SOUL 全局持久化内容' } })
+  check('global-memory POST create: 200 with entry', created.code === 200 && created.json.ok === true && typeof created.json.entry?.id === 'string')
+  check('global-memory POST create: propagation counted trusted sessions only', created.json.reinjected === 2, JSON.stringify(created.json.reinjected))
+  const listed1 = await invoke({ method: 'GET', cookie: 'dsh-auth=ok' })
+  check('global-memory GET after create: new entry visible + stored in isolated global db',
+    listed1.code === 200 && listed1.json.entries.some((e) => e.id === created.json.entry.id) &&
+    existsSync(join(activeHomeDir(), 'global', 'memory.db')))
+
+  // 传播：可信会话被标记，foreign/无库跳过
+  check('propagation: trusted window session marked for reinject', isReinjectPending(wsTrusted, 'sid-trusted', '.dsh-meow') === true)
+  check('propagation: trusted persisted session marked for reinject', isReinjectPending(wsPersisted, 'persisted-trusted', '.dsh-meow') === true)
+  check('propagation: foreign window session not marked', isReinjectPending(wsForeign, 'sid-foreign', '.dsh-meow') === false && !existsSync(sessionsFile(wsForeign, 'sid-foreign', '.dsh-meow')))
+  check('propagation: foreign persisted session not marked', isReinjectPending(wsPersistedForeign, 'persisted-foreign', '.dsh-meow') === false && !existsSync(sessionsFile(wsPersistedForeign, 'persisted-foreign', '.dsh-meow')))
+  check('propagation: no-db sessions get no sessions file', !existsSync(sessionsFile(wsNoDb, 'sid-nodb', '.dsh-meow')) && !existsSync(sessionsFile(wsNoDb, 'persisted-nodb', '.dsh-meow')))
+
+  const saved = await invoke({ method: 'POST', cookie: 'dsh-auth=ok', body: { action: 'save', id: created.json.entry.id, content: 'GLOBAL-EDIT-SOUL 更新后内容' } })
+  check('global-memory POST save: 200 + updated content', saved.code === 200 && saved.json.ok === true && saved.json.entry?.content === 'GLOBAL-EDIT-SOUL 更新后内容')
+  const archived = await invoke({ method: 'POST', cookie: 'dsh-auth=ok', body: { action: 'archive', id: created.json.entry.id } })
+  check('global-memory POST archive: 200 + archived status', archived.code === 200 && archived.json.entry?.status === 'archived')
+  const restored = await invoke({ method: 'POST', cookie: 'dsh-auth=ok', body: { action: 'restore', id: created.json.entry.id } })
+  check('global-memory POST restore: 200 + active status', restored.code === 200 && restored.json.entry?.status === 'active')
+  const invalidAction = await invoke({ method: 'POST', cookie: 'dsh-auth=ok', body: { action: 'bogus' } })
+  check('global-memory POST: invalid action → 400 with error', invalidAction.code === 400 && String(invalidAction.json?.error).includes('action'))
+  const invalidCreate = await invoke({ method: 'POST', cookie: 'dsh-auth=ok', body: { action: 'create', level: 'fact', content: 'x' } })
+  check('global-memory POST: invalid level → 400 with error', invalidCreate.code === 400 && String(invalidCreate.json?.error).includes('level'))
+  const noCookiePost = await invoke({ method: 'POST', body: { action: 'create', level: 'user', content: 'x' } })
+  check('global-memory POST: 401 without auth cookie', noCookiePost.code === 401)
+
+  // 集成：被标记的会话在下一轮用户消息时注入更新后的全局记忆（soul）
+  const preStep = handlers['agent/pre-step']
+  const firstUser = { content: [{ type: 'text', text: '你好' }], source: { kind: 'user' } }
+  const decision = await preStep(
+    { agent: { session: { header: { cwd: wsTrusted, id: 'sid-trusted' }, events: [] }, steer: () => {} }, messages: [firstUser], turn: 2, step: 1, signal: new AbortController().signal },
+    async () => ({ kind: 'enter', messages: [firstUser] }),
+  )
+  const decisionTexts = decision.messages.map((m) => m.content.map((c) => c.text ?? '').join(''))
+  check('propagation integration: marked session re-injects the updated global memory',
+    decisionTexts.some((t) => t.includes('GLOBAL-EDIT-SOUL 更新后内容')), JSON.stringify(decisionTexts.map((t) => t.slice(0, 50))))
+  check('propagation integration: pending flag cleared after reinjection', isReinjectPending(wsTrusted, 'sid-trusted', '.dsh-meow') === false)
+  check('propagation integration: injected content keeps entry keywords marker', created.json.entry !== undefined && marker.length > 0)
+
+  // 全局库未受信：GET trusted:false / POST 400 精确错误
+  const homeForeign = tmp('mmh-gm-route-foreign-')
+  process.env.MEOW_MEMORY_HOME = homeForeign
+  closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(homeForeign)
+  mkdirSync(join(homeForeign, 'global'), { recursive: true })
+  const rawG = new MemoryDb(globalDbPath()); rawG.insert({ level: 'soul', content: '外来全局' }); rawG.close(); closeAllDbs()
+  const routes2 = []
+  const ctx2 = {
+    logger: { info: () => {}, warn: () => {}, error: () => {} },
+    tools: { register: (t) => { void t; return () => {} } },
+    on: () => {},
+    effect: (fn) => { try { fn() } catch { /* mock */ } return () => {} },
+    get: (name) => {
+      if (name === 'webServer') return { register: (route) => { routes2.push(route); return () => {} } }
+      if (name === 'connection') return { requestRejection: () => undefined }
+      return undefined
+    },
+    subagents: { start: () => { throw new Error('subagents not expected') } },
+  }
+  await apply(ctx2, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
+  const route2 = routes2.find((r) => r.path === '/meow-memory/global-memory')
+  const state2 = { code: 0, body: '' }
+  let done2
+  const finished2 = new Promise((r) => { done2 = r })
+  const res2 = { writeHead(code) { state2.code = code }, end(chunk) { state2.body = chunk ?? ''; done2() } }
+  route2.handler({ method: 'GET', headers: {} }, res2)
+  await Promise.race([finished2, tick(1000)])
+  const untrustedGet = JSON.parse(state2.body)
+  check('global-memory GET: untrusted global store → trusted:false + empty entries',
+    state2.code === 200 && untrustedGet.trusted === false && Array.isArray(untrustedGet.entries) && untrustedGet.entries.length === 0)
+  const state3 = { code: 0, body: '' }
+  let done3
+  const finished3 = new Promise((r) => { done3 = r })
+  const res3 = { writeHead(code) { state3.code = code }, end(chunk) { state3.body = chunk ?? ''; done3() } }
+  const req3Handlers = {}
+  const req3 = { method: 'POST', headers: {}, on(ev, cb) { (req3Handlers[ev] ??= []).push(cb); return req3 } }
+  route2.handler(req3, res3)
+  for (const cb of req3Handlers.data ?? []) cb(Buffer.from(JSON.stringify({ action: 'create', level: 'user', content: 'x' })))
+  for (const cb of req3Handlers.end ?? []) cb()
+  await Promise.race([finished3, tick(1000)])
+  check('global-memory POST: untrusted global store → 400 with exact trust error',
+    state3.code === 400 && JSON.parse(state3.body).error === GLOBAL_STORE_UNTRUSTED_ERROR)
+
+  closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(savedActive)
+  if (savedMeowEnv === undefined) delete process.env.MEOW_MEMORY_HOME
+  else process.env.MEOW_MEMORY_HOME = savedMeowEnv
+  clean(home); clean(wsForeign); clean(wsPersistedForeign); clean(wsNoDb)
+  void logs
+}
+
+// ═══════════════════ 25. 0.36：客户端 GlobalMemoryEditor 组件（React 桩 + fetch mock） ═══════════════════
+{
+  const reactStub = `
+export function createElement(type, props, ...children) { return { type, props: props ?? {}, children: children.flat() } }
+export function useCallback(fn) { return fn }
+export function useState(init) {
+  const states = globalThis.__meowStates
+  const i = globalThis.__meowCursor++
+  if (!(i in states)) states[i] = typeof init === 'function' ? init() : init
+  const set = (v) => { states[i] = typeof v === 'function' ? v(states[i]) : v; globalThis.__meowDirty = true }
+  return [states[i], set]
+}
+export function useEffect(fn) { if (globalThis.__meowMountPhase) globalThis.__meowEffects.push(fn) }
+export function useSyncExternalStore(_subscribe, get) { return get() }
+`
+  const entryPath = 'tests/_global-editor-entry.ts'
+  writeFileSync(entryPath, [
+    "export { GlobalMemoryEditor } from '../src/settings-page.ts'",
+    "export { setUiLocaleForTest, t, UI_KEYS } from '../src/i18n/index.js'",
+  ].join('\n'), 'utf8')
+  let mod
+  try {
+    const { build } = await import('esbuild')
+    const { outputFiles } = await build({
+      entryPoints: [entryPath],
+      bundle: true,
+      platform: 'browser',
+      format: 'esm',
+      write: false,
+      logLevel: 'silent',
+      plugins: [{
+        name: 'react-stub',
+        setup(b) {
+          b.onResolve({ filter: /^react$/ }, () => ({ path: 'react-stub', namespace: 'stub' }))
+          b.onLoad({ filter: /.*/, namespace: 'stub' }, () => ({ contents: reactStub, loader: 'js' }))
+        },
+      }],
+    })
+    const code = new TextDecoder().decode(outputFiles[0].contents)
+    mod = await import('data:text/javascript;base64,' + Buffer.from(code).toString('base64'))
+  } finally {
+    rmSync(entryPath, { force: true })
+  }
+
+  const savedDocument = globalThis.document
+  const savedWindow = globalThis.window
+  globalThis.document = { querySelector: () => null, createElement: () => ({ dataset: {}, textContent: '' }), head: { appendChild: () => {} } }
+  globalThis.window = { setTimeout: () => 1 }
+  const originalFetch = globalThis.fetch
+  const calls = []
+  const entries = [
+    { id: 'global-user-1', level: 'user', title: null, content: '用户偏好中文回答', keywords: ['偏好', '中文'], importance: 3, status: 'active', project: '全局', updated_at: 2 },
+    { id: 'global-soul-1', level: 'soul', title: null, content: 'AI 叫喵', keywords: ['名字'], importance: 2, status: 'archived', project: '全局', updated_at: 1 },
+  ]
+  const collect = (node, out = { nodes: [], texts: [] }) => {
+    if (node === null || node === undefined || typeof node === 'boolean') return out
+    if (typeof node === 'string' || typeof node === 'number') { out.texts.push(String(node)); return out }
+    if (Array.isArray(node)) { for (const child of node) collect(child, out); return out }
+    out.nodes.push(node)
+    const props = node.props ?? {}
+    for (const [key, value] of Object.entries(props)) {
+      if (key !== 'children' && typeof value === 'string') out.texts.push(value)
+    }
+    collect(props.children, out)
+    collect(node.children ?? [], out)
+    return out
+  }
+  const renderEditor = async ({ reset = true, maxRenders = 12 } = {}) => {
+    if (reset) { globalThis.__meowStates = []; globalThis.__meowEffects = [] }
+    let tree
+    for (let i = 0; i < maxRenders; i++) {
+      globalThis.__meowCursor = 0
+      globalThis.__meowMountPhase = i === 0
+      globalThis.__meowDirty = false
+      tree = mod.GlobalMemoryEditor()
+      if (i === 0) for (const fn of globalThis.__meowEffects) { try { fn() } catch { /* async load */ } }
+      await tick(25)
+      if (!globalThis.__meowDirty) break
+    }
+    return tree
+  }
+  try {
+    // i18n：22 个新 key 在三种语言里都有真实文案
+    const globalKeys = ['title', 'hint', 'loading', 'empty', 'untrusted', 'add', 'content', 'keywords', 'importance', 'level',
+      'levelSoul', 'levelUser', 'levelRules', 'save', 'cancel', 'archive', 'restore', 'saved', 'saveFailed', 'reinjectNote', 'reinjectCount', 'refresh']
+      .map((k) => `settings.global.${k}`)
+    check('global-edit i18n: 22 new UI keys registered in UI_KEYS', globalKeys.every((k) => mod.UI_KEYS.includes(k)) && globalKeys.length === 22)
+    for (const lang of ['zh', 'en', 'pt-br']) {
+      mod.setUiLocaleForTest(lang)
+      check(`global-edit i18n: all 22 keys translated (${lang})`, globalKeys.every((k) => typeof mod.t(k) === 'string' && mod.t(k).length > 0 && mod.t(k) !== k))
+    }
+    mod.setUiLocaleForTest('zh')
+
+    globalThis.fetch = async (url, init = {}) => {
+      calls.push({ url, method: init.method ?? 'GET', body: init.body })
+      if ((init.method ?? 'GET') === 'GET') return { ok: true, status: 200, json: async () => ({ trusted: true, entries }) }
+      return { ok: true, status: 200, json: async () => ({ ok: true, entry: { id: 'global-user-1' }, reinjected: 3 }) }
+    }
+    const tree = await renderEditor()
+    const treeText = collect(tree).texts.join(' | ')
+    check('global-editor: renders title/hint and the fetch loaded entries',
+      treeText.includes('全局记忆（用户级）') && treeText.includes('这里的 soul / user / 全局准则') &&
+      treeText.includes('用户偏好中文回答') && treeText.includes('AI 叫喵'), treeText.slice(0, 200))
+    check('global-editor: shows level labels + action buttons',
+      treeText.includes('user（用户信息/偏好）') && treeText.includes('soul（AI 自身）') &&
+      ['保存', '归档', '恢复', '刷新', '新增全局记忆'].every((label) => treeText.includes(label)))
+    check('global-editor: initial load issues a GET to the plugin route',
+      calls.some((c) => c.method === 'GET' && c.url === '/meow-memory/global-memory'))
+
+    const buttonOf = (root, label) => collect(root).nodes.find((n) => n.type === 'button' && collect(n).texts.includes(label))
+    const saveButton = buttonOf(tree, '保存')
+    saveButton.props.onClick()
+    await tick(40)
+    const saveCall = [...calls].reverse().find((c) => c.method === 'POST')
+    const saveBody = saveCall === undefined ? null : JSON.parse(saveCall.body)
+    check('global-editor: save button POSTs the correct edit body',
+      saveBody !== null && saveBody.action === 'save' && saveBody.id === 'global-user-1' &&
+      saveBody.content === '用户偏好中文回答' && saveBody.importance === 3 && Array.isArray(saveBody.keywords) === false,
+      JSON.stringify(saveBody))
+    const afterSave = await renderEditor({ reset: false })
+    check('global-editor: status line reports save + reinjected session count',
+      collect(afterSave).texts.join(' | ').includes('已保存') && collect(afterSave).texts.join(' | ').includes('已标记 3 个会话下一轮重新注入。'),
+      collect(afterSave).texts.join(' | ').slice(-160))
+
+    const restoreButton = buttonOf(afterSave, '恢复')
+    restoreButton.props.onClick()
+    await tick(40)
+    const restoreBody = JSON.parse([...calls].reverse().find((c) => c.method === 'POST').body)
+    check('global-editor: archived row renders 恢复 and posts action=restore',
+      restoreBody.action === 'restore' && restoreBody.id === 'global-soul-1', JSON.stringify(restoreBody))
+
+    const select = collect(afterSave).nodes.find((n) => n.type === 'select')
+    select.props.onChange({ target: { value: 'rules' } })
+    const newTextarea = collect(afterSave).nodes.find((n) => n.type === 'textarea' && n.props.placeholder === '内容')
+    newTextarea.props.onChange({ target: { value: '新增全局规则内容' } })
+    const createTree = await renderEditor({ reset: false })
+    buttonOf(createTree, '新增全局记忆').props.onClick()
+    await tick(40)
+    const createBody = JSON.parse([...calls].reverse().find((c) => c.method === 'POST').body)
+    check('global-editor: add form posts action=create with level/content',
+      createBody.action === 'create' && createBody.level === 'rules' && createBody.content === '新增全局规则内容', JSON.stringify(createBody))
+
+    // 无 fetch 环境：不崩（组件内部有 typeof fetch 守卫）
+    delete globalThis.fetch
+    let treeNoFetch
+    let crashed = false
+    try {
+      treeNoFetch = await renderEditor()
+    } catch {
+      crashed = true
+    }
+    const noFetchText = crashed ? '' : collect(treeNoFetch).texts.join(' | ')
+    check('global-editor: no-fetch environment renders (no crash) with an error state',
+      crashed === false && typeof treeNoFetch === 'object' && noFetchText.includes('fetch unavailable'), noFetchText.slice(0, 160))
+  } finally {
+    globalThis.fetch = originalFetch
+    globalThis.document = savedDocument
+    globalThis.window = savedWindow
+  }
 }
 
 // 清理

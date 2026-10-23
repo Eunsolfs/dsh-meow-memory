@@ -1,4 +1,4 @@
-# Tool reference (0.35 fork)
+# Tool reference (0.36 fork)
 
 meow-memory registers **10** memory tools. Three bands: **read** (search / read / find_similar / project / list), **write** (remember / update / forget / dream), **directory** (home).
 
@@ -222,6 +222,16 @@ Switching moves (same disk) or copies (cross disk); the old directory is **never
 - **Injection** (first-turn snapshot, per-message hits, post-compaction re-injection) is bounded by `budget.*` and **skips untrusted stores**; since 0.33 the first-turn snapshot's soul/user/global rules come from the global store (workspace store as fallback), while project panorama/re-injection stay workspace-only; since 0.35, with semantic enabled, **every user message sends one query embedding request** (the LRU only saves repeated text; failures silently fall back to lexical and never block injection);
 - **Manual tools** (search / project / read / list, etc.) return on demand and are not subject to the injection budget, but on an untrusted store they are **refused** (explicit error, not empty results); dream and reflection are refused too. Read tools query both stores (except `memory_project`). With semantic enabled, `memory_search`'s query also sends one embedding request, and write tools **embed the entry inline** (best-effort).
 - `memory_list` is the only low-cost "whole store without bodies" view; `memory_forget` is the only delete/archive entry point (equivalent to `memory_update status=archived` for archiving).
+
+---
+
+## UI editor (0.36, not a tool)
+
+The "Global memory (user-scope)" card at the bottom of the settings page ("Meow memory" tab) is a **user-explicit** channel: it only edits the user-scope global store's `soul` / `user` / global `rules` (including archive/restore/create), **registers no new tool and does not change `memory_*` behaviour**. It reads/writes the global store through the plugin-private `GET/POST /meow-memory/global-memory` (same auth gate) and never touches workspace stores; with an untrusted global store it shows a warning and refuses writes.
+
+- Division of work: `memory_*` still covers all levels/both stores (including project-level memory); the editor covers global scope only.
+- After a save the host marks related sessions for reinject; those sessions re-inject the updated global memory on their **next user message** (no history rewrite, no immediate model call). What the model sees is "the injected content changed on the next turn", not an extra tool call.
+- Validation/limits: content 1–4000 chars, keywords 1–30, importance 1–100; no hard delete (archive); last-write-wins; global scope only; effective on the next message.
 
 ---
 

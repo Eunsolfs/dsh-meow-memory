@@ -58,6 +58,15 @@ const CSS = `
 .meowmm_set_mirrornote{background:color-mix(in srgb,#f59e0b 12%,transparent);border:1px solid color-mix(in srgb,#f59e0b 35%,transparent);border-radius:8px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:1.6;padding:8px 12px}
 .meowmm_set_saved{color:#34d399;font-size:12px}
 .meowmm_set_muted{color:var(--dsw-alias-label-caption);font-size:12px}
+.meowmm_global_card{border-color:color-mix(in srgb,#6366f1 35%,var(--dsw-alias-border-l3))}
+.meowmm_global_head{align-items:center;display:flex;gap:8px;justify-content:space-between}
+.meowmm_global_entry{border-top:1px solid var(--dsw-alias-border-l3);display:flex;flex-direction:column;gap:6px;padding-top:8px}
+.meowmm_global_row{align-items:center;display:flex;flex-wrap:wrap;gap:6px}
+.meowmm_global_content{background:transparent;border:1px solid var(--dsw-alias-border-l3);border-radius:6px;color:inherit;font-family:inherit;font-size:13px;line-height:1.5;padding:6px 8px;resize:vertical;width:100%}
+.meowmm_global_kw{flex:1;min-width:180px;width:auto}
+.meowmm_global_imp{width:90px}
+.meowmm_global_level{width:150px}
+.meowmm_global_new{border-top:1px dashed var(--dsw-alias-border-l3);display:flex;flex-direction:column;gap:6px;margin-top:6px;padding-top:8px}
 `
 
 const el = React.createElement
@@ -207,6 +216,235 @@ function jsonEqual(a: unknown, b: unknown): boolean {
 function useUiLocale(): string {
   const subscribe = React.useCallback((cb: () => void) => onUiLocaleChange(() => cb()), [])
   return React.useSyncExternalStore(subscribe, getUiLocale, getUiLocale)
+}
+
+// ── 用户级全局记忆编辑器（0.36）────────────────────────────────────────────
+// 只走本插件自己的 host 路由（/meow-memory/global-memory，auth gated）：读写的是
+// user-scope 全局库（soul/user/全局 rules），保存后 host 会给相关会话打 reinject
+// 标记，下一轮用户消息重新注入更新后的全局记忆（不改写历史消息）。
+interface GlobalEntryDraft {
+  content: string
+  keywords: string
+  importance: string
+}
+
+function globalMemoryRequest(method: 'GET' | 'POST', body?: unknown): Promise<any> {
+  if (typeof fetch !== 'function') return Promise.reject(new Error('fetch unavailable'))
+  const init: any = { method, headers: { accept: 'application/json' } }
+  if (body !== undefined) {
+    init.headers['content-type'] = 'application/json'
+    init.body = JSON.stringify(body)
+  }
+  return fetch('/meow-memory/global-memory', init).then(async (res: any) => {
+    const json = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error((json && json.error) || `HTTP ${res.status}`)
+    return json
+  })
+}
+
+/** 「喵记忆」设置页底部：可视化编辑用户级全局记忆。 */
+export function GlobalMemoryEditor(): any {
+  const [loading, setLoading] = React.useState(true)
+  const [trusted, setTrusted] = React.useState(true)
+  const [entries, setEntries] = React.useState<any[]>([])
+  const [error, setError] = React.useState<string | null>(null)
+  const [status, setStatus] = React.useState<string | null>(null)
+  const [drafts, setDrafts] = React.useState<Record<string, GlobalEntryDraft>>({})
+  const [newLevel, setNewLevel] = React.useState('user')
+  const [newContent, setNewContent] = React.useState('')
+  const [newKeywords, setNewKeywords] = React.useState('')
+  const [newImportance, setNewImportance] = React.useState('2')
+
+  const load = React.useCallback(async (): Promise<void> => {
+    setLoading(true)
+    setError(null)
+    try {
+      const data = await globalMemoryRequest('GET')
+      const list: any[] = Array.isArray(data?.entries) ? data.entries : []
+      setTrusted(data?.trusted !== false)
+      setEntries(list)
+      setDrafts((prev) => {
+        const next: Record<string, GlobalEntryDraft> = {}
+        for (const e of list) {
+          next[e.id] = prev[e.id] ?? {
+            content: String(e.content ?? ''),
+            keywords: Array.isArray(e.keywords) ? e.keywords.join(', ') : String(e.keywords ?? ''),
+            importance: String(e.importance ?? 2),
+          }
+        }
+        return next
+      })
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+      setTrusted(false)
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  React.useEffect(() => {
+    void load()
+  }, [load])
+
+  const draftOf = (entry: any): GlobalEntryDraft =>
+    drafts[entry.id] ?? {
+      content: String(entry.content ?? ''),
+      keywords: Array.isArray(entry.keywords) ? entry.keywords.join(', ') : '',
+      importance: String(entry.importance ?? 2),
+    }
+
+  const patchDraft = (id: string, patch: Partial<GlobalEntryDraft>): void => {
+    setDrafts((prev) => ({ ...prev, [id]: { ...(prev[id] ?? { content: '', keywords: '', importance: '2' }), ...patch } }))
+  }
+
+  const submit = async (body: Record<string, unknown>): Promise<void> => {
+    setStatus(null)
+    setError(null)
+    try {
+      const data = await globalMemoryRequest('POST', body)
+      if (data?.ok !== true) throw new Error(data?.error ?? 'save failed')
+      const count = typeof data?.reinjected === 'number' ? data.reinjected : 0
+      setStatus(count > 0
+        ? `${t('settings.global.saved')} · ${t('settings.global.reinjectCount', { count })}`
+        : t('settings.global.saved'))
+      await load()
+    } catch (e) {
+      setStatus(t('settings.global.saveFailed', { error: e instanceof Error ? e.message : String(e) }))
+    }
+  }
+
+  const saveEntry = (entry: any): void => {
+    const d = draftOf(entry)
+    void submit({
+      action: 'save',
+      id: entry.id,
+      content: d.content,
+      keywords: d.keywords,
+      importance: Number(d.importance),
+    })
+  }
+
+  const toggleArchive = (entry: any): void => {
+    void submit({ action: entry.status === 'active' ? 'archive' : 'restore', id: entry.id })
+  }
+
+  const createEntry = (): void => {
+    void submit({ action: 'create', level: newLevel, content: newContent, keywords: newKeywords, importance: Number(newImportance) })
+    setNewContent('')
+    setNewKeywords('')
+    setNewImportance('2')
+  }
+
+  const levelLabel = (level: string): string =>
+    t(level === 'soul' ? 'settings.global.levelSoul' : level === 'rules' ? 'settings.global.levelRules' : 'settings.global.levelUser')
+
+  const rows: any[] = []
+  if (loading) {
+    rows.push(el('div', { key: 'loading', className: 'meowmm_set_muted' }, t('settings.global.loading')))
+  } else if (!trusted) {
+    rows.push(el('div', { key: 'untrusted', className: 'meowmm_set_mirrornote' }, t('settings.global.untrusted')))
+  } else if (entries.length === 0) {
+    rows.push(el('div', { key: 'empty', className: 'meowmm_set_muted' }, t('settings.global.empty')))
+  } else {
+    for (const entry of entries) {
+      const d = draftOf(entry)
+      rows.push(el(
+        'div',
+        { key: entry.id, className: 'meowmm_global_entry' },
+        el(
+          'div',
+          { className: 'meowmm_global_head' },
+          el('span', { className: 'meowmm_set_label' }, levelLabel(String(entry.level))),
+          el('span', { className: 'meowmm_set_muted' }, `${entry.id} · ${entry.status === 'active' ? '' : String(entry.status)}`),
+        ),
+        el('textarea', {
+          className: 'meowmm_global_content',
+          value: d.content,
+          rows: 3,
+          onChange: (e: any) => patchDraft(entry.id, { content: e.target.value }),
+        }),
+        el(
+          'div',
+          { className: 'meowmm_global_row' },
+          el('input', {
+            className: 'meowmm_set_input meowmm_global_kw',
+            type: 'text',
+            value: d.keywords,
+            placeholder: t('settings.global.keywords'),
+            onChange: (e: any) => patchDraft(entry.id, { keywords: e.target.value }),
+          }),
+          el('input', {
+            className: 'meowmm_set_input meowmm_global_imp',
+            type: 'number',
+            value: d.importance,
+            placeholder: t('settings.global.importance'),
+            onChange: (e: any) => patchDraft(entry.id, { importance: e.target.value }),
+          }),
+          el('button', { className: 'meowmm_set_reset', onClick: () => saveEntry(entry) }, t('settings.global.save')),
+          el('button', { className: 'meowmm_set_reset', onClick: () => toggleArchive(entry) },
+            t(entry.status === 'active' ? 'settings.global.archive' : 'settings.global.restore')),
+        ),
+      ))
+    }
+  }
+
+  return el(
+    'div',
+    { className: 'meowmm_set_card meowmm_global_card' },
+    el(
+      'div',
+      { className: 'meowmm_global_head' },
+      el('span', { className: 'meowmm_set_group' }, t('settings.global.title')),
+      el('button', { className: 'meowmm_set_reset', onClick: () => void load() }, t('settings.global.refresh')),
+    ),
+    el('span', { className: 'meowmm_set_hint' }, t('settings.global.hint')),
+    status !== null ? el('span', { className: 'meowmm_set_saved' }, status) : null,
+    error !== null ? el('div', { className: 'meowmm_set_err' }, error) : null,
+    ...rows,
+    trusted
+      ? el(
+        'div',
+        { className: 'meowmm_global_new' },
+        el('span', { className: 'meowmm_set_group' }, t('settings.global.add')),
+        el(
+          'div',
+          { className: 'meowmm_global_row' },
+          el('select', {
+            className: 'meowmm_set_input meowmm_global_level',
+            value: newLevel,
+            onChange: (e: any) => setNewLevel(e.target.value),
+          },
+            el('option', { value: 'user' }, levelLabel('user')),
+            el('option', { value: 'soul' }, levelLabel('soul')),
+            el('option', { value: 'rules' }, levelLabel('rules')),
+          ),
+          el('input', {
+            className: 'meowmm_set_input meowmm_global_kw',
+            type: 'text',
+            value: newKeywords,
+            placeholder: t('settings.global.keywords'),
+            onChange: (e: any) => setNewKeywords(e.target.value),
+          }),
+          el('input', {
+            className: 'meowmm_set_input meowmm_global_imp',
+            type: 'number',
+            value: newImportance,
+            placeholder: t('settings.global.importance'),
+            onChange: (e: any) => setNewImportance(e.target.value),
+          }),
+        ),
+        el('textarea', {
+          className: 'meowmm_global_content',
+          rows: 2,
+          value: newContent,
+          placeholder: t('settings.global.content'),
+          onChange: (e: any) => setNewContent(e.target.value),
+        }),
+        el('button', { className: 'meowmm_set_reset', onClick: createEntry }, t('settings.global.add')),
+      )
+      : null,
+    el('span', { className: 'meowmm_set_muted' }, t('settings.global.reinjectNote')),
+  )
 }
 
 /** 设置页主体（导出供测试渲染：createElement 树可直接断言文案）。 */
@@ -594,6 +832,7 @@ export function MemorySettingsSection(props: { scope: any }): any {
         ...group.fields.map(renderField),
       ),
     ),
+    el(GlobalMemoryEditor, { key: 'global-memory-editor' }),
   )
 }
 

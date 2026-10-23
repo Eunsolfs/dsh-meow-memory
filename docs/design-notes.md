@@ -193,7 +193,20 @@ Also: workspace paths are compared after **realpath normalisation** (junction / 
 
 ---
 
-## 19. Known design debt (updated in 0.35.1)
+## 19. 0.36: global-memory visual editor + next-turn re-injection
+
+User-scope global memory (soul/user/global rules) used to be maintainable only through the model tools or by editing SQLite directly. 0.36 adds a **user-explicit** visual editor in the settings page and makes its saves actually affect future sessions without adding automatic spend.
+
+- **Why the settings page instead of a new tool**: editing user-level long-term memory is the user's own decision and should not consume model turns or drag the model into UI interaction; the settings page is an explicit user channel, close in authority to manual `/dream` (dream may still reorganize entries afterwards). **No new tool, no new config fields.**
+- **Data path**: settings UI → plugin-private `GET/POST /meow-memory/global-memory` (same auth gate as the other plugin routes) → `global-edit.ts` pure data layer → global store. The list contains only soul/user/global rules (incl. archived/stale); writes validate content 1–4000, keywords ≤30 (empty derives from content tokens), importance 1–100; no hard delete (archive); concurrent edits to the same id are **last-write-wins**.
+- **Why mark sessions instead of rewriting history**: already-sent injection messages are history; rewriting them would break session consistency and may double-count tokens. 0.36 reuses the existing post-compaction re-injection channel: after a successful save the host marks related sessions (window index + `sessionPersistence` with a cwd, and an existing **trusted** memory.db) for `reinject`; those sessions re-inject the updated global memory on their **next user message** and clear the mark. **Zero immediate tokens**, no extra model request; sessions with no next message keep the old snapshot. Archive/restore trigger it too (the injected content changed).
+- **Why only the global store**: workspace stores are per-cwd project context and should not be batch-rewritten by a cross-workspace editor; with an untrusted/foreign global store the editor shows a warning and refuses writes (it never opens a foreign store), consistent with the trust model.
+- **Semantic interplay**: content/keywords changes clear that entry's embedding (no stale-vector recall); the next apply's background backfill or a later write rebuilds it; importance-only saves keep it. The editor itself makes no embedding requests.
+- **Residual boundaries**: global scope only; effective on the session's next user message; no hard delete / bulk import / conflict merge; the routes are plugin-private (not a public API); last-write-wins; archived entries are not injected but remain in the store.
+
+---
+
+## 20. Known design debt (updated in 0.36)
 
 | Issue | Impact | Why |
 |---|---|---|
@@ -203,6 +216,10 @@ Also: workspace paths are compared after **realpath normalisation** (junction / 
 | **Semantic vectors are model-bound** | Changing the endpoint model/dimensions makes old vectors score 0; stored vectors are not recomputed automatically | Vectors are model-specific; re-write entries or clear and re-backfill |
 | **Settings page does not expose semantic config** | `retrieval.semantic` is profile-patch only | Settings-page code is out of scope this round; edit the config by hand |
 | **Embeddings send memory bodies** | With it enabled, memory bodies/titles/keywords and user query text go to the configured endpoint | That is required for semantic retrieval; default off + explicit docs let the user choose the provider |
+| **Editor is last-write-wins** | Concurrent edits to the same id from multiple settings pages/tools overwrite each other; no conflict detection | Single-user personal plugin; versioning/optimistic locks cost more than they buy |
+| **Editor has no hard delete** | Only archive/restore; archived entries stop being injected but still occupy the store | Consistent with the existing "the plugin never deletes memories for the user" principle; use `memory_forget mode=delete` (tool channel) for that |
+| **Editor covers global scope only** | Project-level rules/fact/lesson/topic are not in the UI and still need `memory_*` tools | Cross-cwd workspace data is semantically complex; batch UI editing is risky — keep the tool channel |
+| **Saves apply only on the next user message** | Sessions with no further user message keep the old snapshot | Not rewriting history and not firing an immediate model request is intentional; the next turn reuses the post-compaction re-injection channel |
 | **Semantic requests add latency** | A hanging endpoint adds up to `timeoutMs` (5s default) to each user message/search/write (no throw, lexical results still returned) | The synchronous wait lets the semantic score participate in this retrieval; lower `timeoutMs` or disable `enabled` to remove it |
 | **Vectors inflate the DB** | Embeddings are JSON text in the DB/backups — ≈31 KiB/row at 1536 dims (1k ≈30 MB), plaintext derived data | Vector search needs them at rest; reduce enabled rows or disable semantic (no new vectors after off) |
 | **Remote plain-http endpoints are rejected** | Only https or loopback http; a remote plain-http base sends nothing (lexical fallback) | Semantic requests carry memory bodies/queries/Bearer; rejecting cleartext is the safe default |

@@ -1,4 +1,4 @@
-# Troubleshooting (0.35 fork)
+# Troubleshooting (0.36 fork)
 
 Start here when installation fails, recall is poor, or behaviour is unexpected.
 
@@ -163,6 +163,16 @@ A valid marker requires: `schema=1`, `installId` equal to this machine's random 
 
 > **0.33 global store**: `<homeDir>/global/memory.db` has the same trust gate (`.owner.json`, `workspace: ''`). A foreign global store does not error; the plugin **falls back to 0.32 single-workspace behaviour** (soul/user/global rules go to the workspace store). It has no `trustWorkspaceMemory` override.
 
+### How do I edit global memory directly (0.36)? Why didn't a save apply immediately?
+
+Settings → "Meow memory" → bottom card "Global memory (user-scope)" (0.36): lists the user-scope global store's `soul` / `user` / global `rules` (incl. archived, restorable); inline edit content / keywords / importance, create, archive/restore. **Global scope only**; project-level rules and fact/lesson/topic still use `memory_*` tools.
+
+- **A save does not change the current session immediately**: the host only marks **related sessions** (window-index entries with a trusted memory.db / persisted sessions with a cwd) for reinject; they re-inject the updated global memory on their **next user message** (no history rewrite, no immediate model call). The UI shows "saved · N sessions marked for re-injection next turn"; sessions with no next message keep their old snapshot.
+- **Untrusted global store**: the editor shows a warning and refuses writes (error `global store unavailable or untrusted`); it never opens a foreign store.
+- **No hard delete**: archive instead; archived entries are not injected but remain in the store and are restorable. Content/keyword changes clear that entry's embedding (rebuilt by a later backfill/write).
+- **Limits**: last-write-wins, no bulk import/conflict merge; the routes are plugin-private (not a public API); dream/reflection can still reorganize entries afterwards.
+- **Config fields are still not exposed on the settings page**: `security` / `budget` / `retrieval` remain profile-patch only (the editor edits data, not config).
+
 ### Is my old `PROJECT.md` migrated automatically?
 
 **Not since 0.32** (`autoMigrate` defaults to `false`). Enable it explicitly and only for a workspace you trust.
@@ -190,11 +200,11 @@ Since 0.33 storage is two-layer:
 
 ### Which DSH versions are supported?
 
-This fork was **verified on DSH Desktop 0.2.1-rc.2** (Electron 44.7.0 / Node 24.21.0, Windows 11): isolated load succeeded, the 3 routes returned 200/401 under auth, the settings namespace appeared, no apply error; the 0.34 live load with `dream.isolated: true` only verified loading (the 0.34.0 child-start bug was found later by re-audit and fixed in 0.34.1); 0.35 additionally ran live loads with default and semantic-enabled configs (both loaded cleanly, no apply error, **zero embedding requests at boot when disabled**, no real-home writes); 0.35.1 is audit remediation (transport policy/cold-start backfill/review refresh) covered by unit tests with unchanged live-load preconditions. **0.1.x was not tested**; the "supports dsh 0.1.5" claim is gone.
+This fork was **verified on DSH Desktop 0.2.1-rc.2** (Electron 44.7.0 / Node 24.21.0, Windows 11): isolated load succeeded, the 4 routes returned 200/401 under auth, the settings namespace appeared, no apply error; the 0.34 live load with `dream.isolated: true` only verified loading (the 0.34.0 child-start bug was found later by re-audit and fixed in 0.34.1); 0.35 additionally ran live loads with default and semantic-enabled configs (both loaded cleanly, no apply error, **zero embedding requests at boot when disabled**, no real-home writes); 0.35.1 is audit remediation (transport policy/cold-start backfill/review refresh); 0.36's editor routes were exercised with a live-boot 401/200 round-trip (mock webServer/auth + isolated instance). **0.1.x was not tested**; the "supports dsh 0.1.5" claim is gone.
 
 ### Settings page saves but nothing changes
 
-On 0.2.x the settings service was redesigned and the plugin takes a degraded path. The page renders, but "edit → save → reload → applied" was not verified by this fork; worst case it displays values without reaching apply. Run the [README self-check list](../README.en.md#self-check-after-install); otherwise edit the profile patch config directly. **0.35's `retrieval.semantic` does not appear on the settings page** — profile patch only.
+On 0.2.x the settings service was redesigned and the plugin takes a degraded path. The page renders, but "edit → save → reload → applied" was not verified by this fork; worst case it displays values without reaching apply. Run the [README self-check list](../README.en.md#self-check-after-install); otherwise edit the profile patch config directly. **0.35's `retrieval.semantic` does not appear on the settings page** — profile patch only; **since 0.36 the bottom of the settings page also has the "Global memory (user-scope)" editor (data editing, not config)**.
 
 ### Tool set shrinks after dream / model changes
 

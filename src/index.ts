@@ -55,6 +55,7 @@ import { migrateLegacy } from './migrate.js'
 import { buildReflectMessage, checkReflectBudget, consecutiveToolSteps, PLUGIN_SOURCE, recordReflectSent, REFLECT_MARKER, scanTurn } from './reflect.js'
 import { isMeowSource } from './source.js'
 import { registerMemoryTools, setMemoryBudgetOptions, setMemoryGlobalDbProvider, setMemoryRetrievalOptions, setMemorySemanticOptions, setMemoryToolGate } from './tools.js'
+import { listGlobalMemory, saveGlobalMemory } from './global-edit.js'
 import { backfillEmbeddings, clearEmbeddingCache, embedTexts, semanticEnabled, semanticWeightOf } from './semantic.js'
 import { authGate, connectionAuthOf } from './auth-gate.js'
 import { resolveSlotText, setPromptLang } from './prompt-loader.js'
@@ -2124,7 +2125,74 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
           })()
         }),
       })
-      ctx.logger.info('meow-memory: dreamed-sessions snapshot + dream-events SSE + skip-dreams routes registered (behind auth gate)')
+      // 用户级全局记忆可视化编辑（0.36）：
+      //   GET  /meow-memory/global-memory → { trusted, entries }（只 soul/user/全局 rules）；
+      //   POST /meow-memory/global-memory → { action:create|save|archive|restore, ... }，
+      //        成功后给"相关会话"打 reinject 标记 → 下一轮用户消息重新注入更新后的全局记忆
+      //        （不改写历史消息；无即时 token 成本）。
+      const markRelatedSessionsForReinject = async (): Promise<number> => {
+        const persistence = (ctx as { get?: (name: string) => unknown }).get?.('sessionPersistence') as
+          | { list?: () => Promise<ReadonlyArray<PersistedSessionLike>> }
+          | undefined
+        const persisted = typeof persistence?.list === 'function' ? await persistence.list() : []
+        // windowIndex 是权威 sid→workspace 映射；sessionPersistence 补冷会话（仅当带 cwd）。
+        const targets = new Map<string, string>()
+        for (const [sid, w] of windowIndex) {
+          if (typeof sid === 'string' && typeof w === 'string' && w.length > 0) targets.set(sid, w)
+        }
+        for (const s of persisted) {
+          const sid = typeof s.id === 'string' ? s.id : ''
+          const cwd = typeof (s as { cwd?: unknown }).cwd === 'string' ? (s as { cwd: string }).cwd : ''
+          if (sid.length > 0 && cwd.length > 0 && !targets.has(sid)) targets.set(sid, cwd)
+        }
+        let count = 0
+        for (const [sid, w] of targets) {
+          try {
+            if (!existsSync(memoryDbPath(w, resolved.projectDir))) continue // 无记忆库不新建
+            if (storeTrustOf(w, resolved.projectDir)?.trusted !== true && !trustOf(w).trusted) continue
+            markReinjectPending(w, sid, resolved.projectDir)
+            count++
+          } catch {
+            /* 单个会话标记失败不影响其它会话 */
+          }
+        }
+        return count
+      }
+      registerOne({
+        kind: 'exact',
+        path: '/meow-memory/global-memory',
+        handler: gated((req, res) => {
+          void (async () => {
+            try {
+              if ((req as { method?: string }).method === 'POST') {
+                const body = await readJsonBody(req) as Record<string, unknown>
+                const action = body.action
+                if (action !== 'create' && action !== 'save' && action !== 'archive' && action !== 'restore') {
+                  return writeJson(res, 400, { ok: false, error: 'action must be create|save|archive|restore' })
+                }
+                const saved = saveGlobalMemory({
+                  action,
+                  id: typeof body.id === 'string' ? body.id : undefined,
+                  level: typeof body.level === 'string' ? body.level : undefined,
+                  content: typeof body.content === 'string' ? body.content : undefined,
+                  keywords: body.keywords as string | string[] | undefined,
+                  importance: typeof body.importance === 'number' ? body.importance : undefined,
+                  status: typeof body.status === 'string' ? body.status : undefined,
+                })
+                if (!saved.ok) return writeJson(res, 400, { ok: false, error: saved.error ?? 'save failed' })
+                const reinjected = await markRelatedSessionsForReinject()
+                ctx.logger.info(`meow-memory: global memory ${action} ${saved.entry?.level ?? ''}/${saved.entry?.id ?? ''} → ${reinjected} session(s) marked for reinject`)
+                return writeJson(res, 200, { ok: true, entry: saved.entry, reinjected })
+              }
+              const listed = listGlobalMemory()
+              return writeJson(res, 200, { trusted: listed.trusted, entries: listed.entries })
+            } catch (e) {
+              writeJson(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) })
+            }
+          })()
+        }),
+      })
+      ctx.logger.info('meow-memory: dreamed-sessions snapshot + dream-events SSE + skip-dreams + global-memory routes registered (behind auth gate)')
       return
     }
     if (attempt < 20) {
@@ -2332,6 +2400,7 @@ export { parseModelSpec, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, 
 export { collectDreamStates, headerOf, type PersistedSessionLike } from './dream-signal.js'
 export { MemoryDb, memoryDbPath, getDb, getGlobalDb, globalDbPath, closeAllDbs, closeGlobalDb, backupMemoryDb, backupGlobalDb, ensureMemoryStore, ensureGlobalStore, storeTrustOf, resetStoreTrustCache, type StoreTrust, LEVELS, newId, PROJECT_SUBCATEGORIES, projectList, projectCovers, projectLabel, relativeTime, isGlobalProject, isGlobalScope, globalProjectMarker, GLOBAL_PROJECT_CANON, GLOBAL_PROJECT_CANON_EN } from './db.js'
 export { migrateWorkspaceToGlobal, globalStoreRows } from './global-store.js'
+export { listGlobalMemory, saveGlobalMemory, GLOBAL_EDIT_LEVELS, GLOBAL_STORE_UNTRUSTED_ERROR, type GlobalMemoryEntry } from './global-edit.js'
 export { migrateLegacy } from './migrate.js'
 export { buildHitInjection, buildInjection, buildReinjection, buildProjectSectionText, readSeen, markSearched, markAccessed, readInjected, markInjected, markProjectQueried, readProjectQueried, markWritten, readWritten, markReinjectPending, clearReinjectPending, isReinjectPending, MAX_REINJECT_PROJECTS, MAX_REINJECT_WRITTEN, sessionsFile, getCurrentProject, setCurrentProject, releaseSeen } from './inject.js'
 export { buildReflectMessage, checkReflectBudget, consecutiveToolSteps, recordReflectSent, resetGlobalReflectCounter, scanTurn } from './reflect.js'

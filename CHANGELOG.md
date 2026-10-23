@@ -1,6 +1,39 @@
 # Changelog
 
-本文件从上游 `Phant0Meow/dsh-meow-memory` v0.31.1 接续。**0.32.0 起为本仓库（hardened fork）的版本，当前 0.35.1**，与上游无隶属关系；上游变更历史见 <https://github.com/Phant0Meow/dsh-meow-memory/blob/main/CHANGELOG.md>。
+本文件从上游 `Phant0Meow/dsh-meow-memory` v0.31.1 接续。**0.32.0 起为本仓库（hardened fork）的版本，当前 0.36.0**，与上游无隶属关系；上游变更历史见 <https://github.com/Phant0Meow/dsh-meow-memory/blob/main/CHANGELOG.md>。
+
+## v0.36.0 (2026-10-23) — 全局记忆可视化编辑 + 下轮重注入
+
+用户请求的功能：不用模型工具，直接在设置页编辑**用户级全局记忆**，保存后让相关会话在下一轮看到新内容。0.35.1 的全部行为保留；**无新增配置项**（纯 UI + 插件私有路由）。
+
+### 可视化编辑器（设置页 →「喵记忆」底部）
+
+- 新增卡片「全局记忆（用户级）」：列表只显示 user-scope 全局库的 `soul` / `user` / 全局 `rules`（含 archived/stale，可恢复）；project-scoped rules 与 fact/lesson/topic 不在其中（仍按工作区、用 `memory_*` 工具管理）。
+- 每条可内联编辑 `content`（textarea）、`keywords`（逗号分隔；留空自动从内容分词派生 1..30 个）、`importance`（整数 1..100）；按钮**保存 / 归档 / 恢复**；底部「新增全局记忆」可选层级（soul/user/rules）+ 内容 + 关键词 + 重要性；「刷新」。
+- 校验：内容 trim 后 1..4000 字符；关键词 ≤30；importance 1..100；`title` 走 DB 默认（null）；**无硬删除**（归档代替）；同 id 并发编辑 **last-write-wins**。
+- i18n：新增 **22 个 UI 文案键**（zh / en / pt-br 三语，键集对齐由 `npm test` 卡住）。
+
+### 插件私有路由（auth-gated）
+
+- 新增 `GET /meow-memory/global-memory`（`{ trusted, entries }`）与 `POST /meow-memory/global-memory`（`create|save|archive|restore`），与其它插件路由同款 `connection.requestRejection` 鉴权闸（未认证 401）。
+- **只读写 user-scope 全局库**，不碰工作区库；全局库未受信/foreign 时列表为空、写入返回固定错误 `global store unavailable or untrusted`（不打开 foreign 库）。无新增配置项。
+
+### 保存后的下轮重注入（传播）
+
+- 任何成功保存（create/save/archive/restore）后，host 给「相关会话」打 **reinject 标记**：window index 里的会话 + `sessionPersistence` 列表里有 cwd 的会话，且必须已有**受信** memory.db；这些会话在**下一轮用户消息**复用压缩重注入通道重新注入更新后的全局记忆，并清掉标记。
+- **不改写历史消息**；**不产生即时的额外模型调用**；没有下一轮消息的会话保留旧快照。返回给 UI 的计数显示为「已保存 · 已标记 N 个会话下一轮重新注入」。归档/恢复同样触发（注入内容变了）。
+
+### 语义与存储联动
+
+- 内容/关键词变化会**清掉该条 embedding**（避免旧向量）；下次 apply 的 background backfill 或下一次写入重新生成；**仅 importance 变化保留向量**。编辑器本身不发任何 embedding 请求。
+
+### 测试
+
+- `npm test`：**1285 条断言全绿**（host 925 + client 360），0 失败；`tests/hardening.mjs` **283 → 349**（+66：editor 单元、路由、传播、组件；mock webServer/auth + live boot 401/200 round-trip）。`node smoke.mjs` 29 条；`check-lang` en/pt-br 语言包（11 槽位）通过。
+
+### 已知限制
+
+- 仅全局作用域（项目级记忆仍按工作区）；保存必须等会话**下一轮用户消息**才生效；**无硬删除/批量导入/冲突合并**；路由是插件私有（非公开 API）；归档条目不注入但仍保留在库中；last-write-wins；dream/反思之后仍可能重整条目。
 
 ## v0.35.1 (2026-10-23) — 审计后修正（语义端点传输/回填/遗忘复习）
 

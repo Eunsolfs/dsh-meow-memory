@@ -1,9 +1,9 @@
-# Configuration reference (0.35 fork)
+# Configuration reference (0.36 fork)
 
 Every field is optional. Two ways to set them:
 
 - **Config file** (profile patch / `cordis.patch.yml` under `config:`) — **the 0.32 `security` / `budget` / `retrieval` groups (including 0.35's `retrieval.semantic`) can only be set this way**;
-- **DSH settings page**, the "Meow memory" tab — covers the fields that existed in 0.31 (master switch, directories, hits, reflection, dream, delegate, language). Per-field save; "Restore default" goes back to the plugin factory default, not the patch baseline.
+- **DSH settings page**, the "Meow memory" tab — covers the fields that existed in 0.31 (master switch, directories, hits, reflection, dream, delegate, language). Per-field save; "Restore default" goes back to the plugin factory default, not the patch baseline. **Since 0.36 the bottom of the page also provides the "Global memory (user-scope)" visual editor (data editing, not config).**
 
 All changes take effect after a **hot reload or restart of the meow-memory plugin** (config is parsed once at apply).
 
@@ -113,6 +113,17 @@ All changes take effect after a **hot reload or restart of the meow-memory plugi
 - **Fallback**: an absent/untrusted/unavailable global store falls back to 0.32 single-workspace behaviour; there is **no `trustWorkspaceMemory` config override for the global store** (a global dir copied/synced from another machine is foreign).
 - **Note**: the global store moves with `homeDir` / `memory_home` (close the connection first on Windows); `backup.enabled` backs up both the workspace store and the global store (an empty/untrusted global store is skipped and no directory is created).
 
+### UI editing: global memory (0.36)
+
+Settings page → "Meow memory" → bottom card "Global memory (user-scope)". **No new config fields**; the data still lives in `<activeHomeDir>/global/memory.db`.
+
+- **Scope**: lists only user-scope global `soul` / `user` / global `rules` (including archived/stale, restorable); project-scoped rules and fact/lesson/topic are not included (they stay per workspace and are managed via `memory_*` tools).
+- **Editing**: per entry inline edit `content` (textarea), `keywords` (comma-separated; empty auto-derives 1..30 from the content), `importance` (integer 1..100); buttons Save / Archive / Restore; "New global memory" with level + content + keywords + importance; Refresh.
+- **Validation/semantics**: content trimmed 1..4000 chars; keywords 1..30; title left to the DB default (null); **no hard delete** (archive instead); concurrent edits to the same id are **last-write-wins**; content/keywords changes **clear that entry's embedding** (rebuilt by a later backfill/write), importance-only saves keep it.
+- **Propagation**: after a successful save the host marks **related sessions** (window index + `sessionPersistence` sessions with a cwd, and an existing **trusted** memory.db) for reinject; those sessions re-inject on their **next user message** via the post-compaction re-injection channel (bounded by `budget.reinjectMaxChars`) and then clear the mark. **No history rewrite, no immediate model call**; sessions with no next message keep their old snapshot; archive/restore trigger it too.
+- **Security**: `GET/POST /meow-memory/global-memory` uses the same auth gate as the other plugin routes; it **only reads/writes the user-scope global store**, never workspace stores; with an untrusted/foreign global store the list is empty and writes return `global store unavailable or untrusted` (the foreign store is not opened). The UI is a user-explicit channel; dream/reflection can still reorganize entries afterwards.
+- **Limits**: global scope only; takes effect on the session's next user message; no hard delete / bulk import / conflict merge; the routes are plugin-private (not a public API); archived entries are not injected but remain in the store.
+
 ---
 
 ## Security gates (new in 0.32, reload required)
@@ -131,7 +142,7 @@ All changes take effect after a **hot reload or restart of the meow-memory plugi
 - **store exists (even schema-only / row-empty) without a valid marker** → `trustWorkspaceMemory` decides `config-trusted` / **foreign**; a foreign store is never opened by normal chat turns (read-only probe only): no upgrade, no index creation, no migration, no read;
 - the marker always lives inside the memory directory, never in the workspace root.
 - `workspace` paths are compared after **realpath normalisation** (opening the same store through a junction / mapped drive / subst alias is no longer misjudged as foreign; aliases that cannot be resolved still fail closed).
-- Trust-gate coverage (0.32.1): HTTP data routes (`GET /meow-memory/dreamed-sessions`, `GET/POST /meow-memory/skip-dreams`; POST returns 403 for untrusted), session window-activity tracking, and startup window-index restore — none of them open/upgrade an untrusted store just for bookkeeping.
+- Trust-gate coverage (0.32.1; new 0.36 route included): HTTP data routes (`GET /meow-memory/dreamed-sessions`, `GET/POST /meow-memory/skip-dreams`; POST returns 403 for untrusted; `GET/POST /meow-memory/global-memory` only reads/writes the user-scope global store and refuses writes when untrusted), session window-activity tracking, and startup window-index restore — none of them open/upgrade an untrusted store just for bookkeeping.
 
 > Why untrusted by default: workspaces are often `git clone`d repositories. The old behaviour auto-injected `.dsh-meow/memory.db` / `PROJECT.md` shipped by the repo as "user long-term memory", a persistent prompt-injection channel (#64-1). Confirm the store is yours, then trust it or delete/rebuild it. Since 0.32, calls to an untrusted store are **refused** (not "return empty"), so the model cannot keep using untrusted data as if it were trusted context.
 >
