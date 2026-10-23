@@ -2141,12 +2141,17 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
           if (typeof sid === 'string' && typeof w === 'string' && w.length > 0) targets.set(sid, w)
         }
         for (const s of persisted) {
-          const sid = typeof s.id === 'string' ? s.id : ''
-          const cwd = typeof (s as { cwd?: unknown }).cwd === 'string' ? (s as { cwd: string }).cwd : ''
+          // 0.2.1 冷会话是 {header:{id,cwd}} 形状，不是扁平 {id,cwd}；必须用 headerOf
+          // 读，否则 header 形状的冷会话永远标不上（0.36.1 review C1）。
+          const h = headerOf(s)
+          const sid = h.id
+          const cwd = h.cwd ?? ''
           if (sid.length > 0 && cwd.length > 0 && !targets.has(sid)) targets.set(sid, cwd)
         }
         let count = 0
+        // 上限保护：极多会话时标记写入也应有界（单次保存最多扫 2000 个会话）。
         for (const [sid, w] of targets) {
+          if (count >= 2000) break
           try {
             if (!existsSync(memoryDbPath(w, resolved.projectDir))) continue // 无记忆库不新建
             if (storeTrustOf(w, resolved.projectDir)?.trusted !== true && !trustOf(w).trusted) continue

@@ -1776,6 +1776,8 @@ const tick = (ms = 10) => new Promise((r) => setTimeout(r, ms))
         return {
           list: async () => [
             { id: 'persisted-trusted', cwd: wsPersisted },
+            // 0.2.1 冷会话是 {header:{id,cwd}} 形状（review C1）：必须也能被标记。
+            { header: { id: 'persisted-header', cwd: wsPersisted } },
             { id: 'persisted-foreign', cwd: wsPersistedForeign },
             { id: 'persisted-nodb', cwd: wsNoDb },
             { id: 'persisted-no-cwd' },
@@ -1815,7 +1817,7 @@ const tick = (ms = 10) => new Promise((r) => setTimeout(r, ms))
 
   const created = await invoke({ method: 'POST', cookie: 'dsh-auth=ok', body: { action: 'create', level: 'soul', content: 'GLOBAL-EDIT-SOUL 全局持久化内容' } })
   check('global-memory POST create: 200 with entry', created.code === 200 && created.json.ok === true && typeof created.json.entry?.id === 'string')
-  check('global-memory POST create: propagation counted trusted sessions only', created.json.reinjected === 2, JSON.stringify(created.json.reinjected))
+  check('global-memory POST create: propagation counted trusted sessions only', created.json.reinjected === 3, JSON.stringify(created.json.reinjected))
   const listed1 = await invoke({ method: 'GET', cookie: 'dsh-auth=ok' })
   check('global-memory GET after create: new entry visible + stored in isolated global db',
     listed1.code === 200 && listed1.json.entries.some((e) => e.id === created.json.entry.id) &&
@@ -1824,6 +1826,7 @@ const tick = (ms = 10) => new Promise((r) => setTimeout(r, ms))
   // 传播：可信会话被标记，foreign/无库跳过
   check('propagation: trusted window session marked for reinject', isReinjectPending(wsTrusted, 'sid-trusted', '.dsh-meow') === true)
   check('propagation: trusted persisted session marked for reinject', isReinjectPending(wsPersisted, 'persisted-trusted', '.dsh-meow') === true)
+  check('propagation: header-shaped cold session marked for reinject', isReinjectPending(wsPersisted, 'persisted-header', '.dsh-meow') === true)
   check('propagation: foreign window session not marked', isReinjectPending(wsForeign, 'sid-foreign', '.dsh-meow') === false && !existsSync(sessionsFile(wsForeign, 'sid-foreign', '.dsh-meow')))
   check('propagation: foreign persisted session not marked', isReinjectPending(wsPersistedForeign, 'persisted-foreign', '.dsh-meow') === false && !existsSync(sessionsFile(wsPersistedForeign, 'persisted-foreign', '.dsh-meow')))
   check('propagation: no-db sessions get no sessions file', !existsSync(sessionsFile(wsNoDb, 'sid-nodb', '.dsh-meow')) && !existsSync(sessionsFile(wsNoDb, 'persisted-nodb', '.dsh-meow')))

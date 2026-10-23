@@ -230,8 +230,8 @@ Switching moves (same disk) or copies (cross disk); the old directory is **never
 The "Global memory (user-scope)" card at the bottom of the settings page ("Meow memory" tab) is a **user-explicit** channel: it only edits the user-scope global store's `soul` / `user` / global `rules` (including archive/restore/create), **registers no new tool and does not change `memory_*` behaviour**. It reads/writes the global store through the plugin-private `GET/POST /meow-memory/global-memory` (same auth gate) and never touches workspace stores; with an untrusted global store it shows a warning and refuses writes.
 
 - Division of work: `memory_*` still covers all levels/both stores (including project-level memory); the editor covers global scope only.
-- After a save the host marks related sessions for reinject; those sessions re-inject the updated global memory on their **next user message** (no history rewrite, no immediate model call). What the model sees is "the injected content changed on the next turn", not an extra tool call.
-- Validation/limits: content 1–4000 chars, keywords 1–30, importance 1–100; no hard delete (archive); last-write-wins; global scope only; effective on the next message.
+- After a save the host marks related sessions for reinject (window index + `sessionPersistence`; **both the header shape `{header:{id,cwd}}` and the flat `{id,cwd}` shape are read**, fixed in 0.36.1, so cold sessions are marked too; at most 2000 sessions per save, already pending not rewritten); those sessions re-inject the updated global memory on their **next user message** (no history rewrite, no immediate model call). What the model sees is "the injected content changed on the next turn", not an extra tool call.
+- Validation/limits: content 1–4000 chars, keywords 1–30, importance 1–100; no hard delete (archive); last-write-wins; global scope only; effective on the next message; marking is bounded (≤2000 sessions per save).
 
 ---
 

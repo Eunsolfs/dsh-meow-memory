@@ -1,6 +1,24 @@
 # Changelog
 
-本文件从上游 `Phant0Meow/dsh-meow-memory` v0.31.1 接续。**0.32.0 起为本仓库（hardened fork）的版本，当前 0.36.0**，与上游无隶属关系；上游变更历史见 <https://github.com/Phant0Meow/dsh-meow-memory/blob/main/CHANGELOG.md>。
+本文件从上游 `Phant0Meow/dsh-meow-memory` v0.31.1 接续。**0.32.0 起为本仓库（hardened fork）的版本，当前 0.36.1**，与上游无隶属关系；上游变更历史见 <https://github.com/Phant0Meow/dsh-meow-memory/blob/main/CHANGELOG.md>。
+
+## v0.36.1 (2026-10-23) — 传播修复（冷会话 header 形状）
+
+独立复审对 0.36.0 的一个 P2 修复：编辑全局记忆后的"下一轮重注入"标记漏掉了 **DSH 0.2.1 的 header 形状冷会话**。无配置/API 变更；测试计数 1285 → **1286**。
+
+### 修复
+
+- **传播改为用 `headerOf(session)` 读取 id/cwd**：0.2.1 的持久会话是 `{header:{id,cwd}}` 形状，0.36.0 只读了扁平 `s.id/s.cwd`，导致 header 形状的冷会话（未打开/未进 window-index）永远不会被标 reinject；0.36.0 changelog 里"冷会话也会标"的说法是**过度声明**。现在 window-index 会话 + `sessionPersistence` 里的会话**两种形状都读**（header 与扁平），仍要求已有**受信** memory.db。
+- **标记写入有界 + 幂等**：单次保存最多标记 **2000** 个会话（防极多会话时无界写）；用 sid→workspace map 去重；`markReinjectPending` 保持幂等——已经 pending 的会话不重复写文件。
+- 传播语义本身不变：下一轮用户消息复用压缩重注入通道、不改写历史、无即时模型调用、无下一轮消息则保留旧快照。
+
+### 测试
+
+- 新增回归：header 形状的冷会话被标记 + 计数为 3；`tests/hardening.mjs` **349 → 350**，总计 **1286**（host 926 + client 360），0 失败；`node smoke.mjs` 29 条；`check-lang` en/pt-br（11 槽位）通过。
+
+### 已知限制（不变）
+
+- 仍是**下一轮**才生效；标记有界（**≤2000 会话/次保存**）；无硬删除；仅全局作用域；last-write-wins。
 
 ## v0.36.0 (2026-10-23) — 全局记忆可视化编辑 + 下轮重注入
 
@@ -20,7 +38,7 @@
 
 ### 保存后的下轮重注入（传播）
 
-- 任何成功保存（create/save/archive/restore）后，host 给「相关会话」打 **reinject 标记**：window index 里的会话 + `sessionPersistence` 列表里有 cwd 的会话，且必须已有**受信** memory.db；这些会话在**下一轮用户消息**复用压缩重注入通道重新注入更新后的全局记忆，并清掉标记。
+- 任何成功保存（create/save/archive/restore）后，host 给「相关会话」打 **reinject 标记**：window index 里的会话 + `sessionPersistence` 列表里的会话（0.36.0 只读扁平 `s.id/s.cwd`，header 形状冷会话漏标；0.36.1 改 `headerOf` 后两种形状都读），且必须已有**受信** memory.db；这些会话在**下一轮用户消息**复用压缩重注入通道重新注入更新后的全局记忆，并清掉标记。0.36.1 起单次保存最多标记 **2000** 个会话，已 pending 不重写（幂等）。
 - **不改写历史消息**；**不产生即时的额外模型调用**；没有下一轮消息的会话保留旧快照。返回给 UI 的计数显示为「已保存 · 已标记 N 个会话下一轮重新注入」。归档/恢复同样触发（注入内容变了）。
 
 ### 语义与存储联动
