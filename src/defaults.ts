@@ -59,6 +59,16 @@ export const CONFIG_DEFAULTS = {
     minScore: 0.35,
     hitBoost: true,
     importanceWeight: true,
+    /** 0.35 可选语义检索：默认关闭（零联网）；显式配置 OpenAI-compatible
+     *  `/embeddings` 端点后才启用（key 走 env）。失败/超时回退纯词法。 */
+    semantic: {
+      enabled: false,
+      baseUrl: '',
+      model: '',
+      apiKeyEnv: 'MEOW_MEMORY_EMBEDDING_KEY',
+      timeoutMs: 5000,
+      weight: 0.8,
+    },
   },
   dream: {
     enabled: true,

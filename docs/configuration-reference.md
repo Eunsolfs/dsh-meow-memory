@@ -1,13 +1,13 @@
-# Configuration reference (0.34 fork)
+# Configuration reference (0.35 fork)
 
 Every field is optional. Two ways to set them:
 
-- **Config file** (profile patch / `cordis.patch.yml` under `config:`) — **the 0.32 `security` / `budget` / `retrieval` groups can only be set this way**;
+- **Config file** (profile patch / `cordis.patch.yml` under `config:`) — **the 0.32 `security` / `budget` / `retrieval` groups (including 0.35's `retrieval.semantic`) can only be set this way**;
 - **DSH settings page**, the "Meow memory" tab — covers the fields that existed in 0.31 (master switch, directories, hits, reflection, dream, delegate, language). Per-field save; "Restore default" goes back to the plugin factory default, not the patch baseline.
 
 All changes take effect after a **hot reload or restart of the meow-memory plugin** (config is parsed once at apply).
 
-> 0.32 hardening: default automatic behaviour goes from unbounded to bounded. No feature is silently switched off. Since 0.33 storage is **two-layer: a user-scope global store + the workspace store** (automatic migration + fallback, no new config fields), and retrieval adds an **offline hybrid lexical floor** (no config toggle). To cut cost, see [Turning automatic spend off](#turning-automatic-spend-off).
+> 0.32 hardening: default automatic behaviour goes from unbounded to bounded. No feature is silently switched off. Since 0.33 storage is **two-layer: a user-scope global store + the workspace store** (automatic migration + fallback, no new config fields), and retrieval adds an **offline hybrid lexical floor** (no config toggle). 0.35 adds **optional semantic retrieval** (`retrieval.semantic`, off by default = zero network; enabling it requires your own OpenAI-compatible `/embeddings` endpoint). To cut cost, see [Turning automatic spend off](#turning-automatic-spend-off).
 
 ---
 
@@ -49,6 +49,13 @@ All changes take effect after a **hot reload or restart of the meow-memory plugi
       minScore: 0.35
       hitBoost: true
       importanceWeight: true
+      semantic:                  # new in 0.35: optional semantic retrieval (off = zero network)
+        enabled: false
+        baseUrl: ''
+        model: ''
+        apiKeyEnv: 'MEOW_MEMORY_EMBEDDING_KEY'
+        timeoutMs: 5000
+        weight: 0.8
     dream:
       enabled: true
       idleMinutes: 180
@@ -162,12 +169,20 @@ All changes take effect after a **hot reload or restart of the meow-memory plugi
 | `retrieval.minScore` | number 0–1 | `0.35` | Minimum score for a keyword hit to be injected |
 | `retrieval.hitBoost` | bool | `true` | Hit-count reinforcement: `×(1 + 0.15·ln(1+hit_count))`, capped at 2.0 |
 | `retrieval.importanceWeight` | bool | `true` | Importance participates in ranking: `×(0.85 + 0.05·importance)` (1→0.9, 4→1.05) |
+| `retrieval.semantic.enabled` | bool | `false` | **0.35**: semantic retrieval master switch. Enabled only when `true` and `baseUrl`/`model` are non-empty; off (default) = **zero network requests**, behaviour identical to 0.34 |
+| `retrieval.semantic.baseUrl` | string | `''` | OpenAI-compatible endpoint base (the request goes to `${baseUrl}/embeddings`, e.g. `http://127.0.0.1:11434/v1`) |
+| `retrieval.semantic.model` | string | `''` | Embedding model name (served by the endpoint; no model is bundled) |
+| `retrieval.semantic.apiKeyEnv` | string | `'MEOW_MEMORY_EMBEDDING_KEY'` | Env var holding the key. **If the default var is unset, requests are sent keyless** (local Ollama/LM Studio); only a *custom* var name that is missing counts as unconfigured (no request). When the key exists, `Authorization: Bearer $env` is sent |
+| `retrieval.semantic.timeoutMs` | number 200–60000 | `5000` | Per-request embedding timeout (ms); timeout/failure silently falls back to pure lexical |
+| `retrieval.semantic.weight` | number 0–1 | `0.8` | Semantic floor blend weight: `relevance = max(lexical, fuzzy, cos·weight·importanceWeight)`; `0` disables semantic scoring (requests may still happen — set `enabled: false` to stay offline) |
 
 The per-message hit score is **not BM25**: keyword intersection × IDF × **query coverage** × exponential recency × importance weight × title boost. `memory_search` is BM25 (BM25 × recency).
 
 > **0.33 hybrid lexical floor (fuzzy, no config toggle)**: character bigram Jaccard + 0.25×trigram Jaccard (NFKC, letters/digits only, CJK-safe without segmentation), noise floor 0.2. It is only a **floor** when BM25 is weak: `score = max(BM25, 0.55·fuzzy·recency·importance)` (per-message chain: `relevance = max(BM25 relevance, fuzzy)`); strong BM25 ordering is unchanged; `memory_search explain=true` may include `fuzzy`. Pure BM25 is a test/internal option (`SearchOptions.fuzzy = false`), not a user config field.
 
 > Since 0.32 coverage is `matched query tokens / total query tokens`. The old denominator was the entry's keyword-token count, so writing more keywords (as the prompts demand) *lowered* the score — the exact opposite of the intent. Raise `minScore` (e.g. 0.5) for a quieter chain, lower it for higher recall.
+
+> **0.35 optional semantic retrieval (`retrieval.semantic`, off by default)**: when enabled, cosine similarity between the query and entry embeddings is **also a floor**, with a **0.25 noise floor** (cos < 0.25 counts as 0, so unrelated entries cannot slip in on tiny similarity; negative/zero similarity counts as 0): `relevance = max(lexical, fuzzy, cos·weight·importanceWeight)`; `memory_search` multiplies by recency and `explain` gains `semantic`. **It is not a rerank** and may admit weak matches. Data flow: with it enabled, `memory_remember`/`memory_update` (content/keywords changes) embed inline after the write (bounded by `timeoutMs`, failures silent); after plugin apply it **backfills in the background** the global store (soul/user/rules) and every trusted workspace (project/fact/lesson/topic/rules), ≤50 rows per level, retrying next start on failure. Embeddings live in a nullable `embedding TEXT` (JSON) column added lazily to each table and therefore travel with the DB/backups. **Privacy**: with it enabled, **memory bodies/titles/keywords** and **user message/query text** are sent to your configured `/embeddings` endpoint; with it disabled nothing is sent. **Changing the embedding model invalidates stored vectors** (model-specific; different dimensions count as 0) — re-write entries or clear and re-backfill. An unreachable endpoint silently degrades to pure lexical and never blocks injection/retrieval/writes. The settings page does **not** expose these fields.
 
 ---
 

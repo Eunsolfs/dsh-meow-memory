@@ -144,6 +144,8 @@ export interface MemoryRow {
   created_at: number
   updated_at: number // 记忆时间戳 = 最后更新时间（dream 封存或 memory_update 刷新）
   last_accessed_at: number | null
+  /** 语义检索向量（0.35，可选）：JSON 数组缓存在 embedding 列；未回填/损坏 → null。 */
+  embedding?: number[] | null
 }
 
 export interface MemoryPatch {
@@ -164,6 +166,33 @@ export function newId(now = Date.now()): string {
   return t + '-' + randomUUID().replace(/-/g, '').slice(0, 26)
 }
 
+/** embedding 列 JSON 解析（安全）：非字符串 / 非法 JSON / 非数组 / 空数组 / 含非有限数
+ *  → null（视作未回填）；绝不抛出（损坏的存量数据不能拖垮整条读链路）。 */
+function parseEmbedding(raw: unknown): number[] | null {
+  if (typeof raw !== 'string' || raw.length === 0) return null
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed) || parsed.length === 0) return null
+    const out: number[] = []
+    for (const v of parsed) {
+      if (typeof v !== 'number' || !Number.isFinite(v)) return null
+      out.push(v)
+    }
+    return out
+  } catch {
+    return null
+  }
+}
+
+/** embedding 列 JSON 序列化（安全）：null/undefined/空数组/含非有限数 → null（不写垃圾）。 */
+function serializeEmbedding(vec: number[] | null | undefined): string | null {
+  if (!Array.isArray(vec) || vec.length === 0) return null
+  for (const v of vec) {
+    if (typeof v !== 'number' || !Number.isFinite(v)) return null
+  }
+  return JSON.stringify(vec)
+}
+
 const COMMON_COLS = `
   id TEXT PRIMARY KEY,
   title TEXT,
@@ -175,7 +204,8 @@ const COMMON_COLS = `
   hit_count INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
-  last_accessed_at INTEGER
+  last_accessed_at INTEGER,
+  embedding TEXT
 `
 
 /** level → 建表语句（差异列按层特化）。表名来自 LEVELS 枚举，不拼外部输入。 */
@@ -511,6 +541,10 @@ export class MemoryDb {
       if (level === 'topic' && !cols.has('project')) {
         this.db.exec('ALTER TABLE topic ADD COLUMN project TEXT')
       }
+      // 0.35：语义检索向量列（可空）。老库就地补列，存量行保持 NULL（= 待回填）。
+      if (!cols.has('embedding')) {
+        this.db.exec(`ALTER TABLE ${level} ADD COLUMN embedding TEXT`)
+      }
       // 旧 UUID（不以 9 位时间前缀开头）→ 按 created_at 重写 id
       const legacy = this.db.prepare(`SELECT id FROM ${level}`).all() as Array<{ id: string }>
       for (const { id } of legacy) {
@@ -602,6 +636,7 @@ export class MemoryDb {
       created_at: row.created_at ?? now,
       updated_at: row.updated_at ?? now,
       last_accessed_at: row.last_accessed_at ?? null,
+      embedding: row.embedding ?? null,
     }
     this.writeInsert(full)
     return full
@@ -615,16 +650,17 @@ export class MemoryDb {
     return row
   }
 
-  /** insert()/insertRow() 共用的一条 INSERT（差异列按 level 特化；表名来自 LEVELS）。 */
+  /** insert()/insertRow() 共用的一条 INSERT（差异列按 level 特化；表名来自 LEVELS）。
+   *  0.35 起带 embedding 列：调用方给的向量原样序列化，非法/缺省写 NULL。 */
   private writeInsert(full: MemoryRow): void {
     this.db
       .prepare(
-        `INSERT INTO ${full.level} (id, title, content, importance, keywords, status, source_session, hit_count, created_at, updated_at, last_accessed_at
+        `INSERT INTO ${full.level} (id, title, content, importance, keywords, status, source_session, hit_count, created_at, updated_at, last_accessed_at, embedding
           ${full.level === 'project' ? ', project, subcategory' : ''}
           ${full.level === 'fact' || full.level === 'lesson' || full.level === 'rules' ? ', project' : ''}
           ${full.level === 'lesson' ? ', corrected' : ''}
           ${full.level === 'topic' ? ', goal, project' : ''}
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
           ${full.level === 'project' ? ', ?, ?' : ''}
           ${full.level === 'fact' || full.level === 'lesson' || full.level === 'rules' ? ', ?' : ''}
           ${full.level === 'lesson' ? ', ?' : ''}
@@ -643,6 +679,7 @@ export class MemoryDb {
         full.created_at,
         full.updated_at,
         full.last_accessed_at,
+        serializeEmbedding(full.embedding),
         ...(full.level === 'project' ? [full.project ?? '', full.subcategory] : []),
         ...(full.level === 'fact' || full.level === 'lesson' || full.level === 'rules' ? [full.project] : []),
         ...(full.level === 'lesson' ? [full.corrected] : []),
@@ -741,6 +778,38 @@ export class MemoryDb {
     }
   }
 
+  /** 写入/清除单条 embedding（0.35 语义检索数据层）：只改 embedding 列——**不刷新**
+   *  updated_at / hit_count（后台回填不得污染"记忆时间戳"与命中统计）。
+   *  传 null = 清除；空数组/含非有限数的非法向量 → false（不写、不清）。
+   *  短 id 走 update 同款「前缀唯一才解析」口径：歧义/未知 → false，绝不抛出。 */
+  setEmbedding(level: Level, id: string, vec: number[] | null): boolean {
+    if (!(LEVELS as readonly string[]).includes(level)) return false
+    if (typeof id !== 'string' || id.length === 0) return false
+    const value = vec === null ? null : serializeEmbedding(vec)
+    if (vec !== null && value === null) return false
+    let targetId = id
+    if (id.length < 36) {
+      let matches: Array<{ id: string }>
+      try {
+        matches = this.db.prepare(`SELECT id FROM ${level} WHERE id LIKE ?`).all(`${id}%`) as Array<{ id: string }>
+      } catch {
+        return false
+      }
+      if (matches.length !== 1) {
+        if (matches.length > 1) {
+          console.warn(`[meow-memory] setEmbedding 拒绝歧义短 id：${level} 前缀 "${id}" 命中 ${matches.length} 行，请用完整 id`)
+        }
+        return false
+      }
+      targetId = matches[0].id
+    }
+    try {
+      return this.db.prepare(`UPDATE ${level} SET embedding = ? WHERE id = ?`).run(value, targetId).changes > 0
+    } catch {
+      return false
+    }
+  }
+
   list(level: Level, opts: { status?: Status; project?: string } = {}): MemoryRow[] {
     const where: string[] = []
     const args: unknown[] = []
@@ -755,6 +824,23 @@ export class MemoryDb {
     const sql = `SELECT * FROM ${level}${where.length ? ' WHERE ' + where.join(' AND ') : ''} ORDER BY created_at DESC`
     const rows = this.db.prepare(sql).all(...args) as Record<string, unknown>[]
     return rows.map((r) => this.fromRow(level, r))
+  }
+
+  /** 待回填 embedding 的条目（0.35 语义检索后台回填用）：status='active' 且 embedding
+   *  为 NULL（兼容历史空串），按记忆时间戳从新到旧；limit 夹在 1..1000，避免一次全库。 */
+  listMissingEmbedding(level: Level, limit = 200): MemoryRow[] {
+    if (!(LEVELS as readonly string[]).includes(level)) return []
+    const n = Number.isFinite(limit) ? Math.max(1, Math.min(1000, Math.floor(limit))) : 200
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM ${level} WHERE status = 'active' AND (embedding IS NULL OR embedding = '') ORDER BY updated_at DESC LIMIT ?`,
+        )
+        .all(n) as Record<string, unknown>[]
+      return rows.map((r) => this.fromRow(level, r))
+    } catch {
+      return []
+    }
   }
 
   /** 全部 active 条目（dream / 注入用），按 level 分组。 */
@@ -1116,6 +1202,7 @@ export class MemoryDb {
       created_at: Number(r.created_at),
       updated_at: Number(r.updated_at),
       last_accessed_at: r.last_accessed_at == null ? null : Number(r.last_accessed_at),
+      embedding: parseEmbedding(r.embedding),
     }
   }
 }

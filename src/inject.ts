@@ -52,6 +52,11 @@ export interface InjectOptions {
   /** 用户级全局记忆库（Phase 2 分层存储）：soul/user/全局 rules 优先取它、工作区库兜底；
    *  不传 = 0.32 纯工作区行为（旧调用方/测试行为不变）。项目全景/重注入第三块始终工作区。 */
   globalDb?: MemoryDb
+  /** 语义检索（Phase 3，可选）：query 向量（由调用方经 semantic.embedTexts 得到）。
+   *  不传/null = 纯词法命中打分（默认离线、零网络、旧行为不变）。 */
+  queryEmbedding?: number[] | null
+  /** 语义分混合权重（config semantic.weight，默认 0.8；只有 queryEmbedding 存在时生效）。 */
+  semanticWeight?: number
 }
 
 /** 预算契约默认值（与 src/defaults.ts 的 budget.* 一致；index.ts 显式传入时以传入为准）。 */
@@ -302,6 +307,9 @@ function toDocs(rows: MemoryRow[]): Doc[] {
     keywords: r.keywords,
     importance: r.importance,
     hit_count: r.hit_count,
+    // 语义向量（Phase 3，0.35）：db 层 embedding 列（JSON 缓存）；缺省/损坏 → null，
+    // keywordHitScore 在没有 queryEmbedding 时完全不看这个字段（默认离线行为不变）。
+    embedding: r.embedding ?? null,
     created_at: r.created_at,
     updated_at: r.updated_at,
   }))
@@ -756,6 +764,10 @@ function hitQuery(
     minScore: o.minScore,
     hitBoost: o.hitBoost,
     importanceWeight: o.importanceWeight,
+    // 语义补分（Phase 3）：只有调用方显式传了 query 向量才启用；否则 keywordHitScore 行为与旧版完全一致。
+    ...(o.queryEmbedding !== undefined && o.queryEmbedding !== null
+      ? { semantic: { queryEmbedding: o.queryEmbedding, weight: o.semanticWeight } }
+      : {}),
   })
   const byId = new Map(hitRows.map((r) => [r.id, r]))
   // 展示/注入用原文 content（docs 的 content 只是 keywords 匹配面，不能当正文）。

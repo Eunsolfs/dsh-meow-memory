@@ -13,17 +13,18 @@
  * No LLM, no harness. Every mutable path is a temp dir; DSH_HOME/MEOW_MEMORY_HOME are
  * redirected before the plugin module is imported so nothing lands in the real home.
  */
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync, utimesSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync, utimesSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { createServer } from 'node:http'
 
 const HOME = mkdtempSync(join(tmpdir(), 'mm-hardening-home-'))
 process.env.MEOW_MEMORY_HOME = join(HOME, 'meow-home')
 process.env.DSH_HOME = join(HOME, 'dsh-home')
 
 const {
-  MemoryDb, memoryDbPath, getDb, getGlobalDb, globalDbPath, closeAllDbs, closeGlobalDb,
+  MemoryDb, memoryDbPath, getDb, getGlobalDb, globalDbPath, closeAllDbs, closeGlobalDb, newId,
   ensureMemoryStore, ensureGlobalStore, storeTrustOf, resetStoreTrustCache,
   migrateWorkspaceToGlobal, globalStoreRows,
   backupGlobalDb,
@@ -37,6 +38,7 @@ const {
   isolatedDreamAvailable, startIsolatedDream, disposeIsolatedDreams, buildIsolatedDigest,
   ISOLATED_DREAM_META_PREFIX, ISOLATED_DEFAULT_TIMEOUT_MINUTES, ISOLATED_DEFAULT_MAX_PROMPT_CHARS,
   CONFIG_DEFAULTS, factoryDefaultOf, abortDream,
+  embedTexts, semanticEnabled, semanticWeightOf, cosine, clearEmbeddingCache, setMemorySemanticOptionsForTests,
 } = await import('../lib/index.js')
 
 let passed = 0
@@ -49,6 +51,80 @@ const tmp = (prefix) => mkdtempSync(join(tmpdir(), prefix))
 const clean = (dir) => { try { closeAllDbs(); rmSync(dir, { recursive: true, force: true }) } catch { /* best effort */ } }
 const ownerOf = (ws, dir = '.dsh-meow') => join(ws, dir, '.owner.json')
 const giOf = (ws, dir = '.dsh-meow') => join(ws, dir, '.gitignore')
+
+// ── Phase 3 test fixtures：确定性 mock OpenAI-compatible /embeddings 服务 ──────────
+// 向量按话题词映射 8 维：deploy/ship/release→0、cache→1、auth/login→2、memory→3、
+// database/sql→4、user/customer→5、test/spec→6、dim7=0.01（保证范数非零）。
+const MOCK_EMBED_DIM = 8
+const mockVector = (text) => {
+  const t = String(text).toLowerCase()
+  const v = new Array(MOCK_EMBED_DIM).fill(0)
+  const mark = (re, i) => { if (re.test(t)) v[i] = 1 }
+  mark(/deploy|rollout|shipping|release|shipment/, 0)
+  mark(/cache|redis/, 1)
+  mark(/auth|login|token/, 2)
+  mark(/memory|recall/, 3)
+  mark(/database|sqlite|\bsql\b/, 4)
+  mark(/customer|people|\buser\b/, 5)
+  mark(/test|spec|\bqa\b/, 6)
+  v[7] = 0.01
+  return v
+}
+const startEmbeddingServer = () => new Promise((resolve) => {
+  const state = { requests: [], mode: 'ok' }
+  const sockets = new Set()
+  const server = createServer((req, res) => {
+    let body = ''
+    req.on('data', (chunk) => { body += chunk })
+    req.on('end', () => {
+      let parsed = null
+      try { parsed = JSON.parse(body) } catch { parsed = null }
+      state.requests.push({ url: req.url, auth: req.headers.authorization, body, parsed })
+      const send = (code, payload, raw = false) => {
+        try { res.writeHead(code, { 'content-type': 'application/json' }); res.end(raw ? payload : JSON.stringify(payload)) } catch { /* client aborted */ }
+      }
+      if (state.mode === '500') return send(500, { error: 'boom' })
+      if (state.mode === 'malformed') return send(200, 'not json', true)
+      if (state.mode === 'badshape') return send(200, { data: [] })
+      if (state.mode === 'hang') { setTimeout(() => send(200, { data: [] }), 3000).unref?.(); return }
+      if (parsed === null) return send(400, { error: 'bad request' })
+      const inputs = Array.isArray(parsed.input) ? parsed.input : [String(parsed.input ?? '')]
+      send(200, { data: inputs.map((text, index) => ({ index, embedding: mockVector(text) })), model: parsed.model ?? 'mock' })
+    })
+  })
+  server.on('connection', (socket) => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)) })
+  server.listen(0, '127.0.0.1', () => {
+    const port = server.address().port
+    resolve({
+      server,
+      port,
+      state,
+      url: `http://127.0.0.1:${port}/v1`,
+      setMode: (mode) => { state.mode = mode },
+      close: () => new Promise((done) => { for (const socket of sockets) { try { socket.destroy() } catch { /* ignore */ } } server.close(() => done()) }),
+    })
+  })
+})
+const semanticCfg = (srv, over = {}) => ({
+  enabled: true,
+  baseUrl: srv.url,
+  model: 'mock-embed',
+  apiKeyEnv: 'MEOW_MEMORY_EMBEDDING_KEY',
+  timeoutMs: 5000,
+  weight: 0.8,
+  ...over,
+})
+const withFetchSpy = async (fn) => {
+  const original = globalThis.fetch
+  const calls = []
+  globalThis.fetch = (...args) => { calls.push(args); return original(...args) }
+  try {
+    return { calls, result: await fn() }
+  } finally {
+    globalThis.fetch = original
+  }
+}
+const tick = (ms = 10) => new Promise((r) => setTimeout(r, ms))
 
 // ═══════════════════ 1. 工作区记忆库信任门（#64-1） ═══════════════════
 {
@@ -1194,6 +1270,351 @@ const giOf = (ws, dir = '.dsh-meow') => join(ws, dir, '.gitignore')
     check('config: apply accepts dream.isolated:true patch config (no throw, 10 tools)', threw === false && a.tools.length === 10, `tools=${a.tools.length}`)
     check('config: apply schedules dream normally with isolated config', a.logs.some((m) => m.includes('dream scheduled')))
   }
+}
+
+// ═══════════════════ 18. Phase 3：semantic.ts 单元 + mock embeddings 服务 ═══════════════════
+{
+  check('semantic: disabled by default in CONFIG_DEFAULTS', CONFIG_DEFAULTS.retrieval.semantic.enabled === false && CONFIG_DEFAULTS.retrieval.semantic.baseUrl === '' && CONFIG_DEFAULTS.retrieval.semantic.model === '')
+  check('semantic: enabled requires enabled + baseUrl + model',
+    semanticEnabled({ enabled: true, baseUrl: 'http://x/v1', model: 'm' }) === true &&
+    semanticEnabled({ enabled: true, baseUrl: '', model: 'm' }) === false &&
+    semanticEnabled({ enabled: false, baseUrl: 'http://x/v1', model: 'm' }) === false &&
+    semanticEnabled(undefined) === false)
+  check('semantic: default weight 0.8, override, invalid → 0.8',
+    semanticWeightOf(undefined) === 0.8 && semanticWeightOf({ weight: 0.3 }) === 0.3 &&
+    semanticWeightOf({ weight: -1 }) === 0.8 && semanticWeightOf({ weight: 'x' }) === 0.8)
+  check('semantic: cosine guards (identical/orthogonal/zero-norm/length-mismatch)',
+    cosine([1, 0], [1, 0]) === 1 && cosine([1, 0], [0, 1]) === 0 && cosine([0, 0], [1, 1]) === 0 &&
+    cosine([1], [1, 2]) === 0 && cosine(null, [1]) === 0)
+
+  const srv = await startEmbeddingServer()
+  const cfg = semanticCfg(srv)
+  const savedEmbedKeyEnv = process.env.MEOW_MEMORY_EMBEDDING_KEY
+  try {
+    clearEmbeddingCache()
+    const off = await withFetchSpy(() => embedTexts({ ...cfg, enabled: false }, ['x']))
+    check('semantic: disabled embedTexts → null with zero fetch', off.result === null && off.calls.length === 0)
+    const empty = await withFetchSpy(() => embedTexts(cfg, []))
+    check('semantic: empty input → [] without fetch', Array.isArray(empty.result) && empty.result.length === 0 && empty.calls.length === 0)
+
+    // 0.35.1 修复：默认 keyEnv（MEOW_MEMORY_EMBEDDING_KEY）未设置时允许无鉴权请求——
+    // 本地 Ollama/LM Studio 这类 keyless endpoint 不再需要塞一个假 env；只有显式配置成
+    // 其他变量名且变量缺失才视为未配置。
+    delete process.env.MEOW_MEMORY_EMBEDDING_KEY
+    const noKey = await embedTexts(semanticCfg(srv), ['x'])
+    check('semantic: default keyEnv unset → keyless request allowed (local endpoints)',
+      noKey !== null && srv.state.requests.length === 1 && srv.state.requests[0].auth === undefined)
+    await embedTexts({ ...semanticCfg(srv), apiKeyEnv: undefined }, ['x2'])
+    check('semantic: no apiKeyEnv field at all → keyless request allowed', srv.state.requests.length === 2 && srv.state.requests[1].auth === undefined)
+    process.env.MEOW_MEMORY_EMBEDDING_KEY = 'mock-key-123'
+    const reqBase = srv.state.requests.length
+
+    const r1 = await embedTexts(cfg, ['deployment pipeline'])
+    check('semantic: enabled embedTexts returns deterministic 8-dim vectors',
+      Array.isArray(r1) && r1.length === 1 && r1[0].length === MOCK_EMBED_DIM && r1[0][0] === 1, JSON.stringify(r1))
+    check('semantic: request is OpenAI-compatible POST <baseUrl>/embeddings',
+      srv.state.requests.length === reqBase + 1 && srv.state.requests[reqBase].url === '/v1/embeddings' &&
+      srv.state.requests[reqBase].parsed?.model === 'mock-embed' &&
+      JSON.stringify(srv.state.requests[reqBase].parsed?.input) === JSON.stringify(['deployment pipeline']),
+      JSON.stringify(srv.state.requests[reqBase]?.parsed))
+    check('semantic: env key sent as Authorization bearer', srv.state.requests[reqBase]?.auth === 'Bearer mock-key-123', String(srv.state.requests[reqBase]?.auth))
+    const r2 = await embedTexts(cfg, ['deployment pipeline'])
+    check('semantic: LRU cache avoids duplicate request for identical text', srv.state.requests.length === reqBase + 1 && JSON.stringify(r2) === JSON.stringify(r1))
+    await embedTexts(cfg, ['auth login'])
+    check('semantic: new text triggers another request', srv.state.requests.length === reqBase + 2)
+
+    clearEmbeddingCache()
+    const [vectDeploy, vectDeployments, vectUnrelated] = await embedTexts(cfg, ['deployment', 'deployments', 'banana smoothie'])
+    check('semantic: word-form variants have high cosine, unrelated low',
+      cosine(vectDeploy, vectDeployments) > 0.9 && cosine(vectDeploy, vectUnrelated) < 0.1,
+      JSON.stringify({ forms: cosine(vectDeploy, vectDeployments), unrelated: cosine(vectDeploy, vectUnrelated) }))
+
+    clearEmbeddingCache()
+    delete process.env.MEOW_TEST_MISSING_EMBED_KEY
+    const beforeMissing = srv.state.requests.length
+    const missingKey = await embedTexts({ ...cfg, apiKeyEnv: 'MEOW_TEST_MISSING_EMBED_KEY' }, ['x'])
+    check('semantic: explicit apiKeyEnv with missing env → null, zero request',
+      missingKey === null && srv.state.requests.length === beforeMissing)
+
+    clearEmbeddingCache()
+    process.env.MEOW_TEST_EMBED_KEY = 'secret-123'
+    await embedTexts({ ...cfg, apiKeyEnv: 'MEOW_TEST_EMBED_KEY' }, ['x'])
+    check('semantic: Authorization bearer only when key env is set',
+      srv.state.requests[beforeMissing]?.auth === 'Bearer secret-123', String(srv.state.requests[beforeMissing]?.auth))
+    delete process.env.MEOW_TEST_EMBED_KEY
+
+    for (const mode of ['500', 'malformed', 'badshape']) {
+      srv.setMode(mode); clearEmbeddingCache()
+      const result = await embedTexts(cfg, ['x'])
+      check(`semantic: ${mode} response → null (fail-open, no throw)`, result === null)
+    }
+    srv.setMode('hang'); clearEmbeddingCache()
+    const t0 = Date.now()
+    const timed = await embedTexts({ ...cfg, timeoutMs: 250 }, ['x'])
+    const elapsed = Date.now() - t0
+    check('semantic: hanging server → null bounded by timeoutMs', timed === null && elapsed >= 200 && elapsed < 3000, `elapsed=${elapsed}`)
+    srv.setMode('ok')
+  } finally {
+    await srv.close()
+    if (savedEmbedKeyEnv === undefined) delete process.env.MEOW_MEMORY_EMBEDDING_KEY
+    else process.env.MEOW_MEMORY_EMBEDDING_KEY = savedEmbedKeyEnv
+  }
+}
+
+// ═══════════════════ 19. Phase 3：embedding 数据层 ═══════════════════
+{
+  const ws = tmp('mmh-sem-db-')
+  const db = new MemoryDb(memoryDbPath(ws))
+  const colsOf = (level) => db.db.prepare(`PRAGMA table_info(${level})`).all().map((c) => String(c.name))
+  check('semantic db: embedding column exists on all 7 level tables',
+    ['soul', 'user', 'project', 'fact', 'lesson', 'topic', 'rules'].every((level) => colsOf(level).includes('embedding')))
+
+  const row = db.insert({ level: 'fact', content: '带向量条目', embedding: [1, 2, 3], updated_at: 5000 })
+  check('semantic db: insert() persists embedding', JSON.stringify(db.findById(row.id)?.row.embedding) === JSON.stringify([1, 2, 3]))
+  const manualId = newId(1234)
+  db.insertRow({
+    id: manualId, level: 'fact', title: null, content: 'insertRow 保留向量', importance: 1, keywords: [],
+    status: 'active', corrected: 0, project: null, subcategory: null, goal: null, source_session: null,
+    hit_count: 0, created_at: 1, updated_at: 1, last_accessed_at: null, embedding: [0.5, 0.5],
+  })
+  check('semantic db: insertRow() preserves embedding', JSON.stringify(db.findById(manualId)?.row.embedding) === JSON.stringify([0.5, 0.5]))
+
+  const before = db.findById(row.id).row
+  check('semantic db: setEmbedding writes a vector', db.setEmbedding('fact', row.id, [4, 5, 6]) === true && JSON.stringify(db.findById(row.id)?.row.embedding) === JSON.stringify([4, 5, 6]))
+  const after = db.findById(row.id).row
+  check('semantic db: setEmbedding does not touch updated_at / hit_count', after.updated_at === before.updated_at && after.hit_count === before.hit_count)
+  check('semantic db: setEmbedding accepts a unique short id', db.setEmbedding('fact', row.id.slice(0, 8), [7]) === true)
+  check('semantic db: setEmbedding(null) clears the vector', db.setEmbedding('fact', row.id, null) === true && db.findById(row.id)?.row.embedding === null)
+  check('semantic db: setEmbedding rejects invalid vectors', db.setEmbedding('fact', row.id, [1, NaN]) === false && db.setEmbedding('fact', row.id, []) === false)
+  check('semantic db: setEmbedding unknown id → false', db.setEmbedding('fact', 'no-such-id', [1]) === false)
+  db.db.prepare('UPDATE fact SET embedding = ? WHERE id = ?').run('not-json', row.id)
+  check('semantic db: corrupt embedding JSON parses as null (never throws)', db.findById(row.id)?.row.embedding === null)
+
+  const missing = []
+  for (const [i, at] of [[1, 100], [2, 300], [3, 200]]) missing.push(db.insert({ level: 'topic', content: `待回填 ${i}`, title: `t${i}`, updated_at: at }))
+  const archivedRow = db.insert({ level: 'topic', content: '归档不回填', title: 'arch', updated_at: 9999 })
+  db.update('topic', archivedRow.id, { status: 'archived' })
+  const list = db.listMissingEmbedding('topic', 2)
+  check('semantic db: listMissingEmbedding returns active rows newest-first with limit',
+    list.length === 2 && list[0].id === missing[1].id && list[1].id === missing[2].id, JSON.stringify(list.map((r) => [r.id, r.updated_at])))
+  check('semantic db: listMissingEmbedding excludes archived rows', !db.listMissingEmbedding('topic', 100).some((r) => r.id === archivedRow.id))
+  db.setEmbedding('topic', missing[1].id, [1, 1])
+  check('semantic db: rows with embedding are no longer listed', !db.listMissingEmbedding('topic', 100).some((r) => r.id === missing[1].id))
+  db.close(); closeAllDbs()
+
+  const wsLegacy = tmp('mmh-sem-legacy-')
+  mkdirSync(join(wsLegacy, '.dsh-meow'), { recursive: true })
+  const raw = new DatabaseSync(memoryDbPath(wsLegacy))
+  raw.exec('CREATE TABLE fact (id TEXT PRIMARY KEY, title TEXT, content TEXT NOT NULL, importance INTEGER NOT NULL, keywords TEXT NOT NULL, status TEXT NOT NULL, source_session TEXT, hit_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_accessed_at INTEGER, project TEXT)')
+  raw.exec("INSERT INTO fact (id, content, importance, keywords, status, hit_count, created_at, updated_at) VALUES ('abc123456-abcdefghijklmnopqrstuvwxyz', '旧行', 1, '[]', 'active', 0, 1000, 1000)")
+  raw.close()
+  const dbUp = new MemoryDb(memoryDbPath(wsLegacy))
+  const upCols = dbUp.db.prepare('PRAGMA table_info(fact)').all().map((c) => String(c.name))
+  const legacyRow = dbUp.findById('abc123456-abcdefghijklmnopqrstuvwxyz')
+  check('semantic db: legacy DB upgrade adds embedding column', upCols.includes('embedding'))
+  check('semantic db: legacy rows get embedding = null after upgrade', legacyRow !== undefined && legacyRow.row.embedding === null)
+  dbUp.close(); closeAllDbs()
+  clean(ws); clean(wsLegacy)
+}
+
+// ═══════════════════ 20. Phase 3：词法/语义混合打分（bm25 + inject，零网络） ═══════════════════
+{
+  const now = Date.now()
+  const deployVec = [1, 0, 0, 0, 0, 0, 0, 0.01]
+  const docs = [
+    { id: 'sem-deploy', level: 'fact', title: null, content: 'deployment pipeline', keywords: ['infra'], importance: 1, created_at: now, updated_at: now, embedding: deployVec },
+    { id: 'sem-cache', level: 'fact', title: null, content: 'cache warmup', keywords: ['redis'], importance: 1, created_at: now, updated_at: now, embedding: [0, 1, 0, 0, 0, 0, 0, 0.01] },
+  ]
+  const lexicalOnly = search('shipping releases', docs, { k: 10, now })
+  const semanticHits = search('shipping releases', docs, { k: 10, now, explain: true, semantic: { queryEmbedding: deployVec, weight: 0.8 } })
+  check('semantic scoring: zero-lexical-overlap query returns nothing without query embedding', lexicalOnly.length === 0)
+  check('semantic scoring: semantic floor surfaces the zero-lexical-overlap memory', semanticHits[0]?.id === 'sem-deploy', JSON.stringify(semanticHits.map((h) => [h.id, h.score])))
+  check('semantic scoring: explain.semantic present and positive for the semantic hit', (semanticHits[0]?.explain?.semantic ?? 0) > 0.1, JSON.stringify(semanticHits[0]?.explain))
+  check('semantic scoring: unrelated memory keeps only a near-zero semantic score',
+    semanticHits.filter((h) => h.id === 'sem-cache').every((h) => (h.explain?.semantic ?? 0) < 0.01))
+  check('semantic scoring: weight 0 disables the semantic floor',
+    search('shipping releases', docs, { k: 10, now, semantic: { queryEmbedding: deployVec, weight: 0 } }).length === 0)
+
+  const ws = tmp('mmh-sem-hit-')
+  const db = new MemoryDb(memoryDbPath(ws))
+  db.insert({ level: 'fact', content: 'deployment pipeline rollout', project: null, keywords: ['infra'], embedding: deployVec, updated_at: now })
+  db.insert({ level: 'fact', content: 'banana smoothie recipe', project: null, keywords: ['food'], embedding: [0, 0, 0, 0, 0, 0, 0, 0.01], updated_at: now })
+  const noVecHit = buildHitInjection(db, ws, 'sem-hit-off', 'shipping releases', { hitTopK: 5 })
+  check('semantic inject: without query embedding the chain stays purely lexical (null)', noVecHit === null)
+  const spy = await withFetchSpy(() => buildHitInjection(db, ws, 'sem-hit-on', 'shipping releases', { hitTopK: 5, queryEmbedding: deployVec, semanticWeight: 0.8 }))
+  check('semantic inject: query embedding drives a semantic-only hit', spy.result !== null && spy.result.text.includes('deployment pipeline rollout'), spy.result?.text)
+  check('semantic inject: bm25/inject themselves never call fetch', spy.calls.length === 0)
+  const low = buildHitInjection(db, ws, 'sem-hit-low', 'shipping releases', { hitTopK: 5, queryEmbedding: deployVec, semanticWeight: 0.1, minScore: 0.35 })
+  check('semantic inject: semantic relevance below minScore is filtered out', low === null)
+  db.close(); closeAllDbs()
+  clean(ws)
+}
+
+// ═══════════════════ 21. Phase 3：apply 级端到端（mock embeddings 服务） ═══════════════════
+{
+  const makeCtx = () => {
+    const tools = []
+    const handlers = {}
+    const ctx = {
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      tools: { register: (t) => { tools.push(t); return () => {} } },
+      on: (name, fn) => { handlers[name] = fn },
+      effect: (fn) => { try { fn() } catch { /* mock */ } return () => {} },
+      get: () => undefined,
+      subagents: { start: () => { throw new Error('subagents not expected') } },
+    }
+    return { ctx, tools, handlers }
+  }
+  const execOf = (ws, sid) => ({ agent: { session: { header: { cwd: ws, id: sid } } } })
+  const userMsg = (text) => ({ content: [{ type: 'text', text }], source: { kind: 'user' } })
+  // 插件 resolved 配置的 apiKeyEnv 恒为默认 env 名（显式）→ 测试必须提供该 env，才会发请求。
+  const savedEmbedKeyEnv21 = process.env.MEOW_MEMORY_EMBEDDING_KEY
+  process.env.MEOW_MEMORY_EMBEDDING_KEY = 'mock-key-123'
+  const srv = await startEmbeddingServer()
+  try {
+    // A) 默认关闭：apply 后 remember/search/pre-step 全程零 fetch
+    const wsA = tmp('mmh-sem-off-')
+    ensureMemoryStore(wsA, '.dsh-meow', { autoGitignore: true, trustWorkspaceMemory: false })
+    const a = makeCtx()
+    await apply(a.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
+    const byA = Object.fromEntries(a.tools.map((t) => [t.name, t]))
+    const execA = execOf(wsA, 'sem-off-1')
+    const spyOff = await withFetchSpy(async () => {
+      const remembered = await byA.memory_remember.execute({ level: 'fact', content: 'deployment pipeline rollout', project: 'dsh', keywords: ['infra', 'deploy'], importance: 2 }, execA)
+      const searched = await byA.memory_search.execute({ query: 'shipping releases', project: 'dsh' }, execA)
+      const pre = a.handlers['agent/pre-step']
+      const first = userMsg('你好')
+      await pre({ agent: { session: { header: { cwd: wsA, id: 'sem-off-1' }, events: [] }, steer: () => {} }, messages: [first], turn: 1, step: 1, signal: new AbortController().signal }, async () => ({ kind: 'enter', messages: [first] }))
+      return { remembered, searched }
+    })
+    check('semantic disabled default: zero fetch across remember/search/pre-step', spyOff.calls.length === 0, `calls=${spyOff.calls.length}`)
+    check('semantic disabled default: tools still work lexically', spyOff.result.remembered?.ok === true && Array.isArray(spyOff.result.searched?.hits))
+    check('semantic disabled default: no embedding persisted', getDb(wsA, '.dsh-meow').findById(spyOff.result.remembered.id)?.row.embedding === null)
+
+    // B) 显式启用：remember/search/update/pre-step 走 mock endpoint
+    clearEmbeddingCache()
+    const wsB = tmp('mmh-sem-on-')
+    ensureMemoryStore(wsB, '.dsh-meow', { autoGitignore: true, trustWorkspaceMemory: false })
+    const dbB = getDb(wsB, '.dsh-meow')
+    const b = makeCtx()
+    await apply(b.ctx, {
+      enabled: true, projectDir: '.dsh-meow', promptLang: 'zh',
+      retrieval: { semantic: { enabled: true, baseUrl: srv.url, model: 'mock-embed', timeoutMs: 1500, weight: 0.8 } },
+    })
+    const byB = Object.fromEntries(b.tools.map((t) => [t.name, t]))
+    const execB = execOf(wsB, 'sem-on-1')
+    const remB = await byB.memory_remember.execute({ level: 'fact', content: 'deployment pipeline rollout', project: 'dsh', keywords: ['infra', 'deploy'], importance: 2 }, execB)
+    const rowB = dbB.findById(remB.id)?.row
+    check('semantic enabled: memory_remember persists the embedding', Array.isArray(rowB?.embedding) && rowB.embedding.length === MOCK_EMBED_DIM, JSON.stringify(rowB?.embedding))
+    check('semantic enabled: mock endpoint was called with /embeddings', srv.state.requests.some((r) => r.url === '/v1/embeddings'))
+    const reqBeforeSearch = srv.state.requests.length
+    const srcB = await byB.memory_search.execute({ query: 'shipping releases', project: 'dsh', explain: true }, execB)
+    const hitB = srcB.hits.find((h) => h.id === remB.id)
+    check('semantic enabled: semantic-only memory returned for zero-lexical-overlap query', hitB !== undefined, JSON.stringify(srcB.hits.map((h) => [h.id, h.explain?.semantic])))
+    check('semantic enabled: tool explain carries semantic score', (hitB?.explain?.semantic ?? 0) > 0, JSON.stringify(hitB?.explain))
+    const searchReqs = srv.state.requests.slice(reqBeforeSearch).filter((r) => JSON.stringify(r.body ?? '').includes('shipping releases'))
+    check('semantic enabled: search embedded the query exactly once (ignoring background backfill)', searchReqs.length === 1, `searchReqs=${searchReqs.length} total=${srv.state.requests.length - reqBeforeSearch}`)
+    const reqBeforeUpdate = srv.state.requests.length
+    const upd1 = await byB.memory_update.execute({ id: remB.id, content: 'deployment pipeline rollout v2' }, execB)
+    check('semantic enabled: content update re-embeds', upd1.ok === true && srv.state.requests.length >= reqBeforeUpdate + 1)
+    const embeddingAfter = JSON.stringify(dbB.findById(remB.id)?.row.embedding)
+    const reqBeforeMeta = srv.state.requests.length
+    await byB.memory_update.execute({ id: remB.id, importance: 5 }, execB)
+    check('semantic enabled: metadata-only update does not re-embed', srv.state.requests.length === reqBeforeMeta && JSON.stringify(dbB.findById(remB.id)?.row.embedding) === embeddingAfter)
+    dbB.insert({ level: 'fact', content: 'deployment pipeline rollout foreign', project: null, keywords: ['infra'], embedding: [1, 0, 0, 0, 0, 0, 0, 0.01], source_session: 'other-session', updated_at: Date.now() })
+    const preB = b.handlers['agent/pre-step']
+    const msg2 = userMsg('shipping releases again')
+    const reqBeforePre = srv.state.requests.length
+    const outB = await preB({
+      agent: { session: { header: { cwd: wsB, id: 'sem-on-2' }, events: [{ type: 'user/message', data: { content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } } }] }, steer: () => {} },
+      messages: [msg2], turn: 2, step: 1, signal: new AbortController().signal,
+    }, async () => ({ kind: 'enter', messages: [msg2] }))
+    const textsB = outB.messages.map((m) => m.content.map((c) => c.text ?? '').join(''))
+    check('semantic enabled: pre-step embedded the user message exactly once', srv.state.requests.length === reqBeforePre + 1)
+    check('semantic enabled: semantic-only memory injected by hit chain', textsB.some((t) => t.includes('deployment pipeline rollout foreign')), JSON.stringify(textsB.map((t) => t.slice(0, 40))))
+
+    // C) 显式 apiKeyEnv 缺失 → 不请求，工具仍可用
+    const c = makeCtx()
+    await apply(c.ctx, {
+      enabled: true, projectDir: '.dsh-meow', promptLang: 'zh',
+      retrieval: { semantic: { enabled: true, baseUrl: srv.url, model: 'mock-embed', apiKeyEnv: 'MEOW_TEST_MISSING_KEY_X', timeoutMs: 1000 } },
+    })
+    delete process.env.MEOW_TEST_MISSING_KEY_X
+    const byC = Object.fromEntries(c.tools.map((t) => [t.name, t]))
+    const wsC = tmp('mmh-sem-key-')
+    ensureMemoryStore(wsC, '.dsh-meow', { autoGitignore: true, trustWorkspaceMemory: false })
+    const execC = execOf(wsC, 'sem-key-1')
+    const reqBeforeC = srv.state.requests.length
+    const remC = await byC.memory_remember.execute({ level: 'fact', content: 'deployment item', project: 'dsh', keywords: ['infra'], importance: 2 }, execC)
+    const srcC = await byC.memory_search.execute({ query: 'shipping releases', project: 'dsh' }, execC)
+    check('semantic enabled + missing apiKeyEnv → zero requests, tools still work',
+      srv.state.requests.length === reqBeforeC && remC.ok === true && Array.isArray(srcC.hits))
+
+    // D) 失败回退：500 / malformed / hang → 词法结果仍返回、工具不抛、embedding 不写
+    const d = makeCtx()
+    await apply(d.ctx, {
+      enabled: true, projectDir: '.dsh-meow', promptLang: 'zh',
+      retrieval: { semantic: { enabled: true, baseUrl: srv.url, model: 'mock-embed', timeoutMs: 300, weight: 0.8 } },
+    })
+    const byD = Object.fromEntries(d.tools.map((t) => [t.name, t]))
+    const wsD = tmp('mmh-sem-fail-')
+    ensureMemoryStore(wsD, '.dsh-meow', { autoGitignore: true, trustWorkspaceMemory: false })
+    const dbD = getDb(wsD, '.dsh-meow')
+    dbD.insert({ level: 'fact', content: 'cache warmup with redis', project: 'dsh', keywords: ['cache', 'redis'], updated_at: Date.now() })
+    const execD = execOf(wsD, 'sem-fail-1')
+    for (const mode of ['500', 'malformed', 'badshape']) {
+      srv.setMode(mode); clearEmbeddingCache()
+      const rem = await byD.memory_remember.execute({ level: 'fact', content: 'deployment item ' + mode, project: 'dsh', keywords: ['infra'], importance: 2 }, execD)
+      const searchRes = await byD.memory_search.execute({ query: 'cache', project: 'dsh' }, execD)
+      check(`semantic failure (${mode}): remember succeeds without embedding`, rem.ok === true && dbD.findById(rem.id)?.row.embedding === null)
+      check(`semantic failure (${mode}): search falls back to lexical results`, searchRes.hits.some((h) => h.content.includes('cache warmup')))
+    }
+    srv.setMode('hang'); clearEmbeddingCache()
+    const tTimeout = Date.now()
+    const timedSearch = await byD.memory_search.execute({ query: 'cache', project: 'dsh' }, execD)
+    check('semantic failure (hang/timeout): lexical fallback, bounded wait, no throw',
+      timedSearch.hits.some((h) => h.content.includes('cache warmup')) && Date.now() - tTimeout < 3000, `elapsed=${Date.now() - tTimeout}`)
+    srv.setMode('ok')
+
+    // E) 先启用、再禁用：禁用后零请求
+    clearEmbeddingCache()
+    const e = makeCtx()
+    await apply(e.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
+    const byE = Object.fromEntries(e.tools.map((t) => [t.name, t]))
+    const wsE = tmp('mmh-sem-off2-')
+    ensureMemoryStore(wsE, '.dsh-meow', { autoGitignore: true, trustWorkspaceMemory: false })
+    const execE = execOf(wsE, 'sem-off2-1')
+    const reqBeforeE = srv.state.requests.length
+    const spyE = await withFetchSpy(async () => {
+      await byE.memory_search.execute({ query: 'shipping releases', project: 'dsh' }, execE)
+      await byE.memory_remember.execute({ level: 'fact', content: 'deployment again', project: 'dsh', keywords: ['infra'], importance: 2 }, execE)
+    })
+    check('semantic disabled after enabled: zero fetch calls', spyE.calls.length === 0 && srv.state.requests.length === reqBeforeE)
+    clean(wsA); clean(wsB); clean(wsC); clean(wsD); clean(wsE)
+  } finally {
+    await srv.close()
+    setMemorySemanticOptionsForTests(undefined)
+    clearEmbeddingCache()
+    if (savedEmbedKeyEnv21 === undefined) delete process.env.MEOW_MEMORY_EMBEDDING_KEY
+    else process.env.MEOW_MEMORY_EMBEDDING_KEY = savedEmbedKeyEnv21
+  }
+}
+
+// ═══════════════════ 22. Phase 3：静态审计（fetch 只允许在 semantic.ts / 同源 client） ═══════════════════
+{
+  const srcDir = new URL('../src/', import.meta.url)
+  const files = readdirSync(srcDir).filter((f) => f.endsWith('.ts'))
+  const hostFiles = files.filter((f) => !f.startsWith('client'))
+  const clientFiles = files.filter((f) => f.startsWith('client'))
+  const reads = (f) => readFileSync(new URL(f, srcDir), 'utf8')
+  const hostFetchFiles = hostFiles.filter((f) => /\bfetch\s*\(/.test(reads(f)))
+  check('static audit: only src/semantic.ts performs host-side fetch', JSON.stringify(hostFetchFiles) === JSON.stringify(['semantic.ts']), JSON.stringify(hostFetchFiles))
+  const clientFetchFiles = clientFiles.filter((f) => /\bfetch\s*\(/.test(reads(f)))
+  check('static audit: client UI fetches are same-origin host routes only',
+    clientFetchFiles.length > 0 && clientFetchFiles.every((f) => /fetch\(\s*'\/meow-memory\//.test(reads(f))), JSON.stringify(clientFetchFiles))
+  const backfillCallers = files.filter((f) => f !== 'db.ts' && /\blistMissingEmbedding\s*\(/.test(reads(f)))
+  console.log(`  [note] listMissingEmbedding callers outside db.ts: ${JSON.stringify(backfillCallers)} (0.35 wires apply-time backfill through semantic.backfillEmbeddings)`)
+  check('static audit: embedding backfill is wired (semantic.ts backfillEmbeddings)', backfillCallers.includes('semantic.ts'))
 }
 
 // 清理

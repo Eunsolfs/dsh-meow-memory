@@ -25,7 +25,7 @@ The first turn injects only the long-term snapshot; hits start from the second u
 
 ## 3. Hits match keywords, not full text (and the real score)
 
-Full-text matching is noisy. Hits therefore match entry keywords. **There is no vector/semantic retrieval.**
+Full-text matching is noisy. Hits therefore match entry keywords. **There is no vector/semantic retrieval by default**; 0.35 adds an **optional** semantic layer (off by default, zero network).
 
 0.32 per-message score (`keywordHitScore`):
 
@@ -42,6 +42,8 @@ keyword intersection × IDF × query coverage × exponential recency × importan
 `memory_search` is a separate **BM25** scorer (`ln(1+(N−df+.5)/(df+.5))`, k1=1.5, b=0.75, length normalisation + recency). The docs no longer conflate the two.
 
 **0.33 hybrid lexical floor (fuzzy)**: BM25 is exact whole-word/bigram matching, so morphological variants, inflections and CJK word-boundary differences are missed. A pure character-level similarity is added (zero-dependency, offline, deterministic): character bigram Jaccard + **0.25×trigram Jaccard** (NFKC, lowercased, letters/digits only; CJK needs no segmentation), noise floor 0.2. It is only a **floor**: `score = max(BM25, 0.55·fuzzy·recency·importance)`; strong BM25 hits keep their ordering, and the complement only rescues recall when BM25 is 0/weak (per-message chain: `relevance = max(BM25 relevance, fuzzy)`, then multiplied by recency). **Not embedding/semantic retrieval** — it covers lexical variants/inflections/word boundaries only; paraphrases can still be missed. No config toggle (pure BM25 is a test/internal option).
+
+**0.35 optional semantic floor (`retrieval.semantic`, off by default)**: when enabled, `semantic.ts` calls an OpenAI-compatible `/embeddings` endpoint and cosine similarity is **also only a floor**: `relevance = max(lexical, fuzzy, cos·weight·importanceWeight)`, with a **0.25 noise floor** (cos < 0.25 counts as 0; negative/zero similarity counts as 0); `memory_search` multiplies by recency and `explain` gains `semantic`. **No rerank** — weak matches can slip in. Off (default) = **zero network** (with no endpoint configured `semanticEnabled()` is false and every call site short-circuits; network access lives only in `semantic.ts`, which static audit can prove). Data/privacy: when enabled, **memory bodies/titles/keywords** and **user message/query text** go to your configured endpoint; the key comes from an env var (default var unset → keyless requests, for local Ollama/LM Studio; only a custom var name that is missing counts as unconfigured). Failure/timeout/non-2xx/bad shape → null, **never throw**, silently falling back to lexical. The write path (`memory_remember`/`memory_update`) embeds inline after the write; plugin apply **backfills in the background** the global store and each trusted workspace (≤50 rows/level, retried next start); embeddings live in a lazy nullable `embedding TEXT` (JSON) column per table. **No local model is bundled**; changing the embedding model invalidates stored vectors (model-specific; different dimensions count as 0).
 
 ---
 
@@ -179,12 +181,28 @@ Also: workspace paths are compared after **realpath normalisation** (junction / 
 
 ---
 
-## 18. Known design debt (updated in 0.34)
+## 18. 0.35 optional semantic retrieval (offline by default)
+
+0.34's retrieval had only BM25 + character n-gram fuzzy, so paraphrases could still be missed. 0.35 adds an **optional** embedding semantic layer, with the default kept at **off**:
+
+- **Why off by default**: embeddings require an external service (no local model is bundled), and enabling it means sending **memory bodies and user query text** to that service; off = zero network and zero privacy exposure, behaviour identical to 0.34.
+- **Why a floor, not a rerank**: same idea as fuzzy — the semantic score only rescues recall when lexical matching is weak, so it cannot outweigh an exact keyword hit; the trade-off is that weak matches can slip in. The **0.25 noise floor** stops unrelated entries surfacing on tiny similarity; negative/zero similarity counts as 0.
+- **Data flow**: `semantic.ts` owns all networking (`POST {baseUrl}/embeddings`, LRU 256); the write path embeds inline (bounded by `timeoutMs`); after plugin apply it backfills historical entries in the background (global store + each trusted workspace, ≤50 rows/level, silent failures retried next start). `embedding` is a nullable JSON `TEXT` column added lazily to all 7 tables and travels with the DB/backups.
+- **Failure semantics**: timeout/network error/non-2xx/bad shape/missing `fetch` → null, caller silently falls back to pure lexical; a broken semantic layer never blocks injection/retrieval/writes.
+- **Known boundaries**: no local model; vectors are model-specific (different model/dimensions → score 0, re-write or re-backfill); the settings page does not expose this config; `weight: 0` only disables semantic scoring — set `enabled: false` to stay fully offline.
+
+---
+
+## 19. Known design debt (updated in 0.35)
 
 | Issue | Impact | Why |
 |---|---|---|
 | **Project-level memory is still workspace-scoped** | `project` / `fact` / `lesson` / `topic` follow the cwd; a new workspace starts with fresh project memory (soul/user/global rules are cross-workspace since 0.33) | Sharing project memory needs a store-ownership model; left for later |
-| **Semantic recall still missing** | fuzzy covers lexical variants/inflections/word boundaries only; paraphrases can still be missed | Needs embeddings/vector indexing; no embedding provider on this host |
+| **No semantic recall by default** | `retrieval.semantic` is off; without it only BM25 + fuzzy run, so paraphrases can still be missed | The semantic layer needs an external embedding service; off is the privacy/availability choice (opt-in) |
+| **Semantic layer is a floor, not a rerank** | Above the 0.25 noise floor weak matches can enter; semantic ordering quality is not guaranteed | Same trade-off as fuzzy: avoid outweighing exact keyword hits; reranking needs a trusted cross-encoder |
+| **Semantic vectors are model-bound** | Changing the endpoint model/dimensions makes old vectors score 0; stored vectors are not recomputed automatically | Vectors are model-specific; re-write entries or clear and re-backfill |
+| **Settings page does not expose semantic config** | `retrieval.semantic` is profile-patch only | Settings-page code is out of scope this round; edit the config by hand |
+| **Embeddings send memory bodies** | With it enabled, memory bodies/titles/keywords and user query text go to the configured endpoint | That is required for semantic retrieval; default off + explicit docs let the user choose the provider |
 | **Dream does not consolidate the global store** | Global entries are maintained via tools/reflection, not dream rounds | Dream is per-window workspace semantics; global consolidation needs its own scheduler |
 | **Migration archives workspace originals** | A lost global store does not re-inject them automatically (content still archived) | Auto-restoring would conflict with "user deleted the global store"; provide `memory_forget mode=restore` |
 | **Isolated dream cannot be aborted from the UI** | Only timeout/completion/failure ends it; dispose/HMR cancels | The host's subagent activation has no UI abort entry (recorded as a 0.34 limitation) |

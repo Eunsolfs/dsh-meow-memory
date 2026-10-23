@@ -1,4 +1,4 @@
-# Tool reference (0.34 fork)
+# Tool reference (0.35 fork)
 
 meow-memory registers **10** memory tools. Three bands: **read** (search / read / find_similar / project / list), **write** (remember / update / forget / dream), **directory** (home).
 
@@ -66,13 +66,15 @@ There is also the `/dream` command: type it in the composer to consolidate this 
 
 **Write target (0.33)**: `level=soul` / `user`, or `level=rules` with a global project → **user-scope global store**; everything else → **workspace store**. Dedupe/merge happens only inside the target store.
 
+**Semantic embedding (0.35, optional)**: with `retrieval.semantic` enabled, after a successful write/merge the entry's embedding is attached **best-effort** (inline, bounded by `timeoutMs`; failure does not affect the write — a later apply's background backfill fills it in). With semantic disabled, no request is made at all.
+
 **Dedupe reality**: only **same level**, bigram **Jaccard ≥ 0.8** (near-identical wording) merges. Paraphrases and cross-level duplicates do **not** merge. Merging overwrites keywords with the new list and takes `max(importance)`.
 
 ---
 
 ## `memory_search` — search
 
-**BM25 × recency weight + the 0.33 hybrid lexical floor** (the per-message keyword hit uses a different scorer, below). Default `k=10`: the first 5 by relevance (seen entries not excluded), then 5 more from the remaining ranking skipping seen entries, re-sorted old → new by memory timestamp. **Queries both stores**, deduped by id.
+**BM25 × recency weight + the 0.33 hybrid lexical floor + optional 0.35 semantic floor** (the per-message keyword hit uses a different scorer, below). Default `k=10`: the first 5 by relevance (seen entries not excluded), then 5 more from the remaining ranking skipping seen entries, re-sorted old → new by memory timestamp. **Queries both stores**, deduped by id.
 
 | Parameter | Type | Default | Meaning |
 |---|---|---|---|
@@ -83,11 +85,13 @@ There is also the `/dream` command: type it in the composer to consolidate this 
 | `days` | integer 1–3650 | — | Only entries created within the last N days |
 | `k` | integer 1–50 | `10` | Max hits |
 | `content_max` | integer 0–5000 | `300` | Truncation per hit; `0` = full text |
-| `explain` | boolean | `false` | Attach a score breakdown per hit (bm25 raw / importance / recencyWeight / status; since 0.33 optionally `fuzzy`, plus `importanceWeight` / `hitBoost` when enabled); does not change the order |
+| `explain` | boolean | `false` | Attach a score breakdown per hit (bm25 raw / importance / recencyWeight / status; since 0.33 optionally `fuzzy`, since 0.35 optionally `semantic` when enabled, plus `importanceWeight` / `hitBoost` when enabled); does not change the order |
 
 **Returns**: `note` + `hits[]` (project, full id, relative time, keywords, truncated content). Use `memory_project` for the project panorama, and `memory_list` for a metadata-only inventory.
 
 > **0.33 hybrid lexical floor**: character bigram Jaccard + 0.25×trigram Jaccard (noise floor 0.2), used only as a floor when BM25 is weak (`score = max(BM25, 0.55·fuzzy·recency·importance)`); strong BM25 ordering is unchanged. **Not semantic/embedding retrieval** — paraphrases may still be missed. No config toggle (pure BM25 is a test/internal option).
+
+> **0.35 optional semantic floor**: with `retrieval.semantic.enabled: true`, this tool embeds `query` once (failure/timeout → pure lexical), `relevance = max(lexical, fuzzy, cos·weight·importanceWeight)` with cos **< 0.25 counted as 0** (noise floor), then × recency; `explain=true` includes a `semantic` component. **No rerank** — weak matches can enter. When enabled, **query text is sent to the configured `/embeddings` endpoint**; off (default) = zero network. See [configuration reference](configuration-reference.md).
 
 ---
 
@@ -215,8 +219,8 @@ Switching moves (same disk) or copies (cross disk); the old directory is **never
 
 ## Automatic injection vs. manual tools
 
-- **Injection** (first-turn snapshot, per-message hits, post-compaction re-injection) is bounded by `budget.*` and **skips untrusted stores**; since 0.33 the first-turn snapshot's soul/user/global rules come from the global store (workspace store as fallback), while project panorama/re-injection stay workspace-only;
-- **Manual tools** (search / project / read / list, etc.) return on demand and are not subject to the injection budget, but on an untrusted store they are **refused** (explicit error, not empty results); dream and reflection are refused too. Read tools query both stores (except `memory_project`).
+- **Injection** (first-turn snapshot, per-message hits, post-compaction re-injection) is bounded by `budget.*` and **skips untrusted stores**; since 0.33 the first-turn snapshot's soul/user/global rules come from the global store (workspace store as fallback), while project panorama/re-injection stay workspace-only; since 0.35, with semantic enabled, **every user message sends one query embedding request** (the LRU only saves repeated text; failures silently fall back to lexical and never block injection);
+- **Manual tools** (search / project / read / list, etc.) return on demand and are not subject to the injection budget, but on an untrusted store they are **refused** (explicit error, not empty results); dream and reflection are refused too. Read tools query both stores (except `memory_project`). With semantic enabled, `memory_search`'s query also sends one embedding request, and write tools **embed the entry inline** (best-effort).
 - `memory_list` is the only low-cost "whole store without bodies" view; `memory_forget` is the only delete/archive entry point (equivalent to `memory_update status=archived` for archiving).
 
 ---

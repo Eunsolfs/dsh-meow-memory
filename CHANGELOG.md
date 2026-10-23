@@ -1,6 +1,42 @@
 # Changelog
 
-本文件从上游 `Phant0Meow/dsh-meow-memory` v0.31.1 接续。**0.32.0 起为本仓库（hardened fork）的版本，当前 0.34.1**，与上游无隶属关系；上游变更历史见 <https://github.com/Phant0Meow/dsh-meow-memory/blob/main/CHANGELOG.md>。
+本文件从上游 `Phant0Meow/dsh-meow-memory` v0.31.1 接续。**0.32.0 起为本仓库（hardened fork）的版本，当前 0.35.0**，与上游无隶属关系；上游变更历史见 <https://github.com/Phant0Meow/dsh-meow-memory/blob/main/CHANGELOG.md>。
+
+## v0.35.0 (2026-10-23) — 可选语义检索（默认离线）
+
+Phase 3。0.34.x 的全部行为保留；本版新增**可选** embedding 语义层，默认关闭、零网络；开启后作为 BM25/fuzzy 之外的第三个 **floor** 参与召回。插件仍然不打包本地模型。
+
+### 可选语义检索（`retrieval.semantic`，默认关）
+
+- 新增 `retrieval.semantic { enabled: false, baseUrl: '', model: '', apiKeyEnv: 'MEOW_MEMORY_EMBEDDING_KEY', timeoutMs: 5000, weight: 0.8 }`。`enabled === true` 且 `baseUrl`/`model` 非空才启用；未配置 = **零网络请求**（行为与 0.34 完全一致）。
+- 端点：OpenAI-compatible `POST {baseUrl}/embeddings`，body `{model, input: string[]}`；`Authorization: Bearer $env` 仅在 key 存在时发送。**key 语义**：默认环境变量 `MEOW_MEMORY_EMBEDDING_KEY` 未设置时**无 key 请求**（适配本地 Ollama/LM Studio）；只有*自定义* `apiKeyEnv` 且其变量缺失才视为未配置、不请求。256 条 LRU（键 `baseUrl|model|text`）。
+- 打分：余弦相似度**只作 floor**，含 **0.25 噪声地板**（低于按 0，避免无关条目靠偶发小相似度混入；负/零相似度按 0）。每消息命中：`relevance = max(词法, fuzzy, cos·weight·importanceWeight)` 再乘遗忘权重，`minScore` 继续 gate relevance；`memory_search` 的 score = relevance×recency，`explain` 增加 `semantic` 分项。**不是 rerank**。
+- **回填已接线**：语义启用时，插件 apply 后 fire-and-forget 调 `semantic.backfillEmbeddings()`——覆盖全局库（soul/user/rules）与每个**可信** window-index 工作区（project/fact/lesson/topic/rules），每层 ≤50 行，失败静默、下次启动重试；历史条目无需手动处理。
+- 写入路径：`memory_remember` / `memory_update`（content/keywords 变化时）写后内联补 embedding（受 `timeoutMs` 约束；失败保持纯词法，不阻塞写入）。
+- 数据层：所有 7 张表**懒添加** nullable `embedding TEXT`（JSON）列（已有库通过 `ALTER TABLE` 升级）；未回填行为 NULL，不参与语义补分。
+
+### 隐私与成本
+
+- **默认关闭时零外发**：不配置 endpoint 就不启用，启动/每消息/写入/检索/回填全部 0 请求（verifier 实测；静态审计也保证只有 `semantic.ts` import fetch）。
+- **开启后**：**记忆正文/标题/关键词**（写入与回填）与**用户消息/查询文本**会发送到你配置的 `/embeddings` 端点。网络请求：每条用户消息 1 次 query embedding（LRU 仅救重复文本）、每次写入 1 次、启动回填按 ≤50 行/层批量；**不是 token 花费**。
+
+### 失败语义
+
+- 未启用/未配置/超时/网络错误/非 2xx/形状不对/极旧运行时无 `fetch` → 返回 null，**绝不 throw**；调用方静默回退纯词法，不阻塞注入/检索/写入。
+
+### 测试与验证
+
+- `npm test`：**1219 条断言全绿**（host 859 + client 360），0 失败；`tests/hardening.mjs` **212 → 283**（新增 semantic 单元 + mock embeddings 服务覆盖：disabled 零请求、enabled 列/explain.semantic/semantic-only recall、失败/超时回退、静态 fetch 审计）。`node smoke.mjs` 29 条；`check-lang` en/pt-br 两个语言包（11 槽位）通过。
+- 隔离实例 live load on DSH 0.2.1-rc.2：default 与 semantic-enabled 两种配置均加载成功、无 apply 错误；**禁用语义时启动 0 embedding 请求**；未写真实 home。**真实 embedding 端点/真实模型 dream 未在隔离实例跑通**（无凭据；语义层由 mock 服务覆盖）。
+
+### 已知限制
+
+- **opt-in / 实验性**：默认关时没有语义召回（只有 BM25 + fuzzy）；开启后只是 floor（cos ≥0.25 才参与、不做 rerank、可能放入弱匹配），不保证语义质量。
+- **外部依赖**：插件不打包本地 embedding 模型，必须自备 OpenAI-compatible endpoint；端点不可用时静默降级回词法。
+- **隐私**：开启后记忆正文与用户查询文本会发往你配置的第三方/本地端点的服务方；默认关 = 不发送。
+- **设置页仍不暴露** `retrieval.semantic`（连同 0.32 的 security/budget 等字段），只能改 profile patch。
+- **换 embedding 模型会让已存向量失效**：向量是模型特定的，维度不同直接按 0 处理；需重写条目或清掉后重新回填。
+- 语义层不改变 dream/反思/注入预算；不回填 archived 行（`listMissingEmbedding` 只取 active）。
 
 ## v0.34.1 (2026-10-23) — 隔离 dream 兼容修复
 

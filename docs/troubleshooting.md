@@ -1,4 +1,4 @@
-# Troubleshooting (0.34 fork)
+# Troubleshooting (0.35 fork)
 
 Start here when installation fails, recall is poor, or behaviour is unexpected.
 
@@ -115,11 +115,21 @@ That is 0.34's isolated dream (off by default): automatic dream runs in a **spaw
 Most likely causes:
 
 1. **`promptLang` not set explicitly** — it shapes the entry language and keywords are extracted per entry language. The value is matched verbatim against a subdirectory name; a typo silently falls back to Chinese.
-2. **Hits match keywords, not full text** — fix keywords with `memory_update`, or find the entry with `memory_list` and rewrite it. Since 0.32 `minScore` (default 0.35) filters weak hits; raise it for a quieter chain, lower for more recall. 0.33's fuzzy floor rescues lexical variants/inflections/word boundaries (not paraphrases).
+2. **Hits match keywords, not full text** — fix keywords with `memory_update`, or find the entry with `memory_list` and rewrite it. Since 0.32 `minScore` (default 0.35) filters weak hits; raise it for a quieter chain, lower for more recall. 0.33's fuzzy floor rescues lexical variants/inflections/word boundaries (not paraphrases); 0.35's optional semantic layer (off by default) covers some paraphrases but is only a floor, not a quality guarantee (see below).
 3. **`hit_count` feedback needs time** — since 0.32 hit counts participate in ranking, but they cannot make an entry precise on their own.
 4. **`pt-br` has no Portuguese stemming/stopwords**, so Portuguese recall is weaker than English (known limitation).
 
-### Hits are metadata, not answers
+### How do I enable semantic retrieval (0.35)? Why is it not helping / what data is sent?
+
+0.35 adds optional `retrieval.semantic`, **off by default = zero network**. To enable: `enabled: true` + non-empty `baseUrl` (OpenAI-compatible, e.g. local Ollama `http://127.0.0.1:11434/v1`) + `model`. Key points:
+
+- **No local model**: the plugin bundles no embedding model; bring your own endpoint. If the default env var `MEOW_MEMORY_EMBEDDING_KEY` is unset, requests are **keyless** (local servers); only a *custom* `apiKeyEnv` whose variable is missing counts as unconfigured (no request).
+- **Privacy**: when enabled, **memory bodies/titles/keywords** (writes + backfill) and **user message/query text** go to the configured endpoint; off sends nothing.
+- **Effect**: cosine is only a **floor** (0.25 noise floor, below counts as 0; negative/zero as 0), no rerank, weak matches may enter; `memory_search explain=true` shows a `semantic` component.
+- **Old entries**: after enabling, plugin apply backfills in the background (global store + trusted workspaces, ≤50 rows/level; retried next start), so history gains vectors over time.
+- **Failures**: timeout (5s default)/network error/non-2xx silently fall back to pure lexical and never block injection/retrieval/writes.
+- **Changing models**: stored vectors are model-specific; a new model/dimensions invalidates old vectors (score 0) — re-write or clear and re-backfill.
+- **Not exposed on the settings page**: `retrieval.semantic` is profile-patch only; reload/restart the plugin after editing.
 
 `memory_search` returns a metadata view (project, id, time, keywords, truncated content). Use `memory_read` for the full text, `memory_project` for the project panorama, and `memory_list` for a whole-store metadata inventory.
 
@@ -166,7 +176,7 @@ Since 0.33 storage is two-layer:
 - Instance-level global directory (global store, logs / window index / migrate state): default `~/.dsh-meow` (**outside `DSH_HOME`**), or `homeDir` / `MEOW_MEMORY_HOME`; `homeDir`/`memory_home` switches move the global store too.
 - Prompt instance overrides: `$DSH_HOME/storages/meow-memory/prompts/<lang>/<slot>.md` (fixed; does not follow `homeDir`/`memory_home` switches).
 
-> On first upgrade to 0.33, the first trusted session per workspace **migrates old workspace soul/user/global rules into the global store and archives the workspace originals** (recoverable); since 0.34 `backup.enabled` backs up both the workspace store and the global store (an empty/untrusted global store is skipped and no directory is created). Backups are each store's `memory.db.bak`.
+> On first upgrade to 0.33, the first trusted session per workspace **migrates old workspace soul/user/global rules into the global store and archives the workspace originals** (recoverable); since 0.34 `backup.enabled` backs up both the workspace store and the global store (an empty/untrusted global store is skipped and no directory is created). Backups are each store's `memory.db.bak`. **0.35 semantic**: when enabled, each table lazily gains a nullable `embedding TEXT` (JSON vector) column and vectors travel with the DB/backups; when disabled no column is added and no vectors are written.
 
 ---
 
@@ -174,11 +184,11 @@ Since 0.33 storage is two-layer:
 
 ### Which DSH versions are supported?
 
-This fork was **verified on DSH Desktop 0.2.1-rc.2** (Electron 44.7.0 / Node 24.21.0, Windows 11): isolated load succeeded, the 3 routes returned 200/401 under auth, the settings namespace appeared, no apply error; 0.34 additionally ran an isolated live load with a `dream.isolated: true` patch (load only, no apply error; the 0.34.0 child-start bug was found later by re-audit and fixed in 0.34.1 with regression tests). **0.1.x was not tested**; the "supports dsh 0.1.5" claim is gone.
+This fork was **verified on DSH Desktop 0.2.1-rc.2** (Electron 44.7.0 / Node 24.21.0, Windows 11): isolated load succeeded, the 3 routes returned 200/401 under auth, the settings namespace appeared, no apply error; the 0.34 live load with `dream.isolated: true` only verified loading (the 0.34.0 child-start bug was found later by re-audit and fixed in 0.34.1); 0.35 additionally ran live loads with default and semantic-enabled configs (both loaded cleanly, no apply error, **zero embedding requests at boot when disabled**, no real-home writes). **0.1.x was not tested**; the "supports dsh 0.1.5" claim is gone.
 
 ### Settings page saves but nothing changes
 
-On 0.2.x the settings service was redesigned and the plugin takes a degraded path. The page renders, but "edit → save → reload → applied" was not verified by this fork; worst case it displays values without reaching apply. Run the [README self-check list](../README.en.md#self-check-after-install); otherwise edit the profile patch config directly.
+On 0.2.x the settings service was redesigned and the plugin takes a degraded path. The page renders, but "edit → save → reload → applied" was not verified by this fork; worst case it displays values without reaching apply. Run the [README self-check list](../README.en.md#self-check-after-install); otherwise edit the profile patch config directly. **0.35's `retrieval.semantic` does not appear on the settings page** — profile patch only.
 
 ### Tool set shrinks after dream / model changes
 

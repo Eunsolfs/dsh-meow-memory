@@ -3,12 +3,12 @@
 | [中文](README.md) | [English](README.en.md) | [Português (BR)](README.pt-br.md) | [MIT License](LICENSE) |
 | :---: | :---: | :---: | :---: |
 
-> **What this is**: a personal hardening fork of `Phant0Meow/dsh-meow-memory` **v0.31.1** (this repository, version **0.34.1**, branch `hardening`).
+> **What this is**: a personal hardening fork of `Phant0Meow/dsh-meow-memory` **v0.31.1** (this repository, version **0.35.0**, branch `hardening`).
 > Upstream is MIT-licensed: <https://github.com/Phant0Meow/dsh-meow-memory>. This fork is **not affiliated with upstream**, does not publish on upstream's behalf, and does not represent upstream's views. All changes and remaining issues are in [CHANGELOG.md](CHANGELOG.md).
 
 Cross-session memory for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): seven-layer SQLite memory, first-turn snapshot injection, per-message keyword hits, and automatic consolidation **with budget caps**.
 
-Version **0.34.1** ｜ Changelog: [CHANGELOG.md](CHANGELOG.md) ｜ Verified host: **DSH Desktop 0.2.1-rc.2** (see [Compatibility](#compatibility))
+Version **0.35.0** ｜ Changelog: [CHANGELOG.md](CHANGELOG.md) ｜ Verified host: **DSH Desktop 0.2.1-rc.2** (see [Compatibility](#compatibility))
 
 **Honesty note**: this README only claims behaviour that exists in the code. 0.32 removed several inflated upstream claims ("automatic dedupe/merge", "Ebbinghaus forgetting curve", per-message "BM25", "supports dsh 0.1.5") and states the real boundary at each point.
 
@@ -18,7 +18,7 @@ Version **0.34.1** ｜ Changelog: [CHANGELOG.md](CHANGELOG.md) ｜ Verified host
 
 This is the plugin's most under-estimated cost. **With default settings it issues LLM requests without an explicit user command**; 0.32 put a cap on every kind, but did not switch any of them off (upstream default behaviour kept, only unbounded → bounded).
 
-| Spend | When | 0.34 cap |
+| Spend | When | 0.35 cap |
 |---|---|---|
 | **Static tax**: memory manual + every tool description/schema in the system prompt | **Every** model request, even a session that never uses memory | ≈**6.7k tokens/request** (measured, Chinese pack; ≈6.3k English; varies with language pack and tool-description length). Cannot be disabled per request; to avoid it entirely set `enabled: false` (or remove the plugin) |
 | **First-turn snapshot**: soul / user / global rules / memory guide | Once, before the first real user message of each session | `budget.snapshotMaxChars` default **6000 chars** (≈2.7k tokens zh) |
@@ -27,6 +27,7 @@ This is the plugin's most under-estimated cost. **With default settings it issue
 | **Automatic dream (main-agent path, default)** | Window idle ≥ `dream.idleMinutes` (default 180), off-peak, **window has a live agent**, estimated context ≤ `budget.dreamMaxContextTokens` (default 40000) | Up to **3 full-context rounds** (later rounds re-estimate and finish early if oversized); `budget.dreamMaxPerWindowPerDay` default **1 per window/day**, plus a **process-wide** `budget.dreamMaxPerDayTotal` default **12/day** (counters roll 24h per process lifetime, reset on restart). A 30k-token session costs ≈90k input tokens per dream; the session history permanently gains ≈8–15k durable tokens |
 | **Automatic dream (isolated child path, `dream.isolated: true`)** | Same gates (frequency/cooldown/peak/global cap still apply), plus host `subagents` service and `spawn` provider required | **Zero main-session model-visible context growth** (the child prompt has its own cap `dream.isolatedMaxPromptChars`, default 20000 chars); child tokens are still billed; the main-context `dreamMaxContextTokens` gate **does not apply** to the isolated path |
 | **Reflection** | After a task with ≥ `reflectTurns` (default 7) consecutive tool steps | **1 full-context request**; `budget.reflectMaxPerDay` default 6/day/window (session), `budget.reflectMinIntervalMinutes` default 20, plus a **process-wide** `budget.reflectMaxPerDayTotal` default **24/day** (rolling 24h, reset on restart); skipped when context exceeds `dreamMaxContextTokens` |
+| **Optional semantic retrieval (`retrieval.semantic.enabled: true`, off by default)** | Every user-message query, every `memory_search`, every write (`memory_remember`/`memory_update`), and a background backfill right after plugin apply | **Not token spend but network requests to your configured `/embeddings` endpoint**: with it enabled, one query embedding per user message (the 256-entry LRU only helps identical text), one per write, and startup backfill in batches of ≤50 rows/level; **off (default) = zero network requests**. Data sent/privacy below |
 
 **How to stop the automatic spend** (manual tools keep working):
 
@@ -46,6 +47,8 @@ Or per window: session row "…" menu → **Memory participation** → turn off 
 > These are **caps**, not promises. Actual spend depends on entry counts, content length and session length; the worst case per day is still bounded in orders of magnitude (≤1 dream + ≤6 reflection full-context turns). The "estimated tokens" used by the context gates are **approximate**: CJK ≈1.7 chars/token, non-CJK ≈4 chars/token (deliberately over-estimated), not exact billing.
 
 > **The 0.33 layered store adds no per-message tokens**: it is just one more local SQLite database (the user-scope global store); injections stay bounded by `budget.*`. Fuzzy scoring is pure CPU (no tokens); dream/reflection frequency and context caps are unchanged.
+
+> **0.35 optional semantic retrieval (`retrieval.semantic.enabled: true`, off by default)**: by default it is **fully offline with zero network requests** (no endpoint configured = not enabled; behaviour identical to 0.34). When enabled it sends **memory bodies/titles/keywords** and **user message/query text** to your configured OpenAI-compatible `/embeddings` endpoint (key via env var, default name `MEOW_MEMORY_EMBEDDING_KEY`; if that default var is unset requests are sent **keyless**, for local Ollama/LM Studio; only a *custom* `apiKeyEnv` whose variable is missing is treated as unconfigured — no request). Semantic similarity is only a **cosine floor** (noise floor 0.25, below that counts as 0; negative/zero similarity counts as 0), never a rerank; failure/timeout (5s default)/non-2xx/bad shape silently fall back to pure lexical. When enabled, plugin apply **backfills historical entries in the background** (global store + each trusted workspace, ≤50 rows/level, failures silent and retried on next start). **No local model is bundled**; changing the embedding model invalidates stored vectors (re-write or re-backfill). See [configuration reference](docs/configuration-reference.md).
 
 > **0.34 isolated dream (`dream.isolated: true`, off by default; usable on 0.2.1 since 0.34.1)**: automatic dream runs in a **spawned empty-context child session**, so the main session gets no model-visible dream turn (only log-only catalog facts) → **zero main-context growth**; the child still spends tokens. The child receives the dream prompt slots + a digest of recent user/assistant text and tool names + entry lists (no tool results/plugin notices), so **consolidation quality is lower than the main-context path** (known trade-off). The child **inherits the parent's agent preset**, so `memory_*` tool visibility depends on that preset's tool set (residual risk; otherwise it falls back to the main-agent dream). Manual `/dream` / `memory_dream` always use the main agent (visible/abortable); **isolated dream cannot be aborted from the UI**. If subagents/spawn is unavailable the plugin falls back to the main-agent dream; **a rejected child start (sync or async — depth/capacity/auth) also falls back to the main-agent dream in the same sweep** (log `isolated-dream rejection -> main-dream fallback`). The 0.34.0 build sent `maxDepth: 0` to spawn, which 0.2.1 interpreted as the child's own depth limit and rejected (`SubagentDepthError`), so no automatic consolidation ran; 0.34.1 sends **no `maxDepth`** (host default 1).
 
@@ -139,7 +142,7 @@ $DSH_HOME/storages/meow-memory*           # install-id, prompt overrides, switch
 - **Seven memory layers**: `soul` (the AI itself) / `user` / `project` (with `subcategory`) / `fact` / `lesson` / `topic` (with a goal sentence) / `rules`. One SQLite table per layer, time-prefixed ids.
 - **Two-layer storage (0.33)**: `soul` / `user` / global `rules` live in the **user-scope global store**, shared across workspaces; `project` / `fact` / `lesson` / `topic` / project rules stay in the workspace store. See [Where memory lives](#where-memory-lives-two-layer-storage-033).
 - **First-turn injection (long-term block)**: soul / user / global rules / memory guide are injected before the first user message as an independent plugin snapshot **without rewriting the user prompt**; soul / user / global rules come from the user-scope global store with the workspace store as fallback; **no keyword hits on turn 1** (hits start from message 2).
-- **Per-message keyword hits + hybrid lexical floor**: from the second user message, fact/lesson/rules/topic are matched by entry **keywords** (not full text), scoped to global + the current project anchor, injecting up to `hitTopK`. 0.33 adds an offline lexical complement — character bigram Jaccard + 0.25×trigram Jaccard (CJK-safe, NFKC) — used as a **floor** when BM25 is weak: `score = max(BM25, 0.55·fuzzy·recency·importance)`, noise floor 0.2. It helps with variants / inflections / CJK word-boundary differences; **it is still not vector/semantic retrieval** (no embeddings), and poorly keyworded entries remain silently unreachable.
+- **Per-message keyword hits + hybrid lexical floor + optional semantic floor (0.35)**: from the second user message, fact/lesson/rules/topic are matched by entry **keywords** (not full text), scoped to global + the current project anchor, injecting up to `hitTopK`. 0.33 adds an offline lexical complement — character bigram Jaccard + 0.25×trigram Jaccard (CJK-safe, NFKC) — used as a **floor** when BM25 is weak: `score = max(BM25, 0.55·fuzzy·recency·importance)`, noise floor 0.2. 0.35 can opt into `retrieval.semantic` (off by default): with it enabled, cosine similarity between the query and entry embeddings is **also a floor** (`relevance = max(lexical, fuzzy, cos·weight·importance)`, cos < 0.25 counts as 0), covering some paraphrases; **it is not a rerank and does not guarantee semantic quality** (see limitations below).
 - **Current-project anchor**: passing a project parameter anchors the session's current project; unanchored sessions hit global entries only.
 - **Cache-friendly**: the static `meow-memory:guide` system-prompt section is registered once with constant text and cannot break the provider's prefix cache.
 - **Post-compaction re-injection**: after compaction the next turn re-injects the long-term snapshot, project panoramas queried this session, and entries written this session (bounded by `reinjectMaxChars`).
@@ -151,8 +154,8 @@ $DSH_HOME/storages/meow-memory*           # install-id, prompt overrides, switch
 
 ### What it cannot do (do not misunderstand)
 
+- **Semantic retrieval is off by default**: without `retrieval.semantic` there is no semantic recall (BM25 + 0.33 fuzzy only). When enabled it is an **experimental floor** (only cosine ≥0.25 participates, no rerank, weak matches can slip in), depends on an **external embeddings endpoint** (no local model bundled), silently degrades to lexical on failure/timeout, is **not exposed on the settings page** (config file only), and changing the embedding model invalidates stored vectors (vectors are model-specific; different dimensions score 0, so re-write/re-backfill).
 - **Project-level memory is still workspace-scoped**: `project` / `fact` / `lesson` / `topic` / project rules follow the cwd (a new workspace starts with fresh project memory). Only `soul` / `user` / global rules are shared across workspaces (0.33 user-scope global store).
-- **No semantic retrieval**: 0.33's fuzzy layer is a character n-gram lexical floor (variants / inflections / word boundaries), not embeddings and not paraphrase understanding. `hit_count` affects ranking but never rewrites keywords automatically.
 - **Global store does not participate in dream**: dream's three rounds still consolidate the workspace DB only; global entries are maintained via tools/reflection.
 - **Isolated dream trade-offs**: with `dream.isolated: true` the main context stays flat, but the child only gets the dream prompt + a recent-conversation digest + entry lists (no tool results), so **consolidation quality is lower than the main-context path**; **isolated dream cannot be aborted from the UI**; the child **inherits the parent's agent preset**, so `memory_*` tool visibility depends on that preset (residual risk); `isolatedArchiveChild` archives the child after it settles (**both success and failure**, leaving a plaintext child-session copy); if subagents/spawn is unavailable or the start is rejected, it falls back to the main-agent dream.
 - **Dream still keeps its instructions/responses/tool calls in the main session history (main-agent path)**: folding is visual only, tokens persist; the isolated path leaves only log-only catalog facts, no model-visible dream turn.
@@ -178,7 +181,7 @@ $DSH_HOME/storages/meow-memory*           # install-id, prompt overrides, switch
 
 2. Either:
    - **local directory**: GUI **Plugins → Add plugin**, enter the **absolute path** of this repository (the plugin manager accepts absolute local paths);
-   - **tarball**: `npm pack` produces `meow-memory-0.34.1.tgz`; enter the absolute path of that `.tgz`.
+   - **tarball**: `npm pack` produces `meow-memory-0.35.0.tgz`; enter the absolute path of that `.tgz`.
 3. Restart `dsh web` (or hot-reload the plugin). New sessions load it automatically.
 
 > Local `file:`/`link:` installs do not run `prepare`, so **build first**; a tarball already contains `lib/`.
@@ -232,7 +235,7 @@ The environment this fork was actually verified on (not a "backward compatible w
 |---|---|
 | Host | **DSH Desktop 0.2.1-rc.2** (Windows 11) |
 | Runtime | Electron 44.7.0 / Node **24.21.0**, `node:sqlite` available |
-| Verified | Isolated instance loads; 3 `/meow-memory/*` routes return 200 with auth / 401 without; settings namespace appears; no apply error. 0.34 also ran an isolated live load with a `dream.isolated: true` patch: **loaded, no apply error** (load only — the child was not actually started); the 0.34.0 child-start bug (`maxDepth: 0`) was found by an independent re-audit and fixed in 0.34.1, covered by regression tests (fake provider enforcing real depth semantics + rejection→fallback path). **Real model / child-session dream was not exercised in the isolated instance** (no credentials) |
+| Verified | Isolated instance loads; 3 `/meow-memory/*` routes return 200 with auth / 401 without; settings namespace appears; no apply error. The 0.34 live load with `dream.isolated: true` only verified loading; the 0.34.0 child-start bug (`maxDepth: 0`) was found by re-audit and fixed in 0.34.1. 0.35 additionally ran live loads with default and semantic-enabled configs: both loaded cleanly with no apply error, **zero embedding requests at boot when disabled**, no real-home writes. **Real model / child-session dream and a real embedding endpoint were not exercised in the isolated instance** (no credentials; the semantic layer is covered by unit tests with a mock embeddings server) |
 | Not verified | **0.1.x hosts** (this fork has not tested them; the "supports dsh 0.1.5" claim is removed); other 0.2.x patch releases |
 
 Known compatibility risks (upstream findings, unchanged by this fork):
@@ -276,6 +279,13 @@ All fields are optional. **The new 0.32 `security` / `budget` / `retrieval` grou
       minScore: 0.35                # keyword-hit injection threshold
       hitBoost: true                # hit-count reinforcement
       importanceWeight: true        # importance participates in ranking
+      semantic:                     # 0.35 optional semantic retrieval (off = zero network)
+        enabled: false              # only an explicit true requests the endpoint
+        baseUrl: ''                 # OpenAI-compatible base, e.g. http://127.0.0.1:11434/v1
+        model: ''                   # embedding model name
+        apiKeyEnv: 'MEOW_MEMORY_EMBEDDING_KEY' # env var holding the key; default var unset = keyless requests
+        timeoutMs: 5000             # per-request timeout (ms; failure silently falls back to lexical)
+        weight: 0.8                 # semantic floor blend weight (0..1; 0 = semantic scoring off)
     dream:
       enabled: true
       idleMinutes: 180
@@ -315,12 +325,12 @@ no hits on turn 1
 
 > Since 0.33 the first-turn snapshot's soul / user / global rules come from the user-scope global store (`<activeHomeDir>/global/memory.db`) with the workspace store as fallback; project panorama and re-injection stay workspace-only.
 
-### Tools (10 in 0.34)
+### Tools (10 in 0.35)
 
 | Tool | Band | Purpose |
 |---|---|---|
 | `memory_remember` | write | Write a memory (content/project/keywords/importance required; **soul/user/global rules go to the user-scope global store, everything else to the workspace store**; near-identical duplicates merge) |
-| `memory_search` | read | Hybrid lexical search (BM25 + character n-gram floor) × exponential recency, with `explain` (optional `fuzzy`) and level/project/status/days filters; queries both stores |
+| `memory_search` | read | Hybrid search (BM25 + character n-gram floor + optional semantic floor) × exponential recency, with `explain` (optional `fuzzy` / `semantic`) and level/project/status/days filters; queries both stores; with semantic enabled the query sends one embedding request |
 | `memory_project` | read | Fetch a project's complete injection paragraph (`project` required); **workspace store only** |
 | `memory_find_similar` | read | Duplicate & conflict detection; queries both stores |
 | `memory_read` | read | Read one entry's complete metadata by id; queries both stores |
@@ -343,7 +353,7 @@ npm run test           # build + language-pack check + full assertions (host + c
 node scripts/check-lang.mjs en       # check one prompt language pack
 ```
 
-Test assertions: `npm test` **1151 all green** (host 791 + client 360), 0 failed; plus 29 in `node smoke.mjs`; `scripts/check-lang.mjs` validates the en/pt-br packs (11 slots aligned).
+Test assertions: `npm test` **1219 all green** (host 859 + client 360), 0 failed; plus 29 in `node smoke.mjs`; `scripts/check-lang.mjs` validates the en/pt-br packs (11 slots aligned).
 
 The `@deepseek-ai/*` packages live in the dsh-meow pnpm workspace, not in this package's `node_modules`. On Windows, `npm run link-workspace` creates junction mirrors so esbuild can resolve them (build-time only).
 
@@ -356,6 +366,7 @@ The `@deepseek-ai/*` packages live in the dsh-meow pnpm workspace, not in this p
 5. Open a session in a cloned, untrusted repository: no long-term memory you did not write should appear (untrusted store + no auto-migration);
 6. Open a session in a different workspace: `soul` / `user` / global rules should still be there (user-scope global store), while `project` / `fact` are the new workspace's (verifies the two layers);
 7. With `dream.isolated: true`: after an automatic dream there should be no dream turn in the main session (only log-only catalog facts) and the child session should be archived (after settle, success or failure); a manual `/dream` should still produce a main-agent dream turn. If the child start is rejected, the main-agent dream should continue (log `isolated-dream rejection -> main-dream fallback`; the 0.34.0 `maxDepth` bug is fixed in 0.34.1).
+8. With `retrieval.semantic.enabled: true`: with `security.debugLogs` you should see backfill logs (historical entries fill in after the first apply); `memory_search` with `explain:true` should include a `semantic` component; point the endpoint at a bad URL and it should silently fall back to lexical without blocking injection/tools (and with semantic disabled, confirm zero embedding requests in logs/network).
 
 ---
 

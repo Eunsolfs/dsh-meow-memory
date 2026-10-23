@@ -13,6 +13,7 @@ import { isAbsolute, resolve } from 'node:path'
 import { findSimilar, search, tokenize, type RankedHit } from './bm25.js'
 import { closeGlobalDb, getDb, getDreamWorkspace, globalProjectMarker, isGlobalProject, isGlobalScope, projectCovers, projectLabel, projectList, relativeTime, type Level, LEVELS, type MemoryPatch, type MemoryRow, type ProjectSubcategory, PROJECT_SUBCATEGORIES } from './db.js'
 import { fillTemplate, keyedValue } from './prompt-loader.js'
+import { embedTexts, semanticEnabled, semanticWeightOf, type SemanticConfigLike } from './semantic.js'
 import { activeHomeDir, homeDirPresets, resolveHomeDir, switchHomeDir } from './home-dir.js'
 
 /** tools.md 键值取用（prompt 文案外置 v0.19.0）：缺键时 keyedValue throw。 */
@@ -58,6 +59,37 @@ export interface MemoryBudgetOptions {
 let budgetOptions: MemoryBudgetOptions = { projectMaxChars: 8000 }
 export function setMemoryBudgetOptions(opts: MemoryBudgetOptions | undefined): void {
   if (opts !== undefined) budgetOptions = opts
+}
+
+// ── 0.35 可选语义检索（默认关闭、零联网）──────────────────────────────────────
+// 只有用户显式配置 embedding endpoint（retrieval.semantic）时才会调用 embedTexts()。
+// 失败/超时 → null → 纯词法（bm25 + fuzzy）行为与 0.35 之前完全一致。
+let semanticOptions: SemanticConfigLike | undefined
+export function setMemorySemanticOptions(opts: SemanticConfigLike | undefined): void {
+  semanticOptions = opts
+}
+/** 单条文本的 embedding（未启用/失败返回 null；网络调用只发生在 semantic.ts）。 */
+async function embedOne(text: string): Promise<number[] | null> {
+  if (!semanticEnabled(semanticOptions) || text.trim().length === 0) return null
+  try {
+    const vectors = await embedTexts(semanticOptions, [text])
+    return vectors?.[0] ?? null
+  } catch {
+    return null
+  }
+}
+/** 记忆的语义文本 = 标题 + 正文 + 关键词（关键词是检索面的一部分）。 */
+function memorySemanticText(row: { title?: string | null; content: string; keywords?: string[] }): string {
+  return [row.title ?? '', row.content, ...(row.keywords ?? [])].join(' ').trim()
+}
+/** 写后补 embedding（best-effort，绝不阻塞/破坏写入结果）。 */
+async function attachEmbedding(db: ReturnType<typeof getDb>, level: Level, id: string, row: { title?: string | null; content: string; keywords?: string[] }): Promise<void> {
+  try {
+    const vec = await embedOne(memorySemanticText(row))
+    if (vec !== null) db.setEmbedding(level, id, vec)
+  } catch {
+    /* 语义补写失败不影响主链 */
+  }
 }
 
 // ── 0.33 分层存储（Phase 2）：用户级全局库 + 工作区库 ────────────────────────
@@ -371,6 +403,8 @@ function rememberTool(dir: string): ToolDefinition {
         if (level === 'lesson' && corrected) patch.corrected = 1
         patch.keywords = keywords // 显式关键词才覆盖合并目标（能走到这里说明关键词非空）
         db.update(level, merged.id, patch)
+        // 0.35：语义开启时补写 embedding（best-effort；失败保持纯词法）。
+        await attachEmbedding(db, level, merged.id, { title: merged.title, content, keywords })
         // 写痕迹（v0.23.0）：合并落库也记入 written——压缩重注入第三块回放本会话写过的记忆。
         markWritten(workspace, source_session ?? 'unknown', [merged.id], dir)
         // 读回合并后的实际存储结果（关键词等），让模型知道最终落库形态。
@@ -398,6 +432,8 @@ function rememberTool(dir: string): ToolDefinition {
       })
       // 写痕迹（v0.23.0）：新建落库记入 written——压缩重注入第三块回放本会话写过的记忆。
       markWritten(workspace, source_session ?? 'unknown', [row.id], dir)
+      // 0.35：语义开启时补写 embedding（best-effort）。
+      await attachEmbedding(db, level, row.id, row)
       return {
         ok: true,
         id: row.id,
@@ -469,6 +505,7 @@ function searchTool(dir: string): ToolDefinition {
                     importanceWeight: { type: 'number' },
                     hitBoost: { type: 'number' },
                     fuzzy: { type: 'number' },
+                    semantic: { type: 'number' },
                   },
                 },
               },
@@ -543,13 +580,23 @@ function searchTool(dir: string): ToolDefinition {
         keywords: r.keywords,
         importance: r.importance,
         hit_count: r.hit_count,
+        embedding: r.embedding ?? null,
         created_at: r.created_at,
         updated_at: r.updated_at,
       }))
+      // 0.35：语义开启时给 query 取一次 embedding（失败/超时 → null → 纯词法）。
+      const queryEmbedding = await embedOne(query)
       // 全量排名（分高到低）后分段选取（用户拍板 2026-08-19）：
       //   前 5 条无脑取（不排除任何记忆，含已见/本 session 建立的）；
       //   第 6 名起逐个往下，绕开已见（injected+searched）的记忆补足，保证新信息。
-      const ranked = search(query, docs, { k: docs.length, explain, halfLifeDays: retrievalOptions.halfLifeDays, hitBoost: retrievalOptions.hitBoost, importanceWeight: retrievalOptions.importanceWeight })
+      const ranked = search(query, docs, {
+        k: docs.length,
+        explain,
+        halfLifeDays: retrievalOptions.halfLifeDays,
+        hitBoost: retrievalOptions.hitBoost,
+        importanceWeight: retrievalOptions.importanceWeight,
+        ...(queryEmbedding !== null ? { semantic: { queryEmbedding, weight: semanticWeightOf(semanticOptions) } } : {}),
+      })
       const blindCount = Math.min(5, k)
       const blind = ranked.slice(0, blindCount)
       const fresh: RankedHit[] = []
@@ -596,6 +643,7 @@ function searchTool(dir: string): ToolDefinition {
                     ...(h.explain?.importanceWeight !== undefined ? { importanceWeight: h.explain.importanceWeight } : {}),
                     ...(h.explain?.hitBoost !== undefined ? { hitBoost: h.explain.hitBoost } : {}),
                     ...(h.explain?.fuzzy !== undefined ? { fuzzy: h.explain.fuzzy } : {}),
+                    ...(h.explain?.semantic !== undefined ? { semantic: h.explain.semantic } : {}),
                   },
                 }
               : {}),
@@ -860,6 +908,14 @@ function updateTool(dir: string): ToolDefinition {
       // 记忆时间戳 = 最后更新时间：db.update 内部自动刷新 updated_at（任何 update 都刷新）。
       // patch 为空（如只想传 keywords:[] 表达"不更新"）→ 视为调用成功、无字段变化。
       const ok = Object.keys(patch).length > 0 ? found.db.update(found.level, found.row.id, patch) : true
+      // 0.35：内容/关键词变了才值得重算 embedding（语义开启时）。
+      if (ok && (patch.content !== undefined || patch.keywords !== undefined)) {
+        await attachEmbedding(found.db, found.level, found.row.id, {
+          title: found.row.title,
+          content: patch.content ?? found.row.content,
+          keywords: patch.keywords ?? found.row.keywords,
+        })
+      }
       // 写痕迹（v0.23.0）：实际落库（patch 非空且 update 成功）才记——空 patch 无字段变化不算写。
       if (ok && Object.keys(patch).length > 0) markWritten(workspace, sessionId ?? 'unknown', [found.row.id], dir)
       return { ok, id: found.row.id, level: found.level }

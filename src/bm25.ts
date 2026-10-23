@@ -9,12 +9,16 @@
  *       不再整体豁免）；可选 importance 参与排名（importanceWeight）与 hit_count 加成（hitBoost）。
  *       混合词法补分（Phase 2）：字符 bigram/trigram Jaccard 相似度只作 BM25 弱命中时的兜底floor
  *       （effective = max(bm25Score, 0.55·fuzzy·recency·importance)），BM25 命中强时不改排序。
+ *       可选语义补分（Phase 3，默认关）：调用方显式传入 queryEmbedding 时，向量余弦相似度同样只作
+ *       floor（effective = max(词法分, sim·semanticWeight·importance)），本模块不发任何网络请求。
  * 偏离信号：turn 文本向量 vs 各 topic 质心（title+goal+content+keywords 词频
  *       向量）的余弦相似度；top1 相似度过低 → "疑似新话题"提示。topic 数 < 3
  *       （冷启动）不提示。信号只提醒不拍板，归属判定由模型用目标句测试完成。
  */
 
 import { getPromptLang } from './prompt-loader.js'
+// 别名避免与本文件 findSimilar/topicDrift 的词频余弦（cosine(Map,Map)）重名。
+import { cosine as cosineSimilarity, DEFAULT_SEMANTIC_WEIGHT, SEMANTIC_MIN_SIMILARITY } from './semantic.js'
 
 export interface Doc {
   id: string
@@ -25,6 +29,9 @@ export interface Doc {
   importance: number
   /** 历史命中/查阅次数（bumpHitCount 累计）——hitBoost 用；旧生产者/测试构造的 Doc 可缺省。 */
   hit_count?: number
+  /** 语义向量（Phase 3，可选；由 semantic.embedTexts 产出并随条目入库）。
+   *  缺省/null = 该条目不参与语义补分（默认离线时恒缺省）。 */
+  embedding?: number[] | null
   created_at: number
   /** 记忆时间戳 = 最后更新时间（艾宾浩斯按它算年龄）。 */
   updated_at: number
@@ -236,6 +243,12 @@ function hitBoostWeight(hitCount: number | undefined): number {
 const round3 = (n: number): number => Math.round(n * 1000) / 1000
 const EMPTY_SET: ReadonlySet<string> = new Set<string>()
 
+/** 语义补分权重（Phase 3）：调用方显式 0..1 优先，否则默认 0.8（0 = 关闭语义补分）。 */
+function resolvedSemanticWeight(opts: SearchOptions): number {
+  const weight = opts.semantic?.weight
+  return typeof weight === 'number' && Number.isFinite(weight) && weight >= 0 ? weight : DEFAULT_SEMANTIC_WEIGHT
+}
+
 // ── 混合词法补分（Phase 2） ───────────────────────────────────────────────────
 //
 // 目标：BM25 是"整词/整 bigram 精确匹配"，同义变体、词形变化、CJK 词边界差异都会漏召回。
@@ -297,14 +310,25 @@ export interface RankedHit {
   importance: number
   updated_at: number
   score: number
-  /** 分项得分（#51/Phase 2，explain=true 时才有）：bm25=关键词原始分（未乘任何系数）、importance=条目重要度、
-   *  recencyWeight=该条目的指数遗忘权重（importance≥3 时有 0.85 下限）、
+  /** 分项得分（#51/Phase 2/Phase 3，explain=true 时才有）：bm25=关键词原始分（未乘任何系数）、
+   *  importance=条目重要度、recencyWeight=该条目的指数遗忘权重（importance≥3 时有 0.85 下限）、
    *  importanceWeight=importance 乘数（importanceWeight 开启时才有）、
    *  hitBoost=hit_count 乘数（hitBoost 开启且该条有 hit_count 时才有）、
-   *  fuzzy=混合词法补分（0.55×字符 n-gram 相似度×recencyWeight×importanceWeight；fuzzy 开启时才有，
-   *  score = max(bm25×recencyWeight×importanceWeight×hitBoost, fuzzy)）、
-   *  score=最终分。状态过滤（active/stale）是检索前的二值过滤、不进打分，工具层在 explain 里补 status 字段。 */
-  explain?: { bm25: number; importance: number; recencyWeight: number; importanceWeight?: number; hitBoost?: number; fuzzy?: number; score: number }
+   *  fuzzy=混合词法补分（0.55×字符 n-gram 相似度×recencyWeight×importanceWeight；fuzzy 开启时才有）、
+   *  semantic=语义补分（余弦相似度×semanticWeight×importanceWeight×recencyWeight；调用方传了
+   *  semantic.queryEmbedding 且该条有 embedding 时才有）、
+   *  score=最终分 = max(bm25×recencyWeight×importanceWeight×hitBoost, fuzzy, semantic)。状态过滤
+   *  （active/stale）是检索前的二值过滤、不进打分，工具层在 explain 里补 status 字段。 */
+  explain?: { bm25: number; importance: number; recencyWeight: number; importanceWeight?: number; hitBoost?: number; fuzzy?: number; semantic?: number; score: number }
+}
+
+/** 语义检索参数（Phase 3）：`queryEmbedding` 与条目 embedding 同为 query 向量时才有意义；
+ *  缺省/null = 不用语义分（默认离线行为，零网络）。 */
+export interface SemanticScoringOptions {
+  /** query 向量（由 semantic.embedTexts 产出；调用方负责长度与模型一致性）。 */
+  queryEmbedding?: number[] | null
+  /** 语义分混合权重（0..1，默认 0.8；0 = 关闭语义补分）。 */
+  weight?: number
 }
 
 export interface SearchOptions {
@@ -323,6 +347,8 @@ export interface SearchOptions {
   importanceWeight?: boolean
   /** 混合词法补分（字符 n-gram 兜底 floor）：默认开（传 false 关闭，回到纯 BM25/0.32 行为）。 */
   fuzzy?: boolean
+  /** 语义补分（Phase 3，默认关）：不传 = 纯词法（旧行为完全不变）。 */
+  semantic?: SemanticScoringOptions
 }
 
 /**
@@ -333,6 +359,8 @@ export interface SearchOptions {
  * - fuzzy 默认开：混合词法补分只当 floor——effective = max(BM25 最终分, 0.55·fuzzy·recency·importance)，
  *   BM25 强命中时排序完全不变；BM25 为 0 但字符 n-gram 相似度足够时（同义变体/词形/CJK 词边界差异）
  *   才补召回。fuzzy 相似度低于噪声地板返回 0，所以零匹配 query 仍然什么都不返回。
+ * - semantic（Phase 3，默认关）：调用方显式传 opts.semantic.queryEmbedding 且该条有 embedding 时，
+ *   score = max(词法分, 0.55·fuzzy·…, cos(query,doc)·semanticWeight·importance) × recency；不传 = 与旧行为完全一致。
  * - minScore 只在显式传入时过滤（search 默认保留全部命中）。
  * 返回按最终分降序。
  */
@@ -342,6 +370,8 @@ export function search(query: string, docs: Doc[], opts: SearchOptions = {}): Ra
   const useImportance = opts.importanceWeight !== false
   const useHitBoost = opts.hitBoost !== false
   const useFuzzy = opts.fuzzy !== false
+  const queryEmbedding = opts.semantic?.queryEmbedding ?? null
+  const semanticWeight = resolvedSemanticWeight(opts)
   const q = tokenize(query)
   if (q.length === 0 || docs.length === 0) return []
   // query 的字符 n-gram 集合只算一次；每条的匹配面也复用同一份文本。
@@ -391,13 +421,21 @@ export function search(query: string, docs: Doc[], opts: SearchOptions = {}): Ra
       : recencyWeight(now - docs[di].updated_at, { halfLifeDays: opts.halfLifeDays, importance: docs[di].importance })
     const impW = useImportance ? 0.85 + 0.05 * docs[di].importance : 1
     const hitW = useHitBoost ? hitBoostWeight(docs[di].hit_count) : 1
-    const bm25Score = raw[di] * w * impW * hitW
+    // 词法主分（不含遗忘权重）：recency 统一在 max() 之后乘，词法/字符/语义三条补分走同一 floor 语义。
+    const lexical = raw[di] * impW * hitW
     // 混合词法补分只当 floor（不含 hitBoost/title 加成，BM25 强时 max() 不改变排序）。
-    // 相似度 ≤1，所以 BM25 分已 ≥ 补分上限（0.55·w·impW）时跳过计算（热路径优化，语义不变）。
-    const fuzzyCap = 0.55 * w * impW
-    const fuzzyPart = useFuzzy && bm25Score < fuzzyCap ? fuzzyCap * fuzzySimilarity(q2, q3, docTexts[di]) : 0
-    const score = Math.max(bm25Score, fuzzyPart)
-    if (score <= 0) continue // 零匹配（BM25=0 且 fuzzy 低于噪声地板）→ 不返回
+    // 相似度 ≤1，所以词法分已 ≥ 补分上限（0.55·impW）时跳过计算（热路径优化，语义不变）。
+    const fuzzyCap = 0.55 * impW
+    const fuzzyPart = useFuzzy && lexical < fuzzyCap ? fuzzyCap * fuzzySimilarity(q2, q3, docTexts[di]) : 0
+    // 语义补分（Phase 3，默认关）：只有调用方显式传 query 向量时才算；低于 0.25 噪声地板按 0。
+    let semanticPart = 0
+    if (queryEmbedding !== null && docs[di].embedding != null) {
+      const sim = cosineSimilarity(queryEmbedding, docs[di].embedding)
+      if (sim >= SEMANTIC_MIN_SIMILARITY) semanticPart = sim * semanticWeight * impW
+    }
+    const relevance = Math.max(lexical, fuzzyPart, semanticPart)
+    const score = relevance * w
+    if (score <= 0) continue // 零匹配（词法/字符/语义都为 0 或负）→ 不返回
     if (opts.minScore !== undefined && score < opts.minScore) continue
     hits.push({
       id: docs[di].id,
@@ -415,7 +453,8 @@ export function search(query: string, docs: Doc[], opts: SearchOptions = {}): Ra
               recencyWeight: round3(w),
               ...(useImportance ? { importanceWeight: round3(impW) } : {}),
               ...(useHitBoost ? { hitBoost: round3(hitW) } : {}),
-              ...(useFuzzy ? { fuzzy: round3(fuzzyPart) } : {}),
+              ...(useFuzzy ? { fuzzy: round3(fuzzyPart * w) } : {}),
+              ...(queryEmbedding !== null ? { semantic: round3(semanticPart * w) } : {}),
               score: round3(score),
             },
           }
@@ -445,6 +484,9 @@ export function search(query: string, docs: Doc[], opts: SearchOptions = {}): Ra
  * - 混合词法补分（fuzzy 默认开）：relevance = max(上面的 BM25 相关度, 0.55×字符 n-gram 相似度×importance权重)，
  *   最终分 = relevance × 遗忘权重。它只救 BM25 漏掉的同义变体/词形/CJK 词边界差异，
  *   相似度低于噪声地板时贡献 0（零匹配 query 不会因为偶发字符而命中）。
+ * - 语义补分（Phase 3，默认关）：调用方显式传 opts.semantic.queryEmbedding 且该条有 embedding 时，
+ *   relevance 再并上 cos(query,doc)×semanticWeight×importance权重（同为相关度、不含遗忘权重，
+ *   minScore 语义不变）；不传 = 与旧行为完全一致。
  */
 export function keywordHitScore(query: string, docs: Doc[], opts: SearchOptions = {}): RankedHit[] {
   const k = opts.k ?? 2
@@ -452,6 +494,8 @@ export function keywordHitScore(query: string, docs: Doc[], opts: SearchOptions 
   const useImportance = opts.importanceWeight !== false
   const useHitBoost = opts.hitBoost !== false
   const useFuzzy = opts.fuzzy !== false
+  const queryEmbedding = opts.semantic?.queryEmbedding ?? null
+  const semanticWeight = resolvedSemanticWeight(opts)
   const q = tokenize(query)
   if (q.length === 0 || docs.length === 0) return []
   const qTf = new Map<string, number>()
@@ -509,8 +553,14 @@ export function keywordHitScore(query: string, docs: Doc[], opts: SearchOptions 
     // 相似度 ≤1，所以 BM25 相关度已 ≥ 补分上限时跳过计算（语义不变）。
     const fuzzyCap = 0.55 * impW
     const fuzzyRelevance = useFuzzy && bm25Relevance < fuzzyCap ? fuzzyCap * fuzzySimilarity(q2, q3, surfaces[di]) : 0
-    const relevance = Math.max(bm25Relevance, fuzzyRelevance)
-    if (relevance <= 0) continue // 零匹配（BM25=0 且 fuzzy 低于噪声地板）→ 不注入
+    // 语义补分（Phase 3，默认关）：与 BM25/fuzzy 同为"相关度"（不含遗忘权重），minScore 继续 gate relevance。
+    let semanticRelevance = 0
+    if (queryEmbedding !== null && docs[di].embedding != null) {
+      const sim = cosineSimilarity(queryEmbedding, docs[di].embedding)
+      if (sim >= SEMANTIC_MIN_SIMILARITY) semanticRelevance = sim * semanticWeight * impW
+    }
+    const relevance = Math.max(bm25Relevance, fuzzyRelevance, semanticRelevance)
+    if (relevance <= 0) continue // 零匹配（词法/字符/语义都为 0 或负）→ 不注入
     if (opts.minScore !== undefined && relevance < opts.minScore) continue
     const score = relevance * w
     out.push({

@@ -54,7 +54,8 @@ import { buildHitInjection, buildInjection, buildReinjection, clearReinjectPendi
 import { migrateLegacy } from './migrate.js'
 import { buildReflectMessage, checkReflectBudget, consecutiveToolSteps, PLUGIN_SOURCE, recordReflectSent, REFLECT_MARKER, scanTurn } from './reflect.js'
 import { isMeowSource } from './source.js'
-import { registerMemoryTools, setMemoryBudgetOptions, setMemoryGlobalDbProvider, setMemoryRetrievalOptions, setMemoryToolGate } from './tools.js'
+import { registerMemoryTools, setMemoryBudgetOptions, setMemoryGlobalDbProvider, setMemoryRetrievalOptions, setMemorySemanticOptions, setMemoryToolGate } from './tools.js'
+import { backfillEmbeddings, clearEmbeddingCache, embedTexts, semanticEnabled, semanticWeightOf } from './semantic.js'
 import { authGate, connectionAuthOf } from './auth-gate.js'
 import { resolveSlotText, setPromptLang } from './prompt-loader.js'
 
@@ -288,6 +289,17 @@ const config = z.object({
       minScore: z.number().min(0).max(1).default(0.35),
       hitBoost: z.boolean().default(true),
       importanceWeight: z.boolean().default(true),
+      /** 0.35 可选语义检索（默认关闭，零联网）：OpenAI-compatible /embeddings。 */
+      semantic: z
+        .object({
+          enabled: z.boolean().default(false),
+          baseUrl: z.string().default(''),
+          model: z.string().default(''),
+          apiKeyEnv: z.string().default('MEOW_MEMORY_EMBEDDING_KEY'),
+          timeoutMs: z.number().min(200).max(60000).default(5000),
+          weight: z.number().min(0).max(1).default(0.8),
+        })
+        .default({}),
     })
     .default({}),
   /** prompt 语言（prompts/<lang>/ 语言包目录名）：决定注入/反思/dream 文案、工具
@@ -514,6 +526,15 @@ interface ResolvedConfig {
     minScore: number
     hitBoost: boolean
     importanceWeight: boolean
+    /** 0.35 可选语义检索（默认关闭，零联网）。 */
+    semantic: {
+      enabled: boolean
+      baseUrl: string
+      model: string
+      apiKeyEnv: string
+      timeoutMs: number
+      weight: number
+    }
   }
 }
 
@@ -525,6 +546,7 @@ function resolveConfig(config: unknown): ResolvedConfig {
   const sec = (c.security ?? {}) as Partial<ResolvedConfig['security']>
   const bud = (c.budget ?? {}) as Partial<ResolvedConfig['budget']>
   const ret = (c.retrieval ?? {}) as Partial<ResolvedConfig['retrieval']>
+  const sem = (ret.semantic ?? {}) as Partial<ResolvedConfig['retrieval']['semantic']>
   return {
     enabled: c.enabled ?? true,
     projectDir: c.projectDir ?? '.dsh-meow',
@@ -593,6 +615,14 @@ function resolveConfig(config: unknown): ResolvedConfig {
       minScore: ret.minScore ?? 0.35,
       hitBoost: ret.hitBoost ?? true,
       importanceWeight: ret.importanceWeight ?? true,
+      semantic: {
+        enabled: sem.enabled ?? false,
+        baseUrl: sem.baseUrl ?? '',
+        model: sem.model ?? '',
+        apiKeyEnv: sem.apiKeyEnv ?? 'MEOW_MEMORY_EMBEDDING_KEY',
+        timeoutMs: sem.timeoutMs ?? 5000,
+        weight: sem.weight ?? 0.8,
+      },
     },
   }
 }
@@ -1359,6 +1389,30 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     perf(`home-log sweep: ${sweptHome.swept.join(',') || '-'}${sweptHome.rotated ? ' +perf.log->old' : ''}`)
   }
   loadWindowIndex(resolved.projectDir) // 恢复窗口索引（热重载/重启后旧窗口不失联）
+  // 0.35 可选语义：启用后后台回填历史条目 embedding（老记忆也能语义召回）。
+  // 默认关闭 → 这里零网络；回填失败静默（下次启动重试）。
+  if (semanticEnabled(resolved.retrieval.semantic)) {
+    void (async () => {
+      try {
+        const g = globalDb()
+        if (g !== undefined) {
+          const n = await backfillEmbeddings(g, resolved.retrieval.semantic, ['soul', 'user', 'rules'])
+          if (n > 0) ctx.logger.info(`meow-memory: 语义回填全局库 ${n} 条`)
+        }
+        for (const [, w] of windowIndex) {
+          if (storeTrustOf(w, resolved.projectDir)?.trusted !== true) continue
+          try {
+            const n = await backfillEmbeddings(getDb(w, resolved.projectDir), resolved.retrieval.semantic, ['project', 'fact', 'lesson', 'topic', 'rules'])
+            if (n > 0) ctx.logger.info(`meow-memory: 语义回填 ${w} ${n} 条`)
+          } catch {
+            /* 单工作区回填失败忽略 */
+          }
+        }
+      } catch {
+        /* 回填是增强项，失败不影响主链 */
+      }
+    })()
+  }
 
   // v0 会话一次性迁移（issue #13）：标记未迁移时体检全部会话并把 source.memory 搬进
   // sections.__meta__，完成后置位 .dsh-meow/migrate-v0-state.json，此后启动直接跳过。
@@ -1401,6 +1455,8 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   })
   // 0.33 分层存储：工具层读写路由到全局库/工作区库（undefined = 单库回退）。
   setMemoryGlobalDbProvider(globalDb)
+  // 0.35 可选语义检索：默认关闭；显式配置后 memory_search 与命中链路共用同一 endpoint。
+  setMemorySemanticOptions(resolved.retrieval.semantic)
   // 0.32：项目全景输出预算（与重注入同量级；防大项目一次塞满上下文）。
   setMemoryBudgetOptions({ projectMaxChars: Math.max(2000, resolved.budget.reinjectMaxChars) })
   // 会话列表"已 dream"小月牙信号（用户拍板 2026-08-19）：dream 开始推 dreaming、
@@ -1763,11 +1819,22 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
           .map((b: { text?: string }) => b.text ?? '')
           .join(' ')
         const db = getDb(ws, resolved.projectDir)
+        // 0.35 可选语义：显式配置 embedding endpoint 时给 query 取一次向量；失败/超时→null。
+        let queryEmbedding: number[] | null = null
+        if (semanticEnabled(resolved.retrieval.semantic)) {
+          try {
+            const vecs = await embedTexts(resolved.retrieval.semantic, [text])
+            queryEmbedding = vecs?.[0] ?? null
+          } catch {
+            queryEmbedding = null
+          }
+        }
         const hit = buildHitInjection(db, ws, sid, text, {
           hitTopK: resolved.hitTopK,
           titleMax: resolved.titleMax,
           trust: trustOf(ws),
           globalDb: globalDb(),
+          ...(queryEmbedding !== null ? { queryEmbedding, semanticWeight: semanticWeightOf(resolved.retrieval.semantic) } : {}),
           hitMaxChars: resolved.budget.hitMaxChars,
           minScore: resolved.retrieval.minScore,
           halfLifeDays: resolved.retrieval.halfLifeDays,
@@ -2266,8 +2333,10 @@ export { migrateLegacy } from './migrate.js'
 export { buildHitInjection, buildInjection, buildReinjection, buildProjectSectionText, readSeen, markSearched, markAccessed, readInjected, markInjected, markProjectQueried, readProjectQueried, markWritten, readWritten, markReinjectPending, clearReinjectPending, isReinjectPending, MAX_REINJECT_PROJECTS, MAX_REINJECT_WRITTEN, sessionsFile, getCurrentProject, setCurrentProject, releaseSeen } from './inject.js'
 export { buildReflectMessage, checkReflectBudget, consecutiveToolSteps, recordReflectSent, resetGlobalReflectCounter, scanTurn } from './reflect.js'
 export { tokenize, stemEn, search, findSimilar, topicDrift, recencyWeight, fuzzyScore } from './bm25.js'
+export { embedTexts, semanticEnabled, semanticWeightOf, cosine, clearEmbeddingCache, backfillEmbeddings, SEMANTIC_MIN_SIMILARITY, type SemanticConfigLike } from './semantic.js'
 export { fillTemplate, keyedValue, resolveSlotText, setPromptLang, getPromptLang, DEFAULT_LANG, SLOTS } from './prompt-loader.js'
 export { DEFAULT_HOME_DIR, activeHomeDir, setActiveHomeDir, dshHomeDir, pluginRootDir, homeDirPresets, resolveHomeDir, switchHomeDir, type HomeDirSwitch } from './home-dir.js'
 export { setMemoryToolGate, registerMemoryTools } from './tools.js'
+export { setMemorySemanticOptions as setMemorySemanticOptionsForTests } from './tools.js'
 export { authGate, connectionAuthOf } from './auth-gate.js'
 export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, handleMemoryTurnFailure, dreamSweepTick, dreamCommandDefinition, isSubagentAgent, dreamSweepOnce, estimateContextTokens, evaluateAutoDreamGate, dreamMaxContextTokens, dreamMaxPerDayTotal, resetGlobalCostCounters, dreamLogPath, DREAM_MAX_ROWS_PER_ROUND, isolatedDreamAvailable, startIsolatedDream, disposeIsolatedDreams, buildIsolatedDreamPrompt, buildIsolatedDigest, ISOLATED_DREAM_META_PREFIX, ISOLATED_DEFAULT_TIMEOUT_MINUTES, ISOLATED_DEFAULT_MAX_PROMPT_CHARS, type DreamConfig } from './dream.js'

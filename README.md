@@ -3,12 +3,12 @@
 | [中文](README.md) | [English](README.en.md) | [Português (BR)](README.pt-br.md) | [MIT License](LICENSE) |
 | :---: | :---: | :---: | :---: |
 
-> **这是什么**：`Phant0Meow/dsh-meow-memory` **v0.31.1** 的个人加固 fork（本仓库，版本 **0.34.1**，分支 `hardening`）。
+> **这是什么**：`Phant0Meow/dsh-meow-memory` **v0.31.1** 的个人加固 fork（本仓库，版本 **0.35.0**，分支 `hardening`）。
 > 上游是 MIT 授权，上游仓库：<https://github.com/Phant0Meow/dsh-meow-memory>。本 fork **与上游无隶属关系**，不代上游发布、也不代表上游立场；所有改动与剩余问题见 [CHANGELOG.md](CHANGELOG.md)。
 
 为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）打造的跨会话记忆插件：七层 SQLite 记忆、首轮快照注入、每消息关键词命中，以及**有预算上限**的自动整理。
 
-当前版本 **0.34.1** ｜ 变更见 [CHANGELOG.md](CHANGELOG.md) ｜ 已实测宿主 **DSH Desktop 0.2.1-rc.2**（见[兼容性](#兼容性)）
+当前版本 **0.35.0** ｜ 变更见 [CHANGELOG.md](CHANGELOG.md) ｜ 已实测宿主 **DSH Desktop 0.2.1-rc.2**（见[兼容性](#兼容性)）
 
 **诚实声明**：本 README 只写代码里确实存在的行为。0.32 删掉了上游 README 里若干夸大表述（"自动去重合并"、"艾宾浩斯遗忘曲线"、每消息命中"BM25"、"兼容 dsh 0.1.5"），并在每处注明真实边界。
 
@@ -18,7 +18,7 @@
 
 这是本插件最容易被低估的成本。**默认配置下，插件会在你不发指令时自动发起 LLM 请求**；0.32 给每一类都加了上限，但没有把任何一类关掉（保持上游默认行为，只把无界变有界）。
 
-| 花费 | 何时发生 | 0.34 上限 |
+| 花费 | 何时发生 | 0.35 上限 |
 |---|---|---|
 | **静态税**：system prompt 里的记忆手册 + 全部工具描述/schema | **每一次**模型请求，哪怕这个会话一次记忆都没用 | ≈**6.7k tokens/请求**（中文包实测；英文包 ≈6.3k；随语言包与工具描述长度略变）。无法按请求关闭；要彻底不付这笔税，设 `enabled: false` 停用插件（或卸载） |
 | **首轮快照**：soul / user / 全局 rules / 记忆导引 | 每个会话第一条真实用户消息前，一次 | `budget.snapshotMaxChars` 默认 **6000 字符**（≈2.7k tokens 中文） |
@@ -27,6 +27,7 @@
 | **dream 自动整理（主 agent 路径，默认）** | 窗口空闲 ≥ `dream.idleMinutes`（默认 180 分钟）、非峰时、**该窗口有 live agent**、估算上下文 ≤ `budget.dreamMaxContextTokens`（默认 40000） | 最多 **3 轮全上下文请求**（后续轮次会重新估算上下文，超限提前收尾）；`budget.dreamMaxPerWindowPerDay` 默认 **1 次/窗口/天**，另有**进程级全局** `budget.dreamMaxPerDayTotal` 默认 **12 次/天**（计数为进程生命周期滚动 24h，重启清零）。30k token 的会话一次 dream ≈ 90k input tokens；会话历史永久 +8–15k durable tokens |
 | **dream 自动整理（隔离子会话路径，`dream.isolated: true`）** | 同上（频次/冷却/峰时/全局上限仍生效），但另需宿主 `subagents` 服务与 `spawn` provider | **主会话模型可见上下文 0 增长**（子会话 prompt 有独立上限 `dream.isolatedMaxPromptChars` 默认 20000 字符）；子会话的 token 仍计费；主上下文大小闸 `dreamMaxContextTokens` 对隔离路径**不生效** |
 | **反思（reflection）** | 单任务连续 ≥ `reflectTurns`（默认 7）个工具步后，任务结束 | **1 轮全上下文请求**；`budget.reflectMaxPerDay` 默认 6 次/天/窗口（会话），`reflectMinIntervalMinutes` 默认 20 分钟，另有**进程级全局** `budget.reflectMaxPerDayTotal` 默认 **24 次/天**（进程滚动 24h，重启清零）；上下文超 `dreamMaxContextTokens` 时跳过 |
+| **可选语义检索（`retrieval.semantic.enabled: true`，默认关）** | 每条用户消息的查询、每次 `memory_search`、每次写入（`memory_remember`/`memory_update`）、插件 apply 后的后台回填 | **不是 token 花费，而是对配置的 `/embeddings` 端点的网络请求**：启用后每条用户消息 1 次 query embedding（256 条 LRU 只救重复文本）、每次写入 1 次、启动回填按 ≤50 行/层批量；默认关 = **零网络请求**。数据发送/隐私见下方说明 |
 
 **怎么关掉自动花费**（只关自动、手动工具仍可用）：
 
@@ -48,6 +49,8 @@
 > **0.34 的隔离 dream（`dream.isolated: true`，默认关；0.34.1 起在 0.2.1 上可用）**：自动 dream 改在 **spawn 空上下文子会话**执行，主会话日志里没有 model-visible 的 dream 轮（只有 log-only catalog 事实），因此**主会话上下文 0 增长**；子会话仍消耗 token。子会话拿到的是「dream 三个 prompt 槽 + 最近 user/assistant 文本与工具名 digest + 条目清单」（不含工具结果/插件通知），所以**整理质量低于主上下文路径**（已知取舍）。子会话**继承父会话的 agent preset**，`memory_*` 工具可见性取决于该 preset 的工具集（残余风险；不可用则回退主窗口 dream）。手动 `/dream` / `memory_dream` 永远走主 agent 路径（可看可中止）；**隔离 dream 无法从 UI 中止**。subagents/spawn 不可用时自动回退主 agent dream；**子会话启动被拒（同步/异步，如深度/容量/鉴权）也会在同一轮扫描里回退主窗口 dream**（日志 `isolated-dream rejection -> main-dream fallback`）。0.34.0 曾因向 spawn 传 `maxDepth: 0` 被 0.2.1 判成"子会话自身深度超限"而完全不整理——0.34.1 不再传 `maxDepth`（宿主默认 1）。
 
 > **0.33 的分层存储不增加每消息 token**：只是多一个本地 SQLite 库（用户级全局库），注入条数仍受 `budget.*` 上限约束；fuzzy 补分是纯 CPU 计算、不花 token；dream/反思频次与上下文闸不变。
+
+> **0.35 的可选语义检索（`retrieval.semantic.enabled: true`，默认关）**：默认**完全离线、零网络请求**（不配置 endpoint 就不启用，行为与 0.34 完全一致）。启用后把**记忆正文/标题/关键词**与**用户消息/查询文本**发送到你配置的 OpenAI-compatible `/embeddings` 端点（key 走环境变量，默认变量名 `MEOW_MEMORY_EMBEDDING_KEY`；该默认变量未设置时会**无 key 请求**，适配本地 Ollama/LM Studio；只有自定义 `apiKeyEnv` 且变量缺失才视为未配置、不请求）。语义分只是**余弦相似度的 floor**（噪声地板 0.25，低于按 0 处理；负/零相似度按 0），不做 rerank；失败/超时（默认 5s）/非 2xx/形状不对一律静默回退纯词法。启用后插件 apply 会**后台回填历史条目** embedding（全局库 + 各可信工作区，≤50 行/层，失败静默、下次启动重试）。**不是本地模型、不打包模型**；换 embedding 模型会让已存向量失效（维度/语义不匹配，需重写或重新回填）。详见[配置参考](docs/配置参考.md)。
 
 ---
 
@@ -139,7 +142,7 @@ $DSH_HOME/storages/meow-memory*           # install-id、prompt 覆盖层、切�
 - **七层记忆**：`soul`（AI 自身）/ `user`（用户信息与偏好）/ `project`（项目信息，含 `subcategory`）/ `fact`（原子事实）/ `lesson`（教训与纠正）/ `topic`（进行中的话题，带目标句）/ `rules`（设计原则与行为准则）。每层一张 SQLite 表，id 带时间前缀。
 - **两层存储（0.33）**：`soul` / `user` / 全局 `rules` 放在**用户级全局库**，跨工作区共享；`project` / `fact` / `lesson` / `topic` / 项目 rules 放工作区库。详见[记忆存哪里](#记忆存哪里两层存储033)。
 - **首轮注入（长期记忆块）**：第一条用户消息前注入 soul / user / 全局 rules / 记忆导引。soul / user / 全局 rules 优先从用户级全局库读，工作区库兜底；作为独立 plugin snapshot 消息放在真实 user 消息之前，**不改写用户 prompt**；**首轮不跑关键词命中**（从第二轮起）。
-- **每消息关键词命中 + 混合词法兜底**：从第二条用户消息起，按条目**关键词**（不是全文）检索 fact/lesson/rules/topic（全局 + 当前 project 锚定），`hitTopK` 命中注入。0.33 加离线混合词法补分：字符 bigram Jaccard + 0.25×trigram Jaccard（CJK 安全、NFKC），作为 BM25 弱命中时的 **floor**：`score = max(BM25, 0.55·fuzzy·recency·importance)`，噪声地板 0.2；对同义变体/词形/CJK 词边界有改善。**仍然不是向量/语义检索**（没有 embedding）；关键词质量差仍会静默召回不到。
+- **每消息关键词命中 + 混合词法兜底 + 可选语义 floor（0.35）**：从第二条用户消息起，按条目**关键词**（不是全文）检索 fact/lesson/rules/topic（全局 + 当前 project 锚定），`hitTopK` 命中注入。0.33 加离线混合词法补分：字符 bigram Jaccard + 0.25×trigram Jaccard（CJK 安全、NFKC），作为 BM25 弱命中时的 **floor**：`score = max(BM25, 0.55·fuzzy·recency·importance)`，噪声地板 0.2；对同义变体/词形/CJK 词边界有改善。0.35 可选 `retrieval.semantic`（默认关）：启用后把 query 与条目 embedding 的余弦相似度**也只当 floor**（`relevance = max(词法, fuzzy, cos·weight·importance)`，cos < 0.25 按 0），从而覆盖一部分同义改写；**不是 rerank，也不保证语义质量**（见下方限制）。
 - **当前 project 锚定**：带 project 参数即锚定该会话的当前项目；未锚定时命中只搜全局（闲聊不误伤）。
 - **缓存友好**：静态 `meow-memory:guide` section 在 system prompt 中注册一次，文本恒定，不破坏 provider 的前缀缓存。
 - **压缩后重注入**：会话压缩后，下一轮重新注入长期记忆快照 + 本会话查阅过的项目全景 + 本会话写入过的记忆原文（受 `reinjectMaxChars` 上限约束）。
@@ -151,8 +154,8 @@ $DSH_HOME/storages/meow-memory*           # install-id、prompt 覆盖层、切�
 
 ### 它做不到的事（别误会）
 
+- **语义检索默认关闭**：不开 `retrieval.semantic` 就没有语义召回（只有 BM25 + 0.33 fuzzy）。开启后它是**实验性 floor**（余弦 ≥0.25 才参与、不做 rerank、可能放进弱匹配），依赖**外部 embeddings 端点**（插件不打包本地模型），失败/超时静默降级回词法；设置页**不暴露**该配置（只能改 profile patch）；换 embedding 模型会让已存向量失效（向量按模型生成，维度不同直接按 0 处理，需重写/重新回填）。
 - **项目级记忆仍按工作区隔离**：`project` / `fact` / `lesson` / `topic` / 项目 rules 跟着 cwd 走（换工作区 = 新的项目记忆）。跨工作区共享的只有 `soul` / `user` / 全局 rules（0.33 用户级全局库）。
-- **没有语义检索**：0.33 的 fuzzy 只是字符 n-gram 词法兜底（同义变体/词形/词边界），不是 embedding、不懂同义改写。`hit_count` 参与排序但不会自动改写关键词。
 - **全局库不参与 dream**：dream 三轮仍只整理工作区库；全局条目靠工具/反思维护。
 - **隔离 dream 的取舍**：`dream.isolated: true` 时主会话上下文 0 增长，但子会话只拿到「dream prompt + 最近对话 digest + 条目清单」（不含工具结果），**整理质量低于主上下文路径**；**隔离 dream 无法从 UI 中止**；子会话**继承父会话 agent preset**，`memory_*` 工具可见性取决于该 preset（残余风险）；`isolatedArchiveChild` 会在子会话 settle 后归档它（**成功/失败都会归档**，留下一份明文子会话副本）；subagents/spawn 不可用或启动被拒时自动退回主 agent dream。
 - **dream 仍会把整理指令/回复/工具调用留在主会话历史里（主 agent 路径）**：UI 折叠只是视觉收纳，token 仍持久存在；隔离路径只留 log-only catalog 事实、无 model-visible dream 轮。
@@ -178,7 +181,7 @@ $DSH_HOME/storages/meow-memory*           # install-id、prompt 覆盖层、切�
 
 2. 任选其一：
    - **本地目录**：GUI 左侧 **Plugins → Add plugin**，填**本仓库的绝对路径**（插件管理器接受绝对本地路径）；
-   - **tarball**：`npm pack` 生成 `meow-memory-0.34.1.tgz`，Plugins → Add plugin 填该 `.tgz` 的绝对路径。
+   - **tarball**：`npm pack` 生成 `meow-memory-0.35.0.tgz`，Plugins → Add plugin 填该 `.tgz` 的绝对路径。
 3. 重启 `dsh web`（或热重载插件）。新会话自动加载。
 
 > 本地 `file:`/`link:` 安装不会执行 `prepare`，所以**必须先构建**；tarball 里已含 `lib/`，装上即可用。
@@ -232,7 +235,7 @@ dsh plugin --profile <profile> remove meow-memory
 |---|---|
 | 宿主 | **DSH Desktop 0.2.1-rc.2**（Windows 11） |
 | 运行时 | Electron 44.7.0 / Node **24.21.0**，`node:sqlite` 可用 |
-| 验证范围 | 隔离实例加载成功；3 条 `/meow-memory/*` 路由带鉴权 200 / 不带 401；设置命名空间出现；无 apply 错误。0.34 另做了一次带 `dream.isolated: true` 的隔离 live load：**加载成功、无 apply 错误**（当时只验证加载，未真正启动子会话）；0.34.0 的子会话启动 bug（`maxDepth: 0`）由独立复审发现，0.34.1 已修复并用回归测试（fake provider 强制真实深度语义 + 拒绝→回退路径）覆盖。**真实模型/子会话 dream 未在隔离实例中跑通**（无账号凭据） |
+| 验证范围 | 隔离实例加载成功；3 条 `/meow-memory/*` 路由带鉴权 200 / 不带 401；设置命名空间出现；无 apply 错误。0.34 带 `dream.isolated: true` 的 live load 只验证了加载；0.34.0 的子会话启动 bug（`maxDepth: 0`）由独立复审发现，0.34.1 修复。0.35 另做 default / semantic-enabled 两种配置的 live load：均加载成功、无 apply 错误，**禁用语义时启动零 embedding 请求**，未写真实 home。**真实模型/子会话 dream 与真实 embedding 端点未在隔离实例中跑通**（无账号凭据；语义层由 mock embeddings 服务单测覆盖） |
 | 未验证 | **0.1.x 宿主**（本 fork 没有测过，不再宣称"兼容 dsh 0.1.5"）；其他 0.2.x 补丁版本 |
 
 已知兼容性风险（沿用上游结论，本 fork 未改）：
@@ -276,6 +279,13 @@ dsh plugin --profile <profile> remove meow-memory
       minScore: 0.35                # 关键词命中注入门槛
       hitBoost: true                # 命中次数反馈加权
       importanceWeight: true        # importance 参与排序
+      semantic:                     # 0.35 可选语义检索（默认关 = 零网络）
+        enabled: false              # 显式打开才请求 endpoint
+        baseUrl: ''                 # OpenAI-compatible base，如 http://127.0.0.1:11434/v1
+        model: ''                   # embedding 模型名
+        apiKeyEnv: 'MEOW_MEMORY_EMBEDDING_KEY' # key 所在环境变量；默认变量未设 = 无 key 请求
+        timeoutMs: 5000             # 单次请求超时（毫秒；失败静默回退词法）
+        weight: 0.8                 # 语义 floor 混合权重（0..1；0 = 关闭语义补分）
     dream:
       enabled: true
       idleMinutes: 180
@@ -314,12 +324,12 @@ dsh plugin --profile <profile> remove meow-memory
 
 > 0.33 起：首轮快照里的 soul / user / 全局 rules 优先来自用户级全局库（`<activeHomeDir>/global/memory.db`），工作区库兜底；项目全景与重注入仍只读工作区库。
 
-### 工具（0.34 共 10 个）
+### 工具（0.35 共 10 个）
 
 | 工具 | 档 | 用途 |
 |---|---|---|
 | `memory_remember` | 写 | 写入一条记忆（必填 content/project/keywords/importance；**soul/user/全局 rules 写用户级全局库，其余写工作区库**；近逐字重复自动合并） |
-| `memory_search` | 读 | 混合词法检索（BM25 + 字符 n-gram 兜底 floor）× 指数半衰，支持 level/project/status/days 过滤与 `explain`（含可选 `fuzzy`）；两库都查 |
+| `memory_search` | 读 | 混合检索（BM25 + 字符 n-gram floor + 可选语义 floor）× 指数半衰，支持 level/project/status/days 过滤与 `explain`（含可选 `fuzzy` / `semantic`）；两库都查；启用语义时 query 会发一次 embedding 请求 |
 | `memory_project` | 读 | 取回某项目完整注入段落（`project` 参数必填）；**只读工作区库** |
 | `memory_find_similar` | 读 | 查重与冲突检测；两库都查 |
 | `memory_read` | 读 | 按 id 读取单条完整元数据；两库都查 |
@@ -342,7 +352,7 @@ npm run test           # build + 语言包自查 + 全量断言（host + client 
 node scripts/check-lang.mjs en       # 只查某个 prompt 语言包
 ```
 
-测试断言数：`npm test` **1151 条全绿**（host 791 + client 360），0 失败；另 `node smoke.mjs` 29 条；`scripts/check-lang.mjs` 校验 en/pt-br 两个语言包（11 槽位对齐）。
+测试断言数：`npm test` **1219 条全绿**（host 859 + client 360），0 失败；另 `node smoke.mjs` 29 条；`scripts/check-lang.mjs` 校验 en/pt-br 两个语言包（11 槽位对齐）。
 
 `@deepseek-ai/*` 包位于 dsh-meow pnpm workspace，不在本包 `node_modules` 里。Windows 上 `npm run link-workspace` 创建 workspace 包的 junction 镜像供 esbuild 解析；仅构建期需要。
 
@@ -355,6 +365,7 @@ node scripts/check-lang.mjs en       # 只查某个 prompt 语言包
 5. 在克隆来的陌生仓库里开新会话：不应出现你没写过的长期记忆内容（不信任库/默认不迁移）；
 6. 换一个工作区开新会话：`soul` / `user` / 全局 rules 应该还在（来自用户级全局库），`project` / `fact` 是新工作区的（验证两层存储）；
 7. 若开了 `dream.isolated: true`：自动 dream 后主会话不应出现 dream 轮（只有 log-only catalog 事实），子会话应被归档（成功/失败都会归档）；`/dream` 手动仍应出现主 agent dream 轮。若子会话启动被拒，应看到主窗口 dream 继续跑（日志 `isolated-dream rejection -> main-dream fallback`；0.34.0 的 `maxDepth` bug 在 0.34.1 已修复）。
+8. 若开了 `retrieval.semantic.enabled: true`：`security.debugLogs` 下应看到回填日志（首次 apply 后会持续补历史条目）；`memory_search` 传 `explain:true` 应出现 `semantic` 分项；把 endpoint 关掉/填错应立即静默回退纯词法、不影响注入与工具（默认关闭时确认网络面板/日志没有任何 embedding 请求）。
 
 ---
 
