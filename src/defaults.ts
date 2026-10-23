@@ -99,6 +99,8 @@ export const CONFIG_DEFAULTS = {
 export interface DefaultFieldSpec {
   key: string
   sub?: string
+  /** 二级子对象（如 retrieval.semantic）：sub2 只在 sub 给定时有意义。 */
+  sub2?: string
 }
 
 /**
@@ -106,9 +108,12 @@ export interface DefaultFieldSpec {
  * ——调用方据此区分"有出厂默认"与"语义=未设置"两条分支。
  */
 export function factoryDefaultOf(spec: DefaultFieldSpec): unknown {
-  const scope: unknown = spec.sub === undefined
+  let scope: unknown = spec.sub === undefined
     ? CONFIG_DEFAULTS as unknown
     : (CONFIG_DEFAULTS as unknown as Record<string, unknown>)[spec.sub]
+  if (scope !== undefined && scope !== null && typeof scope === 'object' && spec.sub2 !== undefined) {
+    scope = (scope as Record<string, unknown>)[spec.sub2]
+  }
   if (scope === undefined || scope === null || typeof scope !== 'object') return undefined
   return (scope as Record<string, unknown>)[spec.key]
 }

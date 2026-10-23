@@ -189,7 +189,7 @@ Also: workspace paths are compared after **realpath normalisation** (junction / 
 - **Why a floor, not a rerank**: same idea as fuzzy — the semantic score only rescues recall when lexical matching is weak, so it cannot outweigh an exact keyword hit; the trade-off is that weak matches can slip in. The **0.25 noise floor** stops unrelated entries surfacing on tiny similarity; negative/zero similarity counts as 0.
 - **Data flow**: `semantic.ts` owns all networking (`POST {baseUrl}/embeddings`, LRU 256); the write path embeds inline (bounded by `timeoutMs`); after plugin apply it backfills historical entries in the background (global store + each trusted workspace, ≤50 rows/level, silent failures retried next start). `embedding` is a nullable JSON `TEXT` column added lazily to all 7 tables and travels with the DB/backups.
 - **Failure semantics**: timeout/network error/non-2xx/bad shape/missing `fetch` → null, caller silently falls back to pure lexical; a broken semantic layer only adds bounded latency (≤`timeoutMs`) and does not make injection/retrieval/writes fail.
-- **Known boundaries**: no local model; vectors are model-specific (different model/dimensions → score 0, re-write or re-backfill); the settings page does not expose this config; `weight: 0` only disables semantic scoring — set `enabled: false` to stay fully offline.
+- **Known boundaries**: no local model; vectors are model-specific (different model/dimensions → score 0, re-write or re-backfill); **since 0.37 these fields are editable on the settings page** (Retrieval & forgetting group; the 0.2.x save→apply path is still not live-verified); `weight: 0` only disables semantic scoring — set `enabled: false` to stay fully offline.
 
 ---
 
@@ -208,7 +208,19 @@ User-scope global memory (soul/user/global rules) used to be maintainable only t
 
 ---
 
-## 20. Known design debt (updated in 0.36.1)
+## 20. 0.37: settings-page parity + stability wrap-up
+
+The advanced knobs from 0.32–0.36 were profile-patch-only; the user explicitly asked to edit them in the settings page. 0.37 closes that gap and fixes four stability issues found by an independent re-audit.
+
+- **Settings parity**: four new groups under "Meow memory" — Security & privacy (`security.*`, with a danger warning on `trustWorkspaceMemory`), Budget & caps (9 `budget.*`), Retrieval & forgetting (`retrieval.*` + nested `retrieval.semantic`), Isolated dream (`requireLiveAgent` + `isolated*`). **37 new UI keys** ×3 languages. Fields still use the patch as the assembly baseline; UI saves write the user layer.
+- **Nested sub-object saves**: saving `retrieval.semantic.*` only merges that sub-object into the `retrieval` user layer — it does not wash the other base keys into the user layer (otherwise a single semantic toggle save would freeze the whole base retrieval into the user layer). "Restore default" writes the factory default back (badge shows default; nested fields likewise write default values into the user layer — pre-existing design, not a regression).
+- **Effect semantics**: saves generally need a hot reload/restart (existing 0.1.x semantics); hot fields (injection/reflection/dream) auto-correct once the settings namespace is ready. The 0.2.x "save → apply" path still has no live click-through (rendering and save RPC shape are unit-tested).
+- **Stability fixes**: (1) on isolated-dream success, child-written rows are adopted into the parent session in **both** the workspace DB and the **user-scope global DB** (0.36 adopted only the workspace DB, leaving global rows with orphan attribution but still globally effective); (2) the dream check gate only claims `last_check` on **existing + trusted** DBs (foreign/missing DBs get no diagnostic write); (3) `handleMemoryTurnFailure` trust-guards before opening the DB (an untrusted store is not opened/upgraded/rewritten; tests assert byte-identical); (4) the `workspaceRegistry.archiveSession()` promise rejection is caught (no unhandled rejection, the dream still finalizes).
+- **Known minors**: `dream_meta.last_check` stores a number while the public `getDreamMeta()` only reads strings (diagnostics see undefined; gate behaviour is correct); nested-field "Restore default" writes the default into the user layer (badge is correct).
+
+---
+
+## 21. Known design debt (updated in 0.37)
 
 | Issue | Impact | Why |
 |---|---|---|
@@ -216,7 +228,7 @@ User-scope global memory (soul/user/global rules) used to be maintainable only t
 | **No semantic recall by default** | `retrieval.semantic` is off; without it only BM25 + fuzzy run, so paraphrases can still be missed | The semantic layer needs an external embedding service; off is the privacy/availability choice (opt-in) |
 | **Semantic layer is a floor, not a rerank** | Above the 0.25 noise floor weak matches can enter; semantic ordering quality is not guaranteed | Same trade-off as fuzzy: avoid outweighing exact keyword hits; reranking needs a trusted cross-encoder |
 | **Semantic vectors are model-bound** | Changing the endpoint model/dimensions makes old vectors score 0; stored vectors are not recomputed automatically | Vectors are model-specific; re-write entries or clear and re-backfill |
-| **Settings page does not expose semantic config** | `retrieval.semantic` is profile-patch only | Settings-page code is out of scope this round; edit the config by hand |
+| **`dream_meta.last_check` reads as undefined in diagnostics** | The gate stores a number but the public `getDreamMeta()` only reads strings, so diagnostics can't read it (gate behaviour is correct) | The diagnostic API's historical type contract; changing it touches the meta-reading contract for little gain (recorded as a known minor) |
 | **Embeddings send memory bodies** | With it enabled, memory bodies/titles/keywords and user query text go to the configured endpoint | That is required for semantic retrieval; default off + explicit docs let the user choose the provider |
 | **Editor is last-write-wins** | Concurrent edits to the same id from multiple settings pages/tools overwrite each other; no conflict detection | Single-user personal plugin; versioning/optimistic locks cost more than they buy |
 | **Editor has no hard delete** | Only archive/restore; archived entries stop being injected but still occupy the store | Consistent with the existing "the plugin never deletes memories for the user" principle; use `memory_forget mode=delete` (tool channel) for that |
@@ -236,7 +248,8 @@ User-scope global memory (soul/user/global rules) used to be maintainable only t
 | **Scans without indexes (upstream)** | 4 full scans per message; fine at hundreds of entries, a cliff at thousands | T1 added indexes; large-scale behaviour still needs measuring |
 | **#66 host-side tool lock** | After a manual dream the tool set may shrink until restart | Host issue; plugin can only avoid the automatic path |
 | **#71 delegate model leak** | Only with `delegate.model` set | Host projection bug; empty default does not trigger |
-| **Settings save path on 0.2.x** | May render but not reach apply | Settings service redesign, not in this pass |
+| **Settings save path on 0.2.x** | May render but not reach apply (since 0.37 the four advanced groups are on the page, but only the save RPC shape is unit-tested — no live click-through) | Settings service redesign, not in this pass; run the self-check after installing |
+| **Nested "Restore default" writes defaults into the user layer** | The badge correctly shows default, but the user layer gains default values (pre-existing design) | Consistent with "restore = factory default"; clearing the user layer needs profile-level work |
 | **Weak pt-br retrieval** | No Portuguese stemming/stopwords | Needs Portuguese NLP |
 | **Dream history costs tokens** | Folding is visual only | No host "hidden message" semantics |
 | **Plaintext PII** | Memory bodies may contain secrets | Encryption needs key management; `.gitignore` + environment boundary instead |

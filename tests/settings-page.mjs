@@ -26,7 +26,8 @@ writeFileSync(
   ENTRY,
   [
     "export { applySettingsPage, MemorySettingsSection, parseSuppressWindows, serializeSuppressWindows } from '../src/settings-page.ts'",
-    "export { setUiLocaleForTest, getUiLocale, t } from '../src/i18n/index.js'",
+    "export { setUiLocaleForTest, getUiLocale, t, UI_KEYS } from '../src/i18n/index.js'",
+    "export { factoryDefaultOf } from '../src/defaults.ts'",
   ].join('\n'),
   'utf8',
 )
@@ -375,6 +376,114 @@ settings.setUiLocaleForTest('zh')
   }
   const pageMem2 = texts(settings.MemorySettingsSection({ scope: memScope }))
   check('mirror: memory 模式亮只读横幅', pageMem2.some((s) => s.includes('只读镜像')))
+}
+
+// ── 7. 0.37：高级设置组（security/budget/retrieval + 嵌套 semantic + dream isolated）──
+console.log('=== 7. 0.37 高级设置组与嵌套 retrieval.semantic ===')
+const wait = (ms) => new Promise((r) => setTimeout(r, ms))
+const nodesOf = (node, out = []) => {
+  if (node === null || node === undefined || typeof node !== 'object') return out
+  if (Array.isArray(node)) { for (const child of node) nodesOf(child, out); return out }
+  out.push(node)
+  const props = node.props ?? {}
+  nodesOf(props.children, out)
+  nodesOf(node.children ?? [], out)
+  return out
+}
+const rowWithLabel = (tree, label) => nodesOf(tree).find((n) => String(n.props?.className ?? '').includes('meowmm_set_row') && texts(n).includes(label))
+const ADVANCED_KEYS = [
+  'settings.group.security', 'settings.group.budget', 'settings.group.retrieval', 'settings.group.dreamIsolated',
+  'settings.field.security.trustWorkspaceMemory.label', 'settings.field.security.trustWorkspaceMemory.hint',
+  'settings.field.security.allowHomeSwitch.label', 'settings.field.security.autoGitignore.label', 'settings.field.security.debugLogs.label',
+  'settings.field.budget.snapshotMaxChars.label', 'settings.field.budget.hitMaxChars.label', 'settings.field.budget.reinjectMaxChars.label',
+  'settings.field.budget.dreamMaxContextTokens.label', 'settings.field.budget.dreamMaxPerWindowPerDay.label',
+  'settings.field.budget.dreamMaxPerDayTotal.label', 'settings.field.budget.reflectMaxPerDay.label',
+  'settings.field.budget.reflectMinIntervalMinutes.label', 'settings.field.budget.reflectMaxPerDayTotal.label',
+  'settings.field.retrieval.halfLifeDays.label', 'settings.field.retrieval.halfLifeDays.hint',
+  'settings.field.retrieval.minScore.label', 'settings.field.retrieval.hitBoost.label', 'settings.field.retrieval.importanceWeight.label',
+  'settings.field.semantic.enabled.label', 'settings.field.semantic.enabled.hint', 'settings.field.semantic.baseUrl.label',
+  'settings.field.semantic.model.label', 'settings.field.semantic.apiKeyEnv.label', 'settings.field.semantic.timeoutMs.label',
+  'settings.field.semantic.weight.label',
+  'settings.field.dream.requireLiveAgent.label', 'settings.field.dream.isolated.label', 'settings.field.dream.isolated.hint',
+  'settings.field.dream.isolatedProvider.label', 'settings.field.dream.isolatedTimeoutMinutes.label',
+  'settings.field.dream.isolatedMaxPromptChars.label', 'settings.field.dream.isolatedArchiveChild.label',
+]
+settings.setUiLocaleForTest('zh')
+const advancedPage = texts(renderPage())
+check('0.37 zh 新增分组标题', ['安全与隐私', '预算与上限', '检索与遗忘', '隔离 dream（可选）'].every((s) => advancedPage.includes(s)), JSON.stringify(advancedPage.filter((s) => s.includes('与') || s.includes('dream（可'))))
+check('0.37 zh 新增字段标签', ['信任工作区记忆库', '首次快照上限（字符）', '遗忘半衰期（天）', '启用语义检索（可选）', '隔离 dream（spawn 子会话）', 'embedding 端点 baseUrl']
+  .every((s) => advancedPage.includes(s)))
+check('0.37 zh semantic 提示说明默认离线 + 外发风险', advancedPage.some((s) => s.includes('默认离线') && s.includes('会发到该端点')))
+check('0.37: 37 new advanced UI keys registered in UI_KEYS', ADVANCED_KEYS.length === 37 && ADVANCED_KEYS.every((k) => settings.UI_KEYS.includes(k)))
+for (const lang of ['zh', 'en', 'pt-br']) {
+  settings.setUiLocaleForTest(lang)
+  check(`0.37: all 37 advanced keys translated (${lang})`, ADVANCED_KEYS.every((k) => typeof settings.t(k) === 'string' && settings.t(k).length > 0 && settings.t(k) !== k))
+}
+settings.setUiLocaleForTest('zh')
+check('0.37 factoryDefaultOf: nested retrieval.semantic defaults',
+  settings.factoryDefaultOf({ key: 'enabled', sub: 'retrieval', sub2: 'semantic' }) === false &&
+  settings.factoryDefaultOf({ key: 'baseUrl', sub: 'retrieval', sub2: 'semantic' }) === '' &&
+  settings.factoryDefaultOf({ key: 'model', sub: 'retrieval', sub2: 'semantic' }) === '' &&
+  settings.factoryDefaultOf({ key: 'timeoutMs', sub: 'retrieval', sub2: 'semantic' }) === 5000 &&
+  settings.factoryDefaultOf({ key: 'weight', sub: 'retrieval', sub2: 'semantic' }) === 0.8 &&
+  settings.factoryDefaultOf({ key: 'apiKeyEnv', sub: 'retrieval', sub2: 'semantic' }) === 'MEOW_MEMORY_EMBEDDING_KEY')
+check('0.37 factoryDefaultOf: unknown sub2 → undefined', settings.factoryDefaultOf({ key: 'enabled', sub: 'retrieval', sub2: 'nope' }) === undefined)
+check('0.37 factoryDefaultOf: dream isolated + budget defaults',
+  settings.factoryDefaultOf({ key: 'isolated', sub: 'dream' }) === false &&
+  settings.factoryDefaultOf({ key: 'isolatedTimeoutMinutes', sub: 'dream' }) === 20 &&
+  settings.factoryDefaultOf({ key: 'snapshotMaxChars', sub: 'budget' }) === 6000 &&
+  settings.factoryDefaultOf({ key: 'halfLifeDays', sub: 'retrieval' }) === 30 &&
+  settings.factoryDefaultOf({ key: 'trustWorkspaceMemory', sub: 'security' }) === false)
+
+// 嵌套 save：改 retrieval.semantic.enabled 只写 retrieval 父对象、保留同层 user 兄弟、不把 base 拍平
+{
+  const calls = []
+  const value = { enabled: true, retrieval: { halfLifeDays: 30, minScore: 0.35, semantic: { enabled: false } }, security: { trustWorkspaceMemory: false }, dream: { isolated: false } }
+  const user = { retrieval: { halfLifeDays: 45, semantic: { timeoutMs: 3000 } } }
+  const scope = {
+    subscribe: () => () => {},
+    getSnapshot: () => ({ status: 'ready', value, user, base: {}, writable: true, mode: 'user' }),
+    set: async (ns, v) => { calls.push({ ns, v }); return true },
+    unset: async (ns) => { calls.push({ unset: ns }); return true },
+  }
+  const tree = settings.MemorySettingsSection({ scope })
+  const row = rowWithLabel(tree, '启用语义检索（可选）')
+  check('0.37 semantic row rendered with checkbox', row !== undefined)
+  const checkbox = nodesOf(row).find((n) => n.props?.type === 'checkbox')
+  checkbox.props.onChange({ target: { checked: true } })
+  await wait(40)
+  const call = calls.find((c) => c.ns === 'retrieval')
+  check('0.37 nested save: writes retrieval parent object', call !== undefined && call.v.semantic?.enabled === true, JSON.stringify(calls))
+  check('0.37 nested save: preserves user-layer siblings (halfLifeDays + semantic.timeoutMs)',
+    call.v.halfLifeDays === 45 && call.v.semantic.timeoutMs === 3000, JSON.stringify(call?.v))
+  check('0.37 nested save: does not flatten base defaults into user layer',
+    call.v.minScore === undefined && Object.keys(call.v).sort().join(',') === 'halfLifeDays,semantic', JSON.stringify(call?.v))
+}
+
+// 嵌套 reset：恢复默认只删嵌套键，父对象里的其它 user 键保留；不写 base
+{
+  const calls = []
+  const user = { retrieval: { halfLifeDays: 45, semantic: { enabled: true } } }
+  const value = { enabled: true, retrieval: { halfLifeDays: 45, semantic: { enabled: true } } }
+  const scope = {
+    subscribe: () => () => {},
+    getSnapshot: () => ({ status: 'ready', value, user, base: {}, writable: true, mode: 'user' }),
+    set: async (ns, v) => { calls.push({ ns, v }); return true },
+    unset: async (ns) => { calls.push({ unset: ns }); return true },
+  }
+  const tree = settings.MemorySettingsSection({ scope })
+  const row = rowWithLabel(tree, '启用语义检索（可选）')
+  check('0.37 nested override row shows 已覆盖 badge', texts(row).includes('已覆盖'))
+  const resetBtn = nodesOf(row).find((n) => String(n.props?.className ?? '').includes('meowmm_set_reset'))
+  check('0.37 nested override row exposes reset button', resetBtn !== undefined)
+  resetBtn.props.onClick()
+  await wait(40)
+  const call = calls.find((c) => c.ns === 'retrieval')
+  // 0.37 reset 语义 = 写回出厂默认（不是删键）：nested 键仍保留 enabled:false，父对象其它 user 键不动。
+  check('0.37 nested reset: writes factory default for the nested key, keeps parent user siblings + no base flatten',
+    call !== undefined && call.v.halfLifeDays === 45 && call.v.semantic?.enabled === false &&
+    call.v.minScore === undefined && Object.keys(call.v).sort().join(',') === 'halfLifeDays,semantic',
+    JSON.stringify(calls))
 }
 
 console.log(`\n${passed} passed, ${failed} failed`)

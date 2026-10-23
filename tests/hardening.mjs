@@ -32,7 +32,7 @@ const {
   buildInjection, buildHitInjection, buildReinjection, setCurrentProject,
   registerMemoryTools, setMemoryToolGate, apply,
   activeHomeDir, setActiveHomeDir,
-  evaluateAutoDreamGate, dreamSweepOnce, dreamLogPath, collectDreamRounds, DREAM_MAX_ROWS_PER_ROUND,
+  evaluateAutoDreamGate, dreamSweepOnce, dreamSweepTick, dreamLogPath, collectDreamRounds, DREAM_MAX_ROWS_PER_ROUND,
   checkReflectBudget, recordReflectSent, estimateContextTokens, dreamMaxPerDayTotal,
   resetGlobalCostCounters, resetGlobalReflectCounter,
   isolatedDreamAvailable, startIsolatedDream, disposeIsolatedDreams, buildIsolatedDigest,
@@ -2066,6 +2066,164 @@ export function useSyncExternalStore(_subscribe, get) { return get() }
     globalThis.document = savedDocument
     globalThis.window = savedWindow
   }
+}
+
+// ═══════════════════ 26. 0.37：隔离 dream 收养全局库子条目 + archiveSession rejection 兜底 ═══
+{
+  const savedActive = activeHomeDir()
+  const home = tmp('mmh-r5-iso-')
+  closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(home)
+  ensureGlobalStore()
+  const gdb = getGlobalDb()
+  const ws = tmp('mmh-r5-iso-ws-')
+  ensureMemoryStore(ws, '.dsh-meow', { autoGitignore: true, trustWorkspaceMemory: false })
+  const db = getDb(ws, '.dsh-meow')
+  const sid = 'win-r5-iso'
+  db.touchWindow(sid, ws, Date.now() - 4 * 3600_000)
+  db.insert({ level: 'fact', content: '父窗口记忆', project: 'dsh', source_session: sid, created_at: 100 })
+  const childId = 'child-r5-iso'
+  const workspaceChild = db.insert({ level: 'fact', content: '子会话写工作区', project: 'dsh', source_session: childId, updated_at: 100 })
+  const globalChild = gdb.insert({ level: 'soul', content: '子会话写全局', source_session: childId, updated_at: 100 })
+  let resolveResult
+  const result = new Promise((r) => { resolveResult = r })
+  const disposed = []
+  const archivedCalls = []
+  const svc = {
+    getProvider: () => ({ name: 'spawn', inheritsParentContext: false, capabilities: { depthLimit: true } }),
+    startActivation: () => Promise.resolve({ childId, result, dispose: () => disposed.push(1) }),
+  }
+  const agent = { session: { header: { id: sid, cwd: ws }, events: [] }, steer: () => {}, followup: () => {} }
+  const ctx = {
+    get: (name) => {
+      if (name === 'agents') return { get: () => agent }
+      if (name === 'subagents') return svc
+      if (name === 'workspaceRegistry') return { archiveSession: (id) => { archivedCalls.push(id); return Promise.reject(new Error('archive boom')) } }
+      return undefined
+    },
+  }
+  const unhandled = []
+  const onUnhandled = (reason) => unhandled.push(reason)
+  process.on('unhandledRejection', onUnhandled)
+  const cfg = {
+    enabled: true, idleMinutes: 180, checkMinutes: 15, suppressWindows: [], suppressLeadMinutes: 15, timeZone: 'UTC', rulesReviewDays: 2,
+    isolated: true, isolatedProvider: 'spawn', isolatedTimeoutMinutes: 20, isolatedMaxPromptChars: 20000, isolatedArchiveChild: true,
+    budget: { dreamMaxContextTokens: 40000, dreamMaxPerWindowPerDay: 1, dreamMaxPerDayTotal: 12 },
+  }
+  try {
+    const ret = startIsolatedDream(ctx, agent, db, sid, ws, '.dsh-meow', cfg, collectDreamRounds(db, sid, ws, '.dsh-meow'), 1_700_000_000_000)
+    check('0.37 isolated: start returns started for global-adopt run', ret === 'started', ret)
+    await tick(10)
+    resolveResult({ stopReason: 'completed', output: [] })
+    await tick(60); await tick(60)
+    check('0.37 isolated: workspace child row adopted to parent session', db.findById(workspaceChild.id)?.row.source_session === sid)
+    check('0.37 isolated: global-DB child row adopted to parent session too', getGlobalDb().findById(globalChild.id)?.row.source_session === sid)
+    check('0.37 isolated: dream finalized (lease released)', db.getDreamLease(sid) === null && db.getWindow(sid)?.last_dream_time !== null)
+    check('0.37 isolated: archiveSession promise rejection is caught (no unhandledRejection)', archivedCalls.length === 1 && unhandled.length === 0, JSON.stringify(unhandled.map((u) => String(u))))
+    check('0.37 isolated: child activation disposed', disposed.length >= 1)
+    check('0.37 isolated: dreamiso meta cleared', db.getDreamMeta(ISOLATED_DREAM_META_PREFIX + sid) === undefined)
+  } finally {
+    process.off('unhandledRejection', onUnhandled)
+    disposeIsolatedDreams()
+    closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(savedActive)
+    clean(home); clean(ws)
+  }
+}
+
+// ═══════════════════ 27. 0.37：tick 检查门只用可信已存在库 + turn/end 失败路径 trust 守卫 ═══
+{
+  const savedActive = activeHomeDir()
+  const savedMeowEnv = process.env.MEOW_MEMORY_HOME
+  const home = tmp('mmh-r5-gate-')
+  process.env.MEOW_MEMORY_HOME = home
+  closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(home)
+  const wsTrusted = tmp('mmh-r5-gate-trusted-')
+  ensureMemoryStore(wsTrusted, '.dsh-meow', { autoGitignore: true, trustWorkspaceMemory: false })
+  const wsForeign = tmp('mmh-r5-gate-foreign-')
+  const fdb = new MemoryDb(memoryDbPath(wsForeign)); fdb.insert({ level: 'fact', content: '外来库' }); fdb.close(); closeAllDbs()
+  resetStoreTrustCache()
+  ensureMemoryStore(wsForeign, '.dsh-meow', { autoGitignore: true, trustWorkspaceMemory: false })
+  // resetStoreTrustCache 清掉了 wsTrusted 的缓存，门过滤只认已判定可信的库 → 重新判定一次。
+  ensureMemoryStore(wsTrusted, '.dsh-meow', { autoGitignore: true, trustWorkspaceMemory: false })
+  // 注意：closeAllDbs() 会连已有缓存一起关；trusted handle 必须在 foreign 构造之后重新取。
+  const trustedDb = getDb(wsTrusted, '.dsh-meow')
+  const wsMissing = tmp('mmh-r5-gate-missing-')
+  const gateCfg = { enabled: true, idleMinutes: 180, checkMinutes: 15, suppressWindows: [], suppressLeadMinutes: 15, timeZone: 'UTC', rulesReviewDays: 2 }
+  const windowIndex = new Map([['g-trusted', wsTrusted], ['g-foreign', wsForeign], ['g-missing', wsMissing]])
+  const readLastCheck = (ws) => {
+    try {
+      const p = memoryDbPath(ws, '.dsh-meow')
+      if (!existsSync(p)) return { db: false, gate: false, value: undefined }
+      const d = new DatabaseSync(p, { readOnly: true })
+      const row = d.prepare("SELECT value FROM dream_meta WHERE key = 'last_check'").get()
+      d.close()
+      return { db: true, gate: row !== undefined, value: row?.value }
+    } catch {
+      return { db: false, gate: false, value: undefined }
+    }
+  }
+  dreamSweepTick({ get: () => undefined }, gateCfg, '.dsh-meow', windowIndex)
+  const trustedGate = readLastCheck(wsTrusted)
+  check('0.37 tick gate: trusted existing workspace claims the check gate',
+    trustedGate.gate === true && typeof trustedGate.value === 'number' && trustedGate.value > 0, JSON.stringify(trustedGate))
+  check('0.37 tick gate: untrusted workspace gets no last_check write', readLastCheck(wsForeign).gate === false)
+  check('0.37 tick gate: missing-DB workspace gets no last_check write', readLastCheck(wsMissing).gate === false)
+
+  // turn/end error 失败路径：未受信库不 getDb（不写 dreamfail），受信库照常释放租约并记失败
+  const makeCtx = () => {
+    const tools = []
+    const handlers = {}
+    const ctx = {
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      tools: { register: (t) => { tools.push(t); return () => {} } },
+      on: (name, fn) => { handlers[name] = fn },
+      effect: (fn) => { try { fn() } catch { /* mock */ } return () => {} },
+      get: () => undefined,
+      subagents: { start: () => { throw new Error('subagents not expected') } },
+    }
+    return { ctx, tools, handlers }
+  }
+  const a = makeCtx()
+  await apply(a.ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
+  const event = a.handlers['session/event']
+  const beforeForeign = readFileSync(memoryDbPath(wsForeign, '.dsh-meow'))
+  const fire = (sid, cwd, type, data) => event({ id: sid, header: { cwd } }, { type, time: Date.now(), data })
+  fire('sid-r5-foreign', wsForeign, 'turn/start')
+  fire('sid-r5-foreign', wsForeign, 'turn/end', { reason: { kind: 'error' } })
+  await tick(20)
+  const afterForeign = readFileSync(memoryDbPath(wsForeign, '.dsh-meow'))
+  check('0.37 turn/end guard: untrusted workload neither opens nor rewrites its DB', beforeForeign.equals(afterForeign))
+  check('0.37 turn/end guard: no dreamfail meta written for untrusted workspace', readLastCheck(wsForeign).gate === false && (() => {
+    try {
+      const d = new DatabaseSync(memoryDbPath(wsForeign, '.dsh-meow'), { readOnly: true })
+      const n = d.prepare("SELECT COUNT(*) AS n FROM dream_meta WHERE key LIKE 'dreamfail:%'").get().n
+      d.close()
+      return n === 0
+    } catch { return false }
+  })())
+
+  trustedDb.touchWindow('sid-r5-trusted', wsTrusted, Date.now())
+  trustedDb.claimDream('sid-r5-trusted', 'r5-owner', Date.now(), 60_000)
+  check('0.37 turn/end guard: trusted session has an active dream lease before error', trustedDb.getDreamLease('sid-r5-trusted') !== null)
+  fire('sid-r5-trusted', wsTrusted, 'turn/start')
+  fire('sid-r5-trusted', wsTrusted, 'turn/end', { reason: { kind: 'error' } })
+  await tick(20)
+  const trustedFailMeta = (() => {
+    try {
+      const d = new DatabaseSync(memoryDbPath(wsTrusted, '.dsh-meow'), { readOnly: true })
+      const rows = d.prepare("SELECT key, value FROM dream_meta WHERE key LIKE 'dreamfail%'").all()
+      d.close()
+      return JSON.stringify(rows)
+    } catch (e) {
+      return 'ERR ' + e.message
+    }
+  })()
+  check('0.37 turn/end guard: trusted session still runs handleMemoryTurnFailure (lease released + failure recorded)',
+    trustedDb.getDreamLease('sid-r5-trusted') === null && trustedFailMeta.includes('dreamfail_c:sid-r5-trusted'), trustedFailMeta)
+
+  closeGlobalDb(); resetStoreTrustCache(); setActiveHomeDir(savedActive)
+  if (savedMeowEnv === undefined) delete process.env.MEOW_MEMORY_HOME
+  else process.env.MEOW_MEMORY_HOME = savedMeowEnv
+  clean(home); clean(wsForeign); clean(wsMissing)
 }
 
 // 清理

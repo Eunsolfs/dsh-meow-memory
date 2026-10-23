@@ -1609,7 +1609,8 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       if (t === 'turn/end' && (event.data as { reason?: { kind?: string } } | undefined)?.reason?.kind === 'error') {
         const pluginTurn = isPluginTurn.get(sid) === true
         const nakedTurn = turnHadMessage.get(sid) === false // turn/start 已见、其后零消息
-        if ((pluginTurn || nakedTurn) && typeof cwd === 'string' && existsSync(memoryDbPath(cwd, resolved.projectDir))) {
+        if ((pluginTurn || nakedTurn) && typeof cwd === 'string' && existsSync(memoryDbPath(cwd, resolved.projectDir))
+          && storeTrustOf(cwd, resolved.projectDir)?.trusted === true && trustOf(cwd).trusted) {
           const outcome = handleMemoryTurnFailure(getDb(cwd, resolved.projectDir), sid, cwd, resolved.projectDir)
           if (outcome !== 'none') broadcast.broadcast(sid, 'active') // 摘掉 dreaming 呼吸灯（重试/封存状态由后续 sweep 表达）
         }

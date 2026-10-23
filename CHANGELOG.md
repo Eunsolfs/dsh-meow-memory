@@ -1,6 +1,33 @@
 # Changelog
 
-本文件从上游 `Phant0Meow/dsh-meow-memory` v0.31.1 接续。**0.32.0 起为本仓库（hardened fork）的版本，当前 0.36.1**，与上游无隶属关系；上游变更历史见 <https://github.com/Phant0Meow/dsh-meow-memory/blob/main/CHANGELOG.md>。
+本文件从上游 `Phant0Meow/dsh-meow-memory` v0.31.1 接续。**0.32.0 起为本仓库（hardened fork）的版本，当前 0.37.0**，与上游无隶属关系；上游变更历史见 <https://github.com/Phant0Meow/dsh-meow-memory/blob/main/CHANGELOG.md>。
+
+## v0.37.0 (2026-10-24) — 设置页 parity + 稳定性收尾
+
+用户请求："把之前只能在 profile patch 里改的开关也放进设置页"，外加独立复审的稳定性收尾。无配置/API 变更；配置 patch 仍是装配基线。
+
+### 设置页 parity
+
+- 「喵记忆」新增 4 组：**安全与隐私**（`security.trustWorkspaceMemory`，含危险操作警告；`allowHomeSwitch` / `autoGitignore` / `debugLogs`）；**预算与上限**（`budget.snapshotMaxChars` / `hitMaxChars` / `reinjectMaxChars` / `dreamMaxContextTokens` / `dreamMaxPerWindowPerDay` / `dreamMaxPerDayTotal` / `reflectMaxPerDay` / `reflectMinIntervalMinutes` / `reflectMaxPerDayTotal`）；**检索与遗忘**（`retrieval.halfLifeDays`（含复习刷新说明）/ `minScore` / `hitBoost` / `importanceWeight` + **嵌套 `retrieval.semantic`**：`enabled` / `baseUrl` / `model` / `apiKeyEnv` / `timeoutMs` / `weight`，UI 说明默认离线、仅 https 或本机 http、开启会发送记忆/查询文本）；**隔离 dream**（`dream.requireLiveAgent` / `isolated` / `isolatedProvider` / `isolatedTimeoutMinutes` / `isolatedMaxPromptChars` / `isolatedArchiveChild`，说明默认关、主会话 0 增长、失败回退主 agent、手动 `/dream` 不受影响）。
+- 新增 **37** 个 UI 文案键（4 分组 + 33 字段）× zh/en/pt-br（原计划 39，实际 37；键集对齐由测试卡住）。
+- **嵌套子对象保存语义**：保存 `retrieval.semantic.enabled` 只把该子对象合并进 `retrieval` 的 user 层，不会把 base 的其它键洗进 user 层；「恢复默认」写回出厂默认（预存设计，徽章显示默认）。
+- **生效语义照实说明**：配置 patch 仍是装配基线；UI 保存后一般需热重载/重启生效（沿用 0.1.x 语义），除注入/反思/dream 等热字段在 settings 命名空间就绪后自动纠正。0.2.x 的"保存 → 落到 apply"链路仍无 live click-through（渲染与 save RPC 形状有单测）。
+
+### 稳定性修复
+
+- **隔离 dream 收养全局库子条目**：成功时除了工作区库，也把子会话写进**用户级全局库**的条目的 `source_session` 归到父会话（0.36 只收养工作区库，全局行会成孤儿 attribution 但仍全局生效）。`archiveSession` 的 promise rejection 也已接住（不再可能未处理拒绝，dream 仍正常收尾）。
+- **dream 检查门只取已存在且受信的库**：`dreamSweep` 的 `last_check` 门只对 `storeTrustOf(...).trusted === true` 且库文件存在的 workspace 取；陌生/缺失库不会写入 `last_check`（此前可能为未受信工作区写诊断记录）。
+- **turn/end 失败兜底先过 trust**：`handleMemoryTurnFailure` 在打开库之前判定信任；未受信工作区不会被打开/升级/改写（测试断言库文件字节不变），避免失败路径绕过 0.32 信任闸。
+
+### 测试
+
+- `npm test`：**1317 条断言全绿**（host 940 + client 377），0 失败；`tests/hardening.mjs` **350 → 364**（+14 稳定性：global adopt、archiveSession rejection、tick gate trust、turn/end trust）；`tests/settings-page.mjs` **66 → 83**（+17：4 组渲染、嵌套 semantic、37 key 三语、restore default）。`node smoke.mjs` 29 条；`check-lang` en/pt-br（11 槽位）通过。
+
+### 已知 minor / 限制
+
+- **`dream_meta.last_check` 存数字**，而公开 `getDreamMeta()` 只读字符串——诊断读取会看到 `undefined`（门行为本身正确）；记录为 known-debt。
+- 嵌套字段「恢复默认」会把默认值写入 user 层（badge 正确显示默认；预存设计，非回归）。
+- 0.2.x 设置页"保存→apply"仍未实测；现有 next-turn 传播、无硬删除、仅全局作用域等限制不变。
 
 ## v0.36.1 (2026-10-23) — 传播修复（冷会话 header 形状）
 

@@ -3,12 +3,12 @@
 | [中文](README.md) | [English](README.en.md) | [Português (BR)](README.pt-br.md) | [MIT License](LICENSE) |
 | :---: | :---: | :---: | :---: |
 
-> **What this is**: a personal hardening fork of `Phant0Meow/dsh-meow-memory` **v0.31.1** (this repository, version **0.36.1**, branch `hardening`).
+> **What this is**: a personal hardening fork of `Phant0Meow/dsh-meow-memory` **v0.31.1** (this repository, version **0.37.0**, branch `hardening`).
 > Upstream is MIT-licensed: <https://github.com/Phant0Meow/dsh-meow-memory>. This fork is **not affiliated with upstream**, does not publish on upstream's behalf, and does not represent upstream's views. All changes and remaining issues are in [CHANGELOG.md](CHANGELOG.md).
 
 Cross-session memory for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): seven-layer SQLite memory, first-turn snapshot injection, per-message keyword hits, and automatic consolidation **with budget caps**.
 
-Version **0.36.1** ｜ Changelog: [CHANGELOG.md](CHANGELOG.md) ｜ Verified host: **DSH Desktop 0.2.1-rc.2** (see [Compatibility](#compatibility))
+Version **0.37.0** ｜ Changelog: [CHANGELOG.md](CHANGELOG.md) ｜ Verified host: **DSH Desktop 0.2.1-rc.2** (see [Compatibility](#compatibility))
 
 **Honesty note**: this README only claims behaviour that exists in the code. 0.32 removed several inflated upstream claims ("automatic dedupe/merge", "Ebbinghaus forgetting curve", per-message "BM25", "supports dsh 0.1.5") and states the real boundary at each point.
 
@@ -145,6 +145,8 @@ $DSH_HOME/storages/meow-memory*           # install-id, prompt overrides, switch
 - **Seven memory layers**: `soul` (the AI itself) / `user` / `project` (with `subcategory`) / `fact` / `lesson` / `topic` (with a goal sentence) / `rules`. One SQLite table per layer, time-prefixed ids.
 - **Two-layer storage (0.33)**: `soul` / `user` / global `rules` live in the **user-scope global store**, shared across workspaces; `project` / `fact` / `lesson` / `topic` / project rules stay in the workspace store. See [Where memory lives](#where-memory-lives-two-layer-storage-033).
 - **Global-memory visual editor (0.36)**: the DSH settings page ("Meow memory" tab, bottom) adds a **"Global memory (user-scope)"** card that lists / inline-edits **content, keywords, importance**, **creates** (soul/user/rules), and **archives/restores**; it only covers soul/user/global rules in the user-scope global store. After a save the host marks related sessions for reinject; those sessions re-inject the updated global memory on their **next user message** (no history rewrite, no immediate model call). Validation: content trim 1–4000 chars, keywords 1–30, importance integer 1–100; **no hard delete** (archive instead); last-write-wins. See [configuration reference "UI editing"](docs/configuration-reference.md#ui-editing-global-memory-036).
+- **Settings page now covers almost every knob (0.37)**: four new groups under "Meow memory" — **Security & privacy** (`security.*`, incl. the dangerous `trustWorkspaceMemory` warning), **Budget & caps** (9 `budget.*`), **Retrieval & forgetting** (`retrieval.*` + **nested `retrieval.semantic`** 6 fields), **Isolated dream** (`dream.requireLiveAgent` + 5 `dream.isolated*`); **37 new UI copy keys** × zh/en/pt-br. Nested sub-object saves only merge that sub-object into the `retrieval` user layer (base keys are not washed into the user layer); "Restore default" writes the factory default back and shows the default badge. **The profile patch remains the assembly baseline**; UI saves generally need a hot reload/restart (hot fields auto-correct once the settings namespace is ready).
+- **Stability fixes (0.37)**: (1) on isolated-dream success, child-written rows are adopted into the parent session in **both** the workspace DB and the **user-scope global DB** (no orphan global attribution); (2) the dream check gate only claims **existing + trusted** DBs (foreign/missing DBs never get `last_check`); (3) the turn/end failure fallback `handleMemoryTurnFailure` trust-guards before opening the DB (an untrusted store gets no schema upgrade at all; the file is byte-identical in tests); (4) the `workspaceRegistry.archiveSession()` promise rejection is caught (no unhandled rejection, the dream still finalizes).
 - **First-turn injection (long-term block)**: soul / user / global rules / memory guide are injected before the first user message as an independent plugin snapshot **without rewriting the user prompt**; soul / user / global rules come from the user-scope global store with the workspace store as fallback; **no keyword hits on turn 1** (hits start from message 2).
 - **Per-message keyword hits + hybrid lexical floor + optional semantic floor (0.35)**: from the second user message, fact/lesson/rules/topic are matched by entry **keywords** (not full text), scoped to global + the current project anchor, injecting up to `hitTopK`. 0.33 adds an offline lexical complement — character bigram Jaccard + 0.25×trigram Jaccard (CJK-safe, NFKC) — used as a **floor** when BM25 is weak: `score = max(BM25, 0.55·fuzzy·recency·importance)`, noise floor 0.2. 0.35 can opt into `retrieval.semantic` (off by default): with it enabled, cosine similarity between the query and entry embeddings is **also a floor** (`relevance = max(lexical, fuzzy, cos·weight·importance)`, cos < 0.25 counts as 0), covering some paraphrases; **it is not a rerank and does not guarantee semantic quality** (see limitations below).
 - **Current-project anchor**: passing a project parameter anchors the session's current project; unanchored sessions hit global entries only.
@@ -158,7 +160,7 @@ $DSH_HOME/storages/meow-memory*           # install-id, prompt overrides, switch
 
 ### What it cannot do (do not misunderstand)
 
-- **Semantic retrieval is off by default**: without `retrieval.semantic` there is no semantic recall (BM25 + 0.33 fuzzy only). When enabled it is an **experimental floor** (only cosine ≥0.25 participates, no rerank, weak matches can slip in), depends on an **external embeddings endpoint** (no local model bundled), silently degrades to lexical on failure/timeout; **only https or loopback http is allowed** (remote plain http is rejected); a hanging endpoint adds **up to `timeoutMs` (5s default) latency**; vectors are JSON text in the DB/backups (≈31 KiB/row at 1536 dims, 1k ≈30 MB, plaintext derived data); **not exposed on the settings page** (config file only); changing the embedding model invalidates stored vectors (re-write/re-backfill).
+- **Semantic retrieval is off by default**: without `retrieval.semantic` there is no semantic recall (BM25 + 0.33 fuzzy only). When enabled it is an **experimental floor** (only cosine ≥0.25 participates, no rerank, weak matches can slip in), depends on an **external embeddings endpoint** (no local model bundled), silently degrades to lexical on failure/timeout; **only https or loopback http is allowed** (remote plain http is rejected); a hanging endpoint adds **up to `timeoutMs` (5s default) latency**; vectors are JSON text in the DB/backups (≈31 KiB/row at 1536 dims, 1k ≈30 MB, plaintext derived data); **since 0.37 these fields are editable on the settings page** (Retrieval & forgetting group), though the 0.2.x save→apply path is still not live-verified (see compatibility); changing the embedding model invalidates stored vectors (re-write/re-backfill).
 - **Project-level memory is still workspace-scoped**: `project` / `fact` / `lesson` / `topic` / project rules follow the cwd (a new workspace starts with fresh project memory). Only `soul` / `user` / global rules are shared across workspaces (0.33 user-scope global store).
 - **Global store does not participate in dream**: dream's three rounds still consolidate the workspace DB only; global entries are maintained via tools/reflection.
 - **UI editor limits (0.36; 0.36.1 propagation fix)**: it edits **global-scope** soul/user/global rules only; project-scoped rules, fact/lesson/topic are not included (use `memory_*` tools); **no hard delete / bulk import / conflict merge**; a save takes effect on the session's **next user message** (sessions with no next turn keep their old snapshot); marking is bounded (**at most 2000 sessions per save**, already pending not rewritten); concurrent edits to the same id are **last-write-wins**; archived entries are no longer injected but remain in the store (restorable); dream/reflection can still reorganize entries afterwards.
@@ -186,7 +188,7 @@ $DSH_HOME/storages/meow-memory*           # install-id, prompt overrides, switch
 
 2. Either:
    - **local directory**: GUI **Plugins → Add plugin**, enter the **absolute path** of this repository (the plugin manager accepts absolute local paths);
-   - **tarball**: `npm pack` produces `meow-memory-0.36.1.tgz`; enter the absolute path of that `.tgz`.
+   - **tarball**: `npm pack` produces `meow-memory-0.37.0.tgz`; enter the absolute path of that `.tgz`.
 3. Restart `dsh web` (or hot-reload the plugin). New sessions load it automatically.
 
 > Local `file:`/`link:` installs do not run `prepare`, so **build first**; a tarball already contains `lib/`.
@@ -240,12 +242,12 @@ The environment this fork was actually verified on (not a "backward compatible w
 |---|---|
 | Host | **DSH Desktop 0.2.1-rc.2** (Windows 11) |
 | Runtime | Electron 44.7.0 / Node **24.21.0**, `node:sqlite` available |
-| Verified | Isolated instance loads; 4 `/meow-memory/*` routes (dreamed-sessions / dream-events / skip-dreams / global-memory) return 200 with auth / 401 without; settings namespace appears; no apply error. The 0.34 live load with `dream.isolated: true` only verified loading; the 0.34.0 child-start bug (`maxDepth: 0`) was found by re-audit and fixed in 0.34.1. 0.35 additionally ran live loads with default and semantic-enabled configs: both loaded cleanly with no apply error, **zero embedding requests at boot when disabled**, no real-home writes. 0.35.1 is audit remediation (transport policy/cold-start backfill/review refresh), covered by unit tests. 0.36's editor routes were exercised with a live-boot 401/200 round-trip (mock webServer/auth + isolated instance) and covered by unit tests for editor/route/propagation/component; 0.36.1 fixes propagation for **header-shaped cold sessions** (`headerOf`) and adds a 2000-session marking cap, covered by unit tests. **Real model / child-session dream and a real embedding endpoint were not exercised in the isolated instance** (no credentials; the semantic layer is covered by unit tests with a mock embeddings server) |
+| Verified | Isolated instance loads; 4 `/meow-memory/*` routes (dreamed-sessions / dream-events / skip-dreams / global-memory) return 200 with auth / 401 without; settings namespace appears; no apply error. The 0.34 live load with `dream.isolated: true` only verified loading; the 0.34.0 child-start bug (`maxDepth: 0`) was found by re-audit and fixed in 0.34.1. 0.35 additionally ran live loads with default and semantic-enabled configs: both loaded cleanly with no apply error, **zero embedding requests at boot when disabled**, no real-home writes. 0.35.1 is audit remediation (transport policy/cold-start backfill/review refresh), covered by unit tests. 0.36's editor routes were exercised with a live-boot 401/200 round-trip (mock webServer/auth + isolated instance) and covered by unit tests for editor/route/propagation/component; 0.36.1 fixes propagation for **header-shaped cold sessions** (`headerOf`) and adds a 2000-session marking cap, covered by unit tests. 0.37's settings-page parity is covered by unit tests (4 groups security/budget/retrieval+nested semantic/isolated-dream rendering, 37 UI keys ×3 languages, nested save shape, restore default) and the stability fixes by hardening unit tests; **the 0.2.x settings save→apply path still has no live click-through**. **Real model / child-session dream and a real embedding endpoint were not exercised in the isolated instance** (no credentials; the semantic layer is covered by unit tests with a mock embeddings server) |
 | Not verified | **0.1.x hosts** (this fork has not tested them; the "supports dsh 0.1.5" claim is removed); other 0.2.x patch releases |
 
 Known compatibility risks (upstream findings, unchanged by this fork):
 
-- **Settings save path**: after the 0.2.x settings service redesign the plugin takes a degraded path. The page renders, but "edit → save → reload → applied" was not verified in this fork; worst case values display but do not reach apply. Run the [self-check](#self-check-after-install) after installing.
+- **Settings save path**: after the 0.2.x settings service redesign the plugin takes a degraded path. The page renders, but "edit → save → reload → applied" was not verified in this fork (since 0.37 the four advanced groups are on the page too, but only the save RPC shape is unit-tested — no live click-through); worst case values display but do not reach apply. Run the [self-check](#self-check-after-install) after installing.
 - **Client UI** (fold bars / moon icons / menu panel) depends on 0.2.x `ChatSnapshot` internals and DOM observation; a host patch may silently disable it (cosmetic only).
 - `node:sqlite` requires **Node ≥ 22.13** (22.5–22.12 needs `--experimental-sqlite`).
 
@@ -253,7 +255,7 @@ Known compatibility risks (upstream findings, unchanged by this fork):
 
 ## Configuration
 
-All fields are optional. **The new 0.32 `security` / `budget` / `retrieval` groups are config-file only** (profile patch or `cordis.patch.yml`); the settings page still covers the 0.31 fields, and **since 0.36 it additionally provides the "Global memory (user-scope)" visual editor (data editing, not config)**, but it does not expose `security` / `budget` / `retrieval` config fields.
+All fields are optional. **Since 0.37 the 0.32 `security` / `budget` / `retrieval` (incl. 0.35 semantic) and 0.34 isolated-dream fields can also be edited in the settings page ("Meow memory")** (the profile patch / `cordis.patch.yml` remains the assembly baseline); **since 0.36 the page also has the "Global memory (user-scope)" visual editor (data editing, not config)**. UI saves generally need a hot reload/restart (hot fields auto-correct once the settings namespace is ready), and the 0.2.x "save → apply" path is still not live-verified in this fork — see [Compatibility](#compatibility).
 
 ```yaml
 - id: meow-memory
@@ -360,14 +362,14 @@ npm run test           # build + language-pack check + full assertions (host + c
 node scripts/check-lang.mjs en       # check one prompt language pack
 ```
 
-Test assertions: `npm test` **1286 all green** (host 926 + client 360), 0 failed; plus 29 in `node smoke.mjs`; `scripts/check-lang.mjs` validates the en/pt-br packs (11 slots aligned).
+Test assertions: `npm test` **1317 all green** (host 940 + client 377), 0 failed; plus 29 in `node smoke.mjs`; `scripts/check-lang.mjs` validates the en/pt-br packs (11 slots aligned).
 
 The `@deepseek-ai/*` packages live in the dsh-meow pnpm workspace, not in this package's `node_modules`. On Windows, `npm run link-workspace` creates junction mirrors so esbuild can resolve them (build-time only).
 
 ### Self-check after install
 
 1. One normal conversation turn: does the first turn show a long-term-memory fold bar? (No → the plugin is not running.)
-2. Change a setting → save → hot-reload the plugin → did the value apply? (Checks the 0.2.x settings drift.)
+2. Change a setting (any field in the 0.37 groups Security & privacy / Budget & caps / Retrieval & forgetting / Isolated dream) → save → hot-reload the plugin → did the value apply? (Checks the 0.2.x settings drift; a nested `retrieval.semantic` save should not wash other base keys into the user layer.)
 3. After `/dream`, keep chatting: is the tool count normal? (Guards #66.)
 4. After a reflection turn, check the model selector: still the main model? (#71 can trigger only with `delegate.model` set.)
 5. Open a session in a cloned, untrusted repository: no long-term memory you did not write should appear (untrusted store + no auto-migration);

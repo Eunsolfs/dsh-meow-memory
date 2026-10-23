@@ -1,4 +1,4 @@
-# Troubleshooting (0.36 fork)
+# Troubleshooting (0.37 fork)
 
 Start here when installation fails, recall is poor, or behaviour is unexpected.
 
@@ -132,7 +132,7 @@ Most likely causes:
 - **Size**: vectors are JSON text in the DB/backups — ≈31 KiB/row at 1536 dims (1k entries ≈30 MB), plaintext derived data.
 - **Failures**: timeout (5s default)/network error/non-2xx silently fall back to pure lexical; they only add bounded latency (≤`timeoutMs`) and never make injection/retrieval/writes fail.
 - **Changing models**: stored vectors are model-specific; a new model/dimensions invalidates old vectors (score 0) — re-write or clear and re-backfill.
-- **Not exposed on the settings page**: `retrieval.semantic` is profile-patch only; reload/restart the plugin after editing.
+- **Settings page (0.37)**: `retrieval.semantic` is editable in the "Retrieval & forgetting" group (nested fields); saves generally need a hot reload/restart, but the 0.2.x "save → apply" path is still not live-verified (see [Compatibility](#compatibility)); the profile patch remains the assembly baseline.
 - **Forgetting**: since 0.35.1 recall refreshes the decay curve (`last_accessed_at`), so recently recalled memories decay more slowly.
 
 ### Hits are metadata, not answers
@@ -171,7 +171,7 @@ Settings → "Meow memory" → bottom card "Global memory (user-scope)" (0.36): 
 - **Untrusted global store**: the editor shows a warning and refuses writes (error `global store unavailable or untrusted`); it never opens a foreign store.
 - **No hard delete**: archive instead; archived entries are not injected but remain in the store and are restorable. Content/keyword changes clear that entry's embedding (rebuilt by a later backfill/write).
 - **Limits**: still effective only on the next user message; marking is bounded (≤2000 sessions per save); last-write-wins, no bulk import/conflict merge; the routes are plugin-private (not a public API); dream/reflection can still reorganize entries afterwards.
-- **Config fields are still not exposed on the settings page**: `security` / `budget` / `retrieval` remain profile-patch only (the editor edits data, not config).
+- **Since 0.37 the settings page covers these config fields**: `security` / `budget` / `retrieval` (incl. nested semantic) and `dream.isolated*` are editable in the new "Meow memory" groups; the profile patch remains the assembly baseline, and the 0.2.x save→apply path is still not live-verified (the editor itself still edits data, not config).
 
 ### Is my old `PROJECT.md` migrated automatically?
 
@@ -200,11 +200,13 @@ Since 0.33 storage is two-layer:
 
 ### Which DSH versions are supported?
 
-This fork was **verified on DSH Desktop 0.2.1-rc.2** (Electron 44.7.0 / Node 24.21.0, Windows 11): isolated load succeeded, the 4 routes returned 200/401 under auth, the settings namespace appeared, no apply error; the 0.34 live load with `dream.isolated: true` only verified loading (the 0.34.0 child-start bug was found later by re-audit and fixed in 0.34.1); 0.35 additionally ran live loads with default and semantic-enabled configs (both loaded cleanly, no apply error, **zero embedding requests at boot when disabled**, no real-home writes); 0.35.1 is audit remediation (transport policy/cold-start backfill/review refresh); 0.36's editor routes were exercised with a live-boot 401/200 round-trip (mock webServer/auth + isolated instance). **0.1.x was not tested**; the "supports dsh 0.1.5" claim is gone.
+This fork was **verified on DSH Desktop 0.2.1-rc.2** (Electron 44.7.0 / Node 24.21.0, Windows 11): isolated load succeeded, the 4 routes returned 200/401 under auth, the settings namespace appeared, no apply error; the 0.34 live load with `dream.isolated: true` only verified loading (the 0.34.0 child-start bug was found later by re-audit and fixed in 0.34.1); 0.35 additionally ran live loads with default and semantic-enabled configs (both loaded cleanly, no apply error, **zero embedding requests at boot when disabled**, no real-home writes); 0.35.1 is audit remediation (transport policy/cold-start backfill/review refresh); 0.36's editor routes were exercised with a live-boot 401/200 round-trip (mock webServer/auth + isolated instance); 0.36.1 fixed propagation and added the marking cap; 0.37's 4 settings groups are covered by settings-page unit tests (37 keys ×3 languages/nested save/restore default) and the stability fixes by hardening unit tests, **while the 0.2.x save→apply path still has no live click-through**. **0.1.x was not tested**; the "supports dsh 0.1.5" claim is gone.
 
 ### Settings page saves but nothing changes
 
-On 0.2.x the settings service was redesigned and the plugin takes a degraded path. The page renders, but "edit → save → reload → applied" was not verified by this fork; worst case it displays values without reaching apply. Run the [README self-check list](../README.en.md#self-check-after-install); otherwise edit the profile patch config directly. **0.35's `retrieval.semantic` does not appear on the settings page** — profile patch only; **since 0.36 the bottom of the settings page also has the "Global memory (user-scope)" editor (data editing, not config)**.
+On 0.2.x the settings service was redesigned and the plugin takes a degraded path. The page renders, but "edit → save → reload → applied" was not verified by this fork; worst case it displays values without reaching apply. Run the [README self-check list](../README.en.md#self-check-after-install); otherwise edit the profile patch config directly.
+
+**Since 0.37 the settings page adds 4 groups**: Security & privacy (`security.*`, incl. the dangerous `trustWorkspaceMemory`), Budget & caps (9 `budget.*`), Retrieval & forgetting (`retrieval.*` + nested `retrieval.semantic`), Isolated dream (`requireLiveAgent` + `isolated*`); these fields are now editable in "Meow memory" (previously profile-patch only). Save semantics: a nested `retrieval.semantic` save only merges that sub-object into the `retrieval` user layer (other base keys are not washed into the user layer); "Restore default" writes the factory default back and shows the default badge; saves generally need a hot reload/restart (hot fields auto-correct once the namespace is ready), and the 0.2.x save→apply path still has no live verification. **0.37 known minors**: `getDreamMeta('last_check')` diagnostics read `undefined` (the gate stores a number, the public API only reads strings; gate behaviour is correct); nested-field "Restore default" writes the default into the user layer (badge is correct; pre-existing design). **Since 0.36 the bottom of the settings page also has the "Global memory (user-scope)" editor (data editing, not config)**.
 
 ### Tool set shrinks after dream / model changes
 

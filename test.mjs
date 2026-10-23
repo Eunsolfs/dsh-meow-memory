@@ -616,6 +616,8 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   // 往返）之前短路——用检查门 last_check 是否被写做可观测判定（去 #26 报告人指出的
   // 观测盲点）；getter 抛错不炸 sweep 链。
   const wsT = mkdtempSync(join(tmpdir(), 'mm-tick-'))
+  // 0.37：检查门只对已存在且**受信**的库取（陌生库不写门记录）——测试库先建标记。
+  ensureMemoryStore(wsT, '.dsh-meow', { autoGitignore: false, trustWorkspaceMemory: false })
   const dbT = getDb(wsT, '.dsh-meow')
   const gateValue = () => dbT.db.prepare(`SELECT value FROM dream_meta WHERE key = 'last_check'`).get()?.value
   const cfgOf = (over) => ({ enabled: true, idleMinutes: 180, suppressWindows: [], suppressLeadMinutes: 15, checkMinutes: 15, timeZone: 'Asia/Shanghai', rulesReviewDays: 2, ...over })

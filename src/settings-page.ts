@@ -79,6 +79,8 @@ const el = React.createElement
 interface FieldSpec {
   key: string
   sub?: string
+  /** 二级子对象（如 retrieval.semantic）：先 sub 再 sub2 定位父对象。 */
+  sub2?: string
   label: UiKey
   type: 'bool' | 'num' | 'str' | 'homeDir'
   hint?: UiKey
@@ -143,6 +145,56 @@ const FIELDS: GroupSpec[] = [
       { key: 'autoMigrate', label: 'settings.field.autoMigrate.label', type: 'bool', hint: 'settings.field.autoMigrate.hint' },
     ],
   },
+  // ── 0.37：之前只能手改 profile patch 的字段，现在进 UI ─────────────────────
+  {
+    title: 'settings.group.security',
+    fields: [
+      { key: 'trustWorkspaceMemory', sub: 'security', label: 'settings.field.security.trustWorkspaceMemory.label', type: 'bool', hint: 'settings.field.security.trustWorkspaceMemory.hint' },
+      { key: 'allowHomeSwitch', sub: 'security', label: 'settings.field.security.allowHomeSwitch.label', type: 'bool' },
+      { key: 'autoGitignore', sub: 'security', label: 'settings.field.security.autoGitignore.label', type: 'bool' },
+      { key: 'debugLogs', sub: 'security', label: 'settings.field.security.debugLogs.label', type: 'bool' },
+    ],
+  },
+  {
+    title: 'settings.group.budget',
+    fields: [
+      { key: 'snapshotMaxChars', sub: 'budget', label: 'settings.field.budget.snapshotMaxChars.label', type: 'num' },
+      { key: 'hitMaxChars', sub: 'budget', label: 'settings.field.budget.hitMaxChars.label', type: 'num' },
+      { key: 'reinjectMaxChars', sub: 'budget', label: 'settings.field.budget.reinjectMaxChars.label', type: 'num' },
+      { key: 'dreamMaxContextTokens', sub: 'budget', label: 'settings.field.budget.dreamMaxContextTokens.label', type: 'num' },
+      { key: 'dreamMaxPerWindowPerDay', sub: 'budget', label: 'settings.field.budget.dreamMaxPerWindowPerDay.label', type: 'num' },
+      { key: 'dreamMaxPerDayTotal', sub: 'budget', label: 'settings.field.budget.dreamMaxPerDayTotal.label', type: 'num' },
+      { key: 'reflectMaxPerDay', sub: 'budget', label: 'settings.field.budget.reflectMaxPerDay.label', type: 'num' },
+      { key: 'reflectMinIntervalMinutes', sub: 'budget', label: 'settings.field.budget.reflectMinIntervalMinutes.label', type: 'num' },
+      { key: 'reflectMaxPerDayTotal', sub: 'budget', label: 'settings.field.budget.reflectMaxPerDayTotal.label', type: 'num' },
+    ],
+  },
+  {
+    title: 'settings.group.retrieval',
+    fields: [
+      { key: 'halfLifeDays', sub: 'retrieval', label: 'settings.field.retrieval.halfLifeDays.label', type: 'num', hint: 'settings.field.retrieval.halfLifeDays.hint' },
+      { key: 'minScore', sub: 'retrieval', label: 'settings.field.retrieval.minScore.label', type: 'num' },
+      { key: 'hitBoost', sub: 'retrieval', label: 'settings.field.retrieval.hitBoost.label', type: 'bool' },
+      { key: 'importanceWeight', sub: 'retrieval', label: 'settings.field.retrieval.importanceWeight.label', type: 'bool' },
+      { key: 'enabled', sub: 'retrieval', sub2: 'semantic', label: 'settings.field.semantic.enabled.label', type: 'bool', hint: 'settings.field.semantic.enabled.hint' },
+      { key: 'baseUrl', sub: 'retrieval', sub2: 'semantic', label: 'settings.field.semantic.baseUrl.label', type: 'str' },
+      { key: 'model', sub: 'retrieval', sub2: 'semantic', label: 'settings.field.semantic.model.label', type: 'str' },
+      { key: 'apiKeyEnv', sub: 'retrieval', sub2: 'semantic', label: 'settings.field.semantic.apiKeyEnv.label', type: 'str' },
+      { key: 'timeoutMs', sub: 'retrieval', sub2: 'semantic', label: 'settings.field.semantic.timeoutMs.label', type: 'num' },
+      { key: 'weight', sub: 'retrieval', sub2: 'semantic', label: 'settings.field.semantic.weight.label', type: 'num' },
+    ],
+  },
+  {
+    title: 'settings.group.dreamIsolated',
+    fields: [
+      { key: 'requireLiveAgent', sub: 'dream', label: 'settings.field.dream.requireLiveAgent.label', type: 'bool' },
+      { key: 'isolated', sub: 'dream', label: 'settings.field.dream.isolated.label', type: 'bool', hint: 'settings.field.dream.isolated.hint' },
+      { key: 'isolatedProvider', sub: 'dream', label: 'settings.field.dream.isolatedProvider.label', type: 'str' },
+      { key: 'isolatedTimeoutMinutes', sub: 'dream', label: 'settings.field.dream.isolatedTimeoutMinutes.label', type: 'num' },
+      { key: 'isolatedMaxPromptChars', sub: 'dream', label: 'settings.field.dream.isolatedMaxPromptChars.label', type: 'num' },
+      { key: 'isolatedArchiveChild', sub: 'dream', label: 'settings.field.dream.isolatedArchiveChild.label', type: 'bool' },
+    ],
+  },
 ]
 
 /** 占位符既可为字面量（'.dsh-meow'）也可为 i18n 键：是已知键则翻译，否则原样。 */
@@ -180,7 +232,9 @@ export function serializeSuppressWindows(w: Array<{ start: string; end: string }
 function fieldValue(value: Record<string, unknown> | undefined, spec: FieldSpec): unknown {
   if (spec.sub === undefined) return value?.[spec.key]
   const parent = value?.[spec.sub] as Record<string, unknown> | undefined
-  return parent?.[spec.key]
+  if (spec.sub2 === undefined) return parent?.[spec.key]
+  const child = parent?.[spec.sub2] as Record<string, unknown> | undefined
+  return child?.[spec.key]
 }
 
 /** 是否在 user 层（=已覆盖，可恢复预填）。 */
@@ -188,12 +242,15 @@ function inUserLayer(user: Record<string, unknown> | undefined, spec: FieldSpec)
   if (user === undefined) return false
   if (spec.sub === undefined) return spec.key in user
   const parent = user[spec.sub] as Record<string, unknown> | undefined
-  return parent !== undefined && spec.key in parent
+  if (spec.sub2 === undefined) return parent !== undefined && spec.key in parent
+  const child = parent?.[spec.sub2] as Record<string, unknown> | undefined
+  return child !== undefined && spec.key in child
 }
 
 /** 本地草稿键：含 sub 前缀——顶层 enabled 与 dream.enabled、reflect 与 delegate.reflect 同名，裸 key 会串草稿。 */
 function draftKey(spec: FieldSpec): string {
-  return spec.sub === undefined ? spec.key : `${spec.sub}.${spec.key}`
+  if (spec.sub === undefined) return spec.key
+  return spec.sub2 === undefined ? `${spec.sub}.${spec.key}` : `${spec.sub}.${spec.sub2}.${spec.key}`
 }
 
 /** JSON 数据结构相等：镜像值是冻结快照的深拷贝，引用必不同，只能按结构比。 */
@@ -510,7 +567,13 @@ export function MemorySettingsSection(props: { scope: any }): any {
         // 连续改同一子对象的两个字段时，闭包快照可能滞后导致第二次 patch 丢掉第一次的写入。
         const user = scope.getSnapshot().user as Record<string, unknown> | undefined
         const parent = { ...((user?.[spec.sub] as Record<string, unknown>) ?? {}) }
-        parent[spec.key] = newValue
+        if (spec.sub2 === undefined) {
+          parent[spec.key] = newValue
+        } else {
+          const child = { ...((parent[spec.sub2] as Record<string, unknown>) ?? {}) }
+          child[spec.key] = newValue
+          parent[spec.sub2] = child
+        }
         setOk = await scope.set(spec.sub, parent)
       }
     } catch (e) {
@@ -522,15 +585,9 @@ export function MemorySettingsSection(props: { scope: any }): any {
     console.info('[meow-memory] settings write', spec.key, {
       mode: snap.mode,
       setReturned: setOk,
-      userNow: (scope.getSnapshot().user as Record<string, unknown> | undefined)?.[spec.sub === undefined ? spec.key : `${String(spec.sub)}.${String(spec.key)}`],
+      userNow: fieldValue(scope.getSnapshot().user as Record<string, unknown> | undefined, spec),
     })
-    const landed = (): boolean => {
-      const v = scope.getSnapshot().user as Record<string, unknown> | undefined
-      const cur = spec.sub === undefined
-        ? v?.[spec.key]
-        : (v?.[spec.sub] as Record<string, unknown> | undefined)?.[spec.key]
-      return jsonEqual(cur, newValue)
-    }
+    const landed = (): boolean => jsonEqual(fieldValue(scope.getSnapshot().user as Record<string, unknown> | undefined, spec), newValue)
     if (landed()) {
       flashSaved()
       return true
@@ -573,7 +630,14 @@ export function MemorySettingsSection(props: { scope: any }): any {
           // 「恢复未设置」= set 回去掉该字段的 user 层父对象；父对象空了才 unset 父键。
           const user = scope.getSnapshot().user as Record<string, unknown> | undefined
           const parent = { ...((user?.[spec.sub] as Record<string, unknown>) ?? {}) }
-          delete parent[spec.key]
+          if (spec.sub2 === undefined) {
+            delete parent[spec.key]
+          } else {
+            const child = { ...((parent[spec.sub2] as Record<string, unknown>) ?? {}) }
+            delete child[spec.key]
+            if (Object.keys(child).length === 0) delete parent[spec.sub2]
+            else parent[spec.sub2] = child
+          }
           if (Object.keys(parent).length === 0) await scope.unset(spec.sub)
           else await scope.set(spec.sub, parent)
         }
@@ -585,17 +649,20 @@ export function MemorySettingsSection(props: { scope: any }): any {
         } else {
           const user = scope.getSnapshot().user as Record<string, unknown> | undefined
           const parent = { ...((user?.[spec.sub] as Record<string, unknown>) ?? {}) }
-          parent[spec.key] = value
+          if (spec.sub2 === undefined) {
+            parent[spec.key] = value
+          } else {
+            const child = { ...((parent[spec.sub2] as Record<string, unknown>) ?? {}) }
+            child[spec.key] = value
+            parent[spec.sub2] = child
+          }
           await scope.set(spec.sub, parent)
         }
       }
       const landed = (): boolean => {
         const user = scope.getSnapshot().user as Record<string, unknown> | undefined
         if (def === undefined) {
-          const cur = spec.sub === undefined
-            ? user?.[spec.key]
-            : (user?.[spec.sub] as Record<string, unknown> | undefined)?.[spec.key]
-          return cur === undefined
+          return fieldValue(user, spec) === undefined
         }
         return jsonEqual(fieldValue(user, spec), def)
       }

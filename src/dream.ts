@@ -34,9 +34,10 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
+import { existsSync } from 'node:fs'
 import { appendFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { getDb, projectList, storeTrustOf, type Level, type MemoryRow } from './db.js'
+import { getDb, getGlobalDb, memoryDbPath, projectList, storeTrustOf, type Level, type MemoryRow } from './db.js'
 import { activeHomeDir } from './home-dir.js'
 import { fillTemplate, keyedValue, resolveSlotText } from './prompt-loader.js'
 import { readSeen, readWritten } from './inject.js'
@@ -1398,6 +1399,10 @@ async function runIsolatedDream(
     if (childId !== undefined) {
       try {
         adopted = db.adoptSessionEntries(childId, sessionId)
+        // 0.37（review A2）：子会话写进**用户级全局库**的条目也归到父窗口，避免
+        // "孤儿 attribution 但仍全局生效"的不一致。
+        const g = getGlobalDb()
+        if (g !== undefined) adopted += g.adoptSessionEntries(childId, sessionId)
       } catch (e) {
         dreamLog(`isolated-dream adopt-failed child=${shortSessionId(childId)} err=${e instanceof Error ? e.message : String(e)}`)
       }
@@ -1440,7 +1445,12 @@ async function runIsolatedDream(
         const registry = (ctx as { get?: (name: string) => unknown }).get?.('workspaceRegistry') as
           | { archiveSession?: (id: string) => unknown }
           | undefined
-        registry?.archiveSession?.(childId)
+        // 0.37（review）：archiveSession 返回 promise；fire-and-forget 必须接住 rejection，
+        // 否则会在宿主里冒未处理拒绝（归档失败本来就不该阻塞收尾）。
+        const archived = registry?.archiveSession?.(childId)
+        if (archived !== undefined && archived !== null && typeof (archived as { then?: unknown }).then === 'function') {
+          void (archived as Promise<unknown>).catch(() => {})
+        }
       } catch {
         /* 归档失败不阻塞 */
       }
@@ -1924,8 +1934,11 @@ export function dreamSweepTick(ctx: Context, cfg: DreamConfig | (() => DreamConf
     // 与 claimDream（start 幂等）+ recoverInterruptedDream（中断自愈）闭环。
     // 工作区按字典序取首个：windowIndex 是插入序 Map，两实例插入序不同时会各自
     // 抢不同库的门 → 门失效（2026-09-10 复核）；排序后只要有公共工作区，必然
-    // 选中同一块库的同一条门记录。零交集的多实例本来无共享状态，无需共门。
-    const gateWorkspaces = [...new Set(windowIndex.values())].sort()
+    // 选中同一块库的同一条门记录。零交集的多实例本来无共享状态。
+    // 0.37：门只对**已存在且受信**的库取——未受信/陌生库连门记录都不该写。
+    const gateWorkspaces = [...new Set(windowIndex.values())]
+      .filter((w) => typeof w === 'string' && w.length > 0 && existsSync(memoryDbPath(w, dir)) && storeTrustOf(w, dir)?.trusted === true)
+      .sort()
     if (gateWorkspaces.length === 0 || !getDb(gateWorkspaces[0], dir).claimCheckGate(60_000)) return
     dreamSweepOnce(ctx, c, dir, windowIndex, onDreamState, workspaceDisabled)
   } catch (error: unknown) {
