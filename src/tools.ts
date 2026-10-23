@@ -39,6 +39,27 @@ export function setMemoryToolGate(gate: MemoryToolGate | undefined): void {
   toolGate = gate
 }
 
+/** 检索参数（0.32，apply 期注入；memory_search 与命中链路同一口径）。 */
+export interface MemoryRetrievalOptions {
+  halfLifeDays: number
+  hitBoost: boolean
+  importanceWeight: boolean
+}
+let retrievalOptions: MemoryRetrievalOptions = { halfLifeDays: 30, hitBoost: true, importanceWeight: true }
+export function setMemoryRetrievalOptions(opts: MemoryRetrievalOptions | undefined): void {
+  if (opts !== undefined) retrievalOptions = opts
+}
+
+/** 输出预算（0.32）：项目全景正文上限（memory_project 输出、dream 第 3 轮同源），
+ *  防止大项目把 100+ 条记忆一次塞进上下文。apply 期由 index.ts 注入。 */
+export interface MemoryBudgetOptions {
+  projectMaxChars: number
+}
+let budgetOptions: MemoryBudgetOptions = { projectMaxChars: 8000 }
+export function setMemoryBudgetOptions(opts: MemoryBudgetOptions | undefined): void {
+  if (opts !== undefined) budgetOptions = opts
+}
+
 /** 门控检查：拒绝时抛出带理由的 Error（工具错误的既有通道）。 */
 function refuseOrThrow(kind: 'read' | 'write', exec: ToolRunContext): void {
   if (toolGate === undefined) return
@@ -332,10 +353,10 @@ function rememberTool(dir: string): ToolDefinition {
         ...(row.project ? { project: row.project } : {}),
       }
     },
-    presentCall(args: unknown): { card: 'generic'; title: string; kind: 'write' } {
+    presentCall(args: unknown): { card: 'generic'; title: string; kind: 'edit' } {
       const parsed = args as { content?: unknown }
       const preview = typeof parsed.content === 'string' ? parsed.content.slice(0, 40) : ''
-      return { card: 'generic', title: `memory_remember: ${preview}`, kind: 'write' }
+      return { card: 'generic', title: `memory_remember: ${preview}`, kind: 'edit' }
     },
   }
 }
@@ -463,13 +484,14 @@ function searchTool(dir: string): ToolDefinition {
         content: r.content,
         keywords: r.keywords,
         importance: r.importance,
+        hit_count: r.hit_count,
         created_at: r.created_at,
         updated_at: r.updated_at,
       }))
       // 全量排名（分高到低）后分段选取（用户拍板 2026-08-19）：
       //   前 5 条无脑取（不排除任何记忆，含已见/本 session 建立的）；
       //   第 6 名起逐个往下，绕开已见（injected+searched）的记忆补足，保证新信息。
-      const ranked = search(query, docs, { k: docs.length, explain })
+      const ranked = search(query, docs, { k: docs.length, explain, halfLifeDays: retrievalOptions.halfLifeDays, hitBoost: retrievalOptions.hitBoost, importanceWeight: retrievalOptions.importanceWeight })
       const blindCount = Math.min(5, k)
       const blind = ranked.slice(0, blindCount)
       const fresh: RankedHit[] = []
@@ -771,9 +793,9 @@ function updateTool(dir: string): ToolDefinition {
       if (ok && Object.keys(patch).length > 0) markWritten(workspace, sessionId ?? 'unknown', [found.row.id], dir)
       return { ok, id: found.row.id, level: found.level }
     },
-    presentCall(args: unknown): { card: 'generic'; title: string; kind: 'write' } {
+    presentCall(args: unknown): { card: 'generic'; title: string; kind: 'edit' } {
       const parsed = args as { id?: unknown; status?: unknown }
-      return { card: 'generic', title: `memory_update: ${String(parsed.id ?? '').slice(0, 8)}${parsed.status ? ` → ${String(parsed.status)}` : ''}`, kind: 'write' }
+      return { card: 'generic', title: `memory_update: ${String(parsed.id ?? '').slice(0, 8)}${parsed.status ? ` → ${String(parsed.status)}` : ''}`, kind: 'edit' }
     },
   }
 }
@@ -831,7 +853,11 @@ function projectTool(dir: string): ToolDefinition {
       if (text === null) {
         return { project, text: L('project.empty', { name: project }) }
       }
-      return { project, text }
+      // 0.32：项目全景输出上限（memory_project 工具与 dream 第 3 轮同源）。
+      const capped = text.length > budgetOptions.projectMaxChars
+        ? `${text.slice(0, budgetOptions.projectMaxChars)}…`
+        : text
+      return { project, text: capped }
     },
     presentCall(args: unknown): { card: 'generic'; title: string; kind: 'read' } {
       const parsed = args as { project?: unknown }
@@ -840,10 +866,23 @@ function projectTool(dir: string): ToolDefinition {
   }
 }
 
-/** 全局数据目录查看/切换（用户拍板 2026-09-25）：对用户=说一句话即可换目录，
- *  零代码零重启——不依赖 dsh 0.1.7 设置页写入链（其真机写入被拒、拒因静默）。
- *  切换=插件内部 switchHomeDir（同盘移动/跨盘复制+旧目录绝不自动删+失败留原地）。 */
-function homeTool(): ToolDefinition {
+/** 工具文案软取（0.32 新增工具用）：语言包还没补键时回退到内置文案，绝不让
+ *  工具注册期 throw（旧语言包/实例覆盖层缺键不再拖垮整个工具面）。 */
+const Tsoft = (key: string, fallback: string): string => {
+  try {
+    return T(key)
+  } catch {
+    return fallback
+  }
+}
+
+/**
+ * 全局数据目录查看/切换。
+ * 0.32 安全闸（#64-2）：默认**只读**——模型可直调的工具不允许搬全局目录（那同时是
+ * prompt 覆盖层根，搬走 = 可改写注入文案并固化）。需要切换时在 profile 配置里显式
+ * 打开 `security.allowHomeSwitch: true`，或由用户手工改配置；默认拒绝并给指示。
+ */
+function homeTool(allowHomeSwitch: () => boolean): ToolDefinition {
   return {
     name: 'memory_home',
     description: T('memory_home.description'),
@@ -870,14 +909,19 @@ function homeTool(): ToolDefinition {
       const parsed = args as { target?: unknown }
       const presets = homeDirPresets()
       const raw = typeof parsed.target === 'string' ? parsed.target.trim() : ''
+      const switching = allowHomeSwitch()
       if (raw === '') {
         return { note: [
           `当前全局数据目录：${activeHomeDir()}`,
+          `切换能力：${switching ? '已启用（security.allowHomeSwitch=true）' : '已禁用（默认；需要时在 profile 配置 security.allowHomeSwitch: true，改后重载插件）'}`,
           `预设 default（系统用户主目录）：${presets.default}`,
           `预设 dsh-storage（DSH 根目录 Storage）：${presets['dsh-storage']}`,
           `预设 plugin-root（插件本体根目录）：${presets['plugin-root']}`,
-          `不修改则不传 target；要切换请传预设标记或绝对路径。`,
+          switching ? '要切换请传预设标记或绝对路径。' : '本工具默认只读；目录切换必须由用户显式开启配置。',
         ].join('\n') }
+      }
+      if (!switching) {
+        return { note: `拒绝切换：memory_home 默认只读（安全原因，防止模型接管 prompt 覆盖层/搬走全局目录）。当前目录未变：${activeHomeDir()}。如需切换，请用户在 profile 配置里设置 security.allowHomeSwitch: true 并重载插件。` }
       }
       const LEGAL = ['default', 'dsh-storage', 'plugin-root']
       const target = resolveHomeDir(raw)
@@ -893,10 +937,180 @@ function homeTool(): ToolDefinition {
       if (sw.mode === 'rename') return { note: `已切换为 ${sw.to}：自 ${sw.from} 移动 ${sw.files} 项完成（同盘移动）。如本机有多个 dsh 实例共享旧目录，请同步修改它们的设置。` }
       return { note: `已切换为 ${sw.to}：自 ${sw.from} 复制 ${sw.files} 项（跨盘复制为快照）。旧目录 ${sw.from} 保留未删，确认无误后可手动删除；若多个 dsh 实例共享旧目录，请同步修改其他实例的设置。` }
     },
+    presentCall(): { card: 'generic'; title: string; kind: 'read' } {
+      return { card: 'generic', title: 'memory_home', kind: 'read' }
+    },
   }
 }
 
-export function registerMemoryTools(register: (t: ToolDefinition) => void, dir = '.dsh-meow'): void {
+/** 记忆管理视图（#76）：分页列出元数据（不含正文），先看清再决定 update/forget。 */
+function listTool(dir: string): ToolDefinition {
+  return {
+    name: 'memory_list',
+    description: Tsoft('memory_list.description', '分页列出记忆条目元数据（id/层级/标题/关键词/重要性/状态/项目/更新时间），用于管理记忆；不含正文，正文用 memory_read。'),
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        level: { type: 'string', description: Tsoft('memory_list.param.level', '层级，逗号多选：soul/user/project/fact/lesson/topic/rules；缺省 all') },
+        project: { type: 'string', description: Tsoft('memory_list.param.project', '按项目名过滤（逗号多选，OR 语义）') },
+        status: { type: 'string', enum: ['active', 'stale', 'archived', 'all'], description: Tsoft('memory_list.param.status', '状态过滤，默认 active') },
+        limit: { type: 'integer', minimum: 1, maximum: 100, description: Tsoft('memory_list.param.limit', '本页条数，默认 20') },
+        offset: { type: 'integer', minimum: 0, description: Tsoft('memory_list.param.offset', '偏移量，默认 0') },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['total', 'items'],
+        properties: {
+          note: { type: 'string' },
+          total: { type: 'number' },
+          items: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                id: { type: 'string' },
+                level: { type: 'string' },
+                title: { type: 'string' },
+                keywords: { type: 'array', items: { type: 'string' } },
+                importance: { type: 'number' },
+                status: { type: 'string' },
+                project: { type: 'string' },
+                updated_at: { type: 'number' },
+              },
+            },
+          },
+        },
+      },
+      render: (_args, value) => {
+        const v = value as { total?: number; items?: Array<Record<string, unknown>>; note?: string }
+        const items = Array.isArray(v.items) ? v.items : []
+        const lines = [`共 ${String(v.total ?? items.length)} 条${v.note ? `（${v.note}）` : ''}：`]
+        for (const it of items) {
+          const kw = Array.isArray(it.keywords) ? (it.keywords as unknown[]).slice(0, 5).join('/') : ''
+          lines.push(`${String(it.id ?? '')} [${String(it.level ?? '')}] ${String(it.title ?? '')} · ${String(it.status ?? '')}${it.project ? ` · ${String(it.project)}` : ''}${kw ? ` · ${kw}` : ''}`)
+        }
+        return [{ type: 'text' as const, text: lines.join('\n') }]
+      },
+    },
+    async execute(args: unknown, exec: ToolRunContext) {
+      refuseOrThrow('read', exec)
+      const parsed = args as { level?: unknown; project?: unknown; status?: unknown; limit?: unknown; offset?: unknown }
+      const workspace = workspaceOf(exec)
+      if (!workspace) throw new Error('memory_list: 无法确定工作区（会话无 cwd）')
+      const db = getDb(workspace, dir)
+      const parseCsv = (v: unknown): string[] => (typeof v === 'string' ? v.split(',').map((s) => s.trim()).filter(Boolean) : [])
+      const levelArg = parseCsv(parsed.level)
+      const levels: Level[] = levelArg.length === 0 || levelArg.includes('all')
+        ? [...LEVELS]
+        : (LEVELS.filter((l) => levelArg.includes(l)) as Level[])
+      const statusArg = typeof parsed.status === 'string' && ['active', 'stale', 'archived', 'all'].includes(parsed.status) ? parsed.status : 'active'
+      const projectArg = parseCsv(parsed.project)
+      const limitRaw = typeof parsed.limit === 'number' ? parsed.limit : Number(parsed.limit)
+      const limit = Number.isFinite(limitRaw) ? Math.min(100, Math.max(1, Math.trunc(limitRaw))) : 20
+      const offsetRaw = typeof parsed.offset === 'number' ? parsed.offset : Number(parsed.offset)
+      const offset = Number.isFinite(offsetRaw) ? Math.max(0, Math.trunc(offsetRaw)) : 0
+      const rows = levels.flatMap((lv) => db.list(lv, statusArg === 'all' ? {} : { status: statusArg as 'active' | 'archived' | 'stale' }))
+        .filter((r) => projectArg.length === 0 || projectArg.some((p) => projectCovers(r.project, p)))
+        .sort((a, b) => b.updated_at - a.updated_at)
+      const page = rows.slice(offset, offset + limit)
+      return {
+        total: rows.length,
+        items: page.map((r) => ({
+          id: r.id,
+          level: r.level,
+          title: r.title ?? '',
+          keywords: r.keywords,
+          importance: r.importance,
+          status: r.status,
+          project: r.project ?? '',
+          updated_at: r.updated_at,
+        })),
+      }
+    },
+    presentCall(): { card: 'generic'; title: string; kind: 'read' } {
+      return { card: 'generic', title: 'memory_list', kind: 'read' }
+    },
+  }
+}
+
+/** 记忆管理动作（#76）：归档/恢复/硬删一条。默认归档（可逆）；硬删要 confirm:true。 */
+function forgetTool(dir: string): ToolDefinition {
+  return {
+    name: 'memory_forget',
+    description: Tsoft('memory_forget.description', '管理单条记忆：mode=archive（默认，归档，可 restore 恢复）/restore（取消归档）/delete（硬删除，不可恢复，必须 confirm:true）。按 id 操作，先用 memory_list/memory_search 找 id。'),
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['id'],
+      properties: {
+        id: { type: 'string', description: Tsoft('memory_forget.param.id', '记忆 id（完整 id 或唯一短 id）') },
+        mode: { type: 'string', enum: ['archive', 'restore', 'delete'], description: Tsoft('memory_forget.param.mode', 'archive=归档（默认）/restore=恢复/delete=硬删除') },
+        confirm: { type: 'boolean', description: Tsoft('memory_forget.param.confirm', '仅 mode=delete 时需要 true，确认不可恢复') },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['note'],
+        properties: {
+          id: { type: 'string' },
+          note: { type: 'string' },
+        },
+      },
+      render: (_args, value) => {
+        const v = value as { note?: string }
+        return [{ type: 'text' as const, text: String(v.note ?? '') }]
+      },
+    },
+    async execute(args: unknown, exec: ToolRunContext) {
+      refuseOrThrow('write', exec)
+      const parsed = args as { id?: unknown; mode?: unknown; confirm?: unknown }
+      const id = typeof parsed.id === 'string' ? parsed.id.trim() : ''
+      if (!id) throw new Error('memory_forget: id 不能为空')
+      const mode = parsed.mode === 'restore' || parsed.mode === 'delete' ? parsed.mode : 'archive'
+      if (mode === 'delete') {
+        const confirmed = parsed.confirm === true || parsed.confirm === 'true'
+        if (!confirmed) throw new Error('memory_forget: 硬删除不可恢复，必须显式传 confirm: true；只想暂时隐藏请用 mode=archive')
+      }
+      const workspace = workspaceOf(exec)
+      if (!workspace) throw new Error('memory_forget: 无法确定工作区（会话无 cwd）')
+      const db = getDb(workspace, dir)
+      const matches = db.findByIdAll(id)
+      if (matches.length === 0) return { note: `未找到 id=${id} 的记忆。`, id }
+      if (matches.length > 1) {
+        throw new Error(`memory_forget: id "${id}" 命中 ${matches.length} 条（短 id 歧义），请改用完整 id：${matches.map((m) => m.row.id).join(', ')}`)
+      }
+      const { row, level } = matches[0]
+      if (mode === 'delete') {
+        const ok = db.deleteRow(level, row.id)
+        return { note: ok ? `已硬删除记忆 ${row.id}（不可恢复）。` : `删除失败：未找到 id=${row.id}。`, id: row.id }
+      }
+      const ok = db.update(level, row.id, { status: mode === 'restore' ? 'active' : 'archived' })
+      return {
+        note: ok
+          ? (mode === 'restore' ? `已恢复记忆 ${row.id} 为 active。` : `已归档记忆 ${row.id}（可用 memory_forget mode=restore 恢复）。`)
+          : `操作失败：未找到 id=${row.id}。`,
+        id: row.id,
+      }
+    },
+    presentCall(args: unknown): { card: 'generic'; title: string; kind: 'edit' } {
+      const parsed = args as { id?: unknown; mode?: unknown }
+      return { card: 'generic', title: `memory_forget: ${String(parsed.id ?? '').slice(0, 10)}${parsed.mode ? ` → ${String(parsed.mode)}` : ''}`, kind: 'edit' }
+    },
+  }
+}
+
+export function registerMemoryTools(
+  register: (t: ToolDefinition) => void,
+  dir = '.dsh-meow',
+  opts: { allowHomeSwitch?: () => boolean } = {},
+): void {
   // 门控判定器经 setMemoryToolGate 注入（apply 期设置；工具工厂签名保持不变）。
   register(rememberTool(dir))
   register(searchTool(dir))
@@ -904,5 +1118,7 @@ export function registerMemoryTools(register: (t: ToolDefinition) => void, dir =
   register(readTool(dir))
   register(updateTool(dir))
   register(projectTool(dir))
-  register(homeTool())
+  register(listTool(dir))
+  register(forgetTool(dir))
+  register(homeTool(opts.allowHomeSwitch ?? (() => false)))
 }

@@ -11,8 +11,8 @@
 - memory_remember.param.goal: The topic's goal sentence (recommended when level=topic, e.g. "get the femGen integration working").
 - memory_remember.param.importance: Importance (any number, no upper bound; soft guide 1-4: 4=fatal red line / health and safety, 3=stressed by the user / globally applicable, 2=a user decision or an abstract conclusion, 1=trivia).
 - memory_remember.param.corrected: Whether this is something the user corrected (for level=lesson).
-- memory_remember.param.keywords: Keywords you choose (the reflection/dream rounds ask for 8-13 content words; omit it and they are extracted automatically).
-- memory_remember.out.keywords: The keywords actually stored (auto-extracted; after a merge, the latest value).
+- memory_remember.param.keywords: Required. The 8-13 search keywords (a merge updates them to the latest value); omitting them raises an error — there is no automatic extraction fallback.
+- memory_remember.out.keywords: The keywords actually stored (after a merge, the latest value).
 - memory_remember.out.project: The project actually recorded (if any).
 
 ### memory_search
@@ -25,7 +25,7 @@
 - memory_search.param.days: Only entries created in the last N days (by creation time).
 - memory_search.param.k: Maximum number of results.
 - memory_search.param.content_max: Truncate each entry's content to this length, 0=full text.
-- memory_search.param.explain: Explainable-retrieval switch (default off). With true, each hit carries a per-component score breakdown in explain (bm25 keyword score, importance, recencyWeight Ebbinghaus weight, status) to debug "why wasn't this recalled / why was this recalled"; ordering is unchanged.
+- memory_search.param.explain: Explainable-retrieval switch (default off). With true, each hit carries a per-component score breakdown in explain (bm25 keyword score, importance, recencyWeight exponential half-life weight, status) to debug "why wasn't this recalled / why was this recalled"; ordering is unchanged.
 - memory_search.out.note: Conflict note.
 - memory_search.out.hits.id: Full memory id (pass it to memory_read/memory_update/memory_find_similar).
 - memory_search.out.hits.keywords: The entry's keywords (extracted by an LLM or automatically).
@@ -63,12 +63,40 @@
 - memory_project.param.project: Project name (the memory guide at the start of the session lists every project the user has — pick from it).
 - memory_project.out.text: The project's memory block, grouped by subcategory (plain text).
 
+### memory_list
+
+- memory_list.description: List memory-entry metadata (id / level / title / keywords / importance / status / project / memory timestamp), with no full text — a low-token view for taking stock and finding ids to hand to memory_read / memory_update / memory_forget. Lists only active entries by default; level / project / status accept comma-separated multi-select; limit / offset paginate. Use memory_read for the text and memory_project for the project panorama.
+- memory_list.param.level: Limit to levels, comma-separated: soul/user/project/fact/lesson/topic/rules; default all = every level.
+- memory_list.param.project: Filter by project name (comma-separated, OR); "global" / unmarked entries are naturally included.
+- memory_list.param.status: Status filter: active (default) / stale / archived / all.
+- memory_list.param.limit: Maximum entries returned (1-100, default 20).
+- memory_list.param.offset: Paging offset (starts at 0, default 0).
+- memory_list.out.note: The current filter and result-count hint.
+- memory_list.out.total: Total entries matching the filter (not limited by limit).
+- memory_list.out.items.id: Full memory id (can be passed to memory_read / memory_update / memory_forget).
+- memory_list.out.items.level: Memory level.
+- memory_list.out.items.title: Display title (truncated from the content).
+- memory_list.out.items.keywords: Keyword list.
+- memory_list.out.items.importance: Importance.
+- memory_list.out.items.status: Status (active / stale / archived).
+- memory_list.out.items.project: Project; "" = unmarked; global information is "global".
+- memory_list.out.items.updated_at: Memory timestamp (last update, milliseconds).
+
+### memory_forget
+
+- memory_forget.description: Handle one memory by id: default mode=archive archives it (recoverable); mode=restore un-archives it back to active; mode=delete permanently hard-deletes it (irreversible, requires confirm=true). Affects one entry only; for bulk cleanup call it several times or list ids with memory_list first. Prefer archiving; hard-delete only when the user explicitly asks to "delete it completely".
+- memory_forget.param.id: Memory id (full id or a 12-character short id).
+- memory_forget.param.mode: archive = archive (default, recoverable) / restore = un-archive / delete = hard delete (irreversible, needs confirm=true).
+- memory_forget.param.confirm: Required true when mode=delete, otherwise the call is refused; ignored for other modes.
+- memory_forget.out.note: Result hint (archived / restored / deleted).
+- memory_forget.out.id: The id of the entry that was handled.
+
 ### memory_dream
 
 - memory_dream.description: Schedule a memory consolidation (dream) for this window right now: everything this window created or pulled up is sent to the main agent round by round to be tidied and put away (round 1 = atomic memories, project/fact/lesson/rules/soul/user; round 2 = topic memories; round 3 = project summary, added only when this window actually touched a project). It triggers automatically after 3+ hours of window idle time (suppressed during peak hours, 09:00-12:00 and 14:00-18:00 Beijing time, plus the 15 minutes before each); this tool is the manual trigger.
 
 ### memory_home
 
-- memory_home.description: View or switch the meow-memory global data directory (where instance-level data such as logs and the dream window ledger lives; the memory store itself sits inside each project and is unaffected). Call without parameters to get the current directory and the real locations of the three presets; switching automatically moves the old directory contents over (same-disk move / cross-disk copy). After a cross-disk copy the old directory is kept, not deleted - remind the user to delete it manually once verified; if several dsh instances share one directory, remind the user to update them together. Call this when the user wants to move memory data or logs off the system drive or to another location. A switch persists across restarts via a pointer file at $DSH_HOME/storages/meow-memory-home.json.
-- memory_home.param.target: Target location. Either a preset marker: default = system user home (the default), dsh-storage = meow-memory folder under the DSH home's storages, plugin-root = storage folder next to the plugin itself; or an absolute path. Omit to view the current state without changing anything.
+- memory_home.description: View the meow-memory global data directory (where instance-level data such as logs, the dream window ledger and migrate state lives; the memory store itself sits inside each project and is unaffected; prompt overrides are NOT here — they resolve from the fixed `$DSH_HOME/storages/meow-memory/prompts/`). **Query-only by default**: with `security.allowHomeSwitch: false` this tool only reports the current directory, the three presets and whether switching is enabled; passing a target is refused with an explanation — that is the safety gate: moving the directory changes where instance data lives, so the model should not be able to move it. Switching is allowed only after the user explicitly sets `security.allowHomeSwitch: true` in the config. Switching automatically moves the old directory contents over (same-disk move / cross-disk copy). After a cross-disk copy the old directory is kept, not deleted - remind the user to delete it manually once verified; if several dsh instances share one directory, remind the user to update them together. Call this when the user wants to move memory data or logs off the system drive or to another location (first confirm the switch is enabled, otherwise explain that the config must change). A switch persists across restarts via a pointer file at $DSH_HOME/storages/meow-memory-home.json.
+- memory_home.param.target: Target location. Either a preset marker: default = system user home (the default), dsh-storage = meow-memory folder under the DSH home's storages, plugin-root = storage folder next to the plugin itself; or an absolute path. Omit to view the current state without changing anything; passing a target is refused while `security.allowHomeSwitch: false`.
 - memory_home.out.note: View/switch result: the current or new directory, how many files were moved, and what to do with the old directory.

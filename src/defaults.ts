@@ -27,10 +27,36 @@ export const CONFIG_DEFAULTS = {
   titleMax: 40,
   reflect: true,
   reflectTurns: 7,
-  autoMigrate: true,
+  /** 0.32 起默认关：工作区里来路不明的 PROJECT.md 不得零交互导入（安全审计 #64-1）。 */
+  autoMigrate: false,
   /** 全局目录选择：''=默认（平台用户主目录）；预设标记或绝对路径见 home-dir.ts。
    *  恢复默认写入 ''（而非删字段）=回落平台默认目录。 */
   homeDir: '',
+  /** 安全闸（0.32）：工作区已有、但非本插件创建的 memory.db 默认不信任（不注入其
+   *  soul/user/全局 rules）；memory_home 默认只读查询，不许模型搬目录。 */
+  security: {
+    trustWorkspaceMemory: false,
+    allowHomeSwitch: false,
+    autoGitignore: true,
+    debugLogs: false,
+  },
+  /** 注入/整理预算（0.32）：把「默认自动花 token」限制在可解释的上限里。 */
+  budget: {
+    snapshotMaxChars: 6000,
+    hitMaxChars: 1500,
+    reinjectMaxChars: 8000,
+    dreamMaxContextTokens: 40000,
+    dreamMaxPerWindowPerDay: 1,
+    reflectMaxPerDay: 6,
+    reflectMinIntervalMinutes: 20,
+  },
+  /** 检索/遗忘参数（0.32）：真指数半衰 + 命中反馈 + 查询覆盖率 + 最低分门槛。 */
+  retrieval: {
+    halfLifeDays: 30,
+    minScore: 0.35,
+    hitBoost: true,
+    importanceWeight: true,
+  },
   dream: {
     enabled: true,
     idleMinutes: 180,

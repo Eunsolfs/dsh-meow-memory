@@ -106,13 +106,17 @@ function legacyHostFence(req: unknown, trustedHosts: readonly string[]): boolean
  * - connection 存在但无 requestRejection（≤0.1.2）：回退旧版官方同款 Host
  *   fence，不过 → 403，过 → 放行。
  * - connection 整个缺失：保守拒绝（503）。
+ *
+ * 0.32：连接服务支持**按请求惰性读取**（传函数）。旧实现只在路由注册时取一次，
+ * 冷启动竞态下 connection 尚未注册 → 三条路由被永久钉在 503 直到插件重载。
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function authGate<R extends { writeHead: (...args: any[]) => void; end: (...args: any[]) => void }>(
-  connection: ConnectionAuthFace | undefined,
+  connectionOrGetter: ConnectionAuthFace | undefined | (() => ConnectionAuthFace | undefined),
   handler: (req: unknown, res: R) => void,
 ): (req: unknown, res: R) => void {
   return (req, res) => {
+    const connection = typeof connectionOrGetter === 'function' ? connectionOrGetter() : connectionOrGetter
     const reject = connection?.requestRejection
     if (typeof reject === 'function') {
       const rejection = reject.call(connection, req)

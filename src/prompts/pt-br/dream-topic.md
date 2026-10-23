@@ -8,7 +8,7 @@ Se você encontrar topics bagunçados — a causa de algo no topic A, o resultad
 
 # Como atualizar memórias topic
 1. Julgue pela informação mais recente: as coisas que esses topics descrevem evoluíram, há informação nova importante? Atualize-os. Você pode reescrever um topic para incorporar o novo progresso e cortar pontos antigos que você não considera mais importantes.
-2. Reveja a conversa: há um novo topic que valha a pena guardar? Se sim, crie-o. Se sua tarefa não rendeu nenhuma memória topic, isso muito provavelmente é um novo topic.
+2. Reveja a conversa: há um novo topic que valha a pena guardar? Crie-o apenas quando esta conversa realmente contiver um arco de acontecimentos rastreável (causa / progresso / desfecho). Se nenhuma memória topic foi recuperada e não há esse novo progresso na conversa, pule esta etapa — nunca adivinhe nem invente um topic só para criar um.
 3. Algum topic está disperso ou fora do trilho? Se um cobre várias coisas e você acha que deveria ser dividido, quebre o topic grande em sub-topics (crie novos).
 4. Vários topics estão na verdade descrevendo a mesma coisa e precisam ser mesclados? Mescle-os.
 5. Vários topics estão emaranhados, de modo que a separação limpa só sai da mesclagem das informações deles e de uma nova divisão? Reescreva-os.
@@ -17,6 +17,7 @@ Se você encontrar topics bagunçados — a causa de algo no topic A, o resultad
 8. Registre o project (um nome de projeto, ou global) e a importance.
 9. Para um topic que você considera muito importante, se estiver em dúvida sobre qual é a verdade, vá ler os arquivos do projeto e confira. Apenas para memórias que realmente importam.
 10. Importante: verifique nestes topics qualquer coisa desatualizada, derrubada, provada errada ou enganosa — arquive-a (status=archived) ou reescreva-a (prefira arquivar). Nunca deixe isso como active. E não infle a importance: progresso comum em um assunto é 1, no máximo 2; só algo sério merece 3.
-11. Quando terminar, responda "este grupo está consolidado" e não chame nenhuma outra ferramenta.
+11. Disciplina de arquivamento: antes de definir status=archived, você precisa nomear a evidência concreta (um fato verificado, uma conversa/verificação de arquivo provando que ficou inválido). Sem evidência, deixe como está ou verifique antes — nunca arquive só para "arrumar".
+12. Quando terminar, responda "este grupo está consolidado" e não chame nenhuma outra ferramenta.
 
 Você pode chamar várias ferramentas em um turno — por favor, conclua todas as chamadas de ferramenta desta tarefa em uma única resposta.

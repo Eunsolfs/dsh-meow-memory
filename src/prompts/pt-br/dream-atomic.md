@@ -14,15 +14,17 @@ Há aqui algo que você acha que deveria ser arrumado ou atualizado? Se sim, atu
 8. Alguma entrada está longa demais, carregando demais? -> Divida-a em várias, usando update para reescrever e remember para criar as novas.
 9. As palavras-chave estão precisas? -> Se estiverem, deixe o parâmetro keywords de fora; se você achar que estão erradas, corrija-as com o parâmetro keywords do memory_update — quando o prompt do usuário acerta as palavras-chave de uma entrada, essa entrada é trazida. Então pense ao contrário: "quais palavras no prompt de um usuário deveriam fazer esta memória aparecer?" Esse é o seu critério. Não use o nome do projeto como palavra-chave; use palavras específicas da entrada. Prefira entidades centrais, o centro semântico, nomes próprios. Forma dicionarizada simples — o tokenizador faz stemming das palavras em inglês, então um singular já casa com seu plural, e stopwords não recuperam nada. De 8 a 13 delas.
 10. Os rótulos de projeto estão certos? Algo está rotulado com um projeto quando na verdade é informação global? Então o rótulo de projeto deve sair. Algo claramente pertence a um projeto mas não carrega informação de projeto? Então adicione.
-11. Aprendizado sem reflexão é desperdício — generalize mais:
-- Este é um excelente momento para abstrair e consolidar. Há regras gerais que valha a pena destilar? Adicione-as como novas memórias.
-- Você agora pode entender algumas entradas melhor e mais profundamente do que quando as escreveu. Atualize-as.
+11. Acrescente apenas com evidência — nada de "generalizar por generalizar":
+- Só acrescente ou reescreva uma memória quando as entradas já presentes na lista acima, ou fatos verificáveis nesta janela, a sustentarem diretamente. Nunca invente regras gerais nem preencha detalhes que a lista não respalda.
+- Se você realmente acrescentar uma memória do tipo resumo, o content deve dizer em quais entradas/fatos existentes ela se baseia, e você deve rodar memory_find_similar antes para não criar uma afirmação que contradiga as entradas antigas.
+- Você pode entender melhor algumas entradas agora do que quando as escreveu — tais atualizações exigem a mesma evidência; suposições não valem.
 12. Olhe para o que é injetado no primeiro turno. Você ainda acha que tudo aquilo importa? Realmente precisa ser injetado no início de toda sessão? O que não precisar, você pode baixar de importance ou mover para outro level (fact, por exemplo).
 O primeiro turno injeta apenas: soul (a própria IA) / user (as preferências do usuário) / regras globais (importance>=2). Para colocar algo no primeiro turno: uma regra global -> mova para rules com importance>=2 (project "global"); algo sobre o usuário -> mova para user; algo sobre você -> mova para soul.
 13. memory_project mostra entradas de nível de projeto (todos concluídos, apenas os 5 mais recentes) mais regras específicas do projeto; as verificações acima também valem lá (todos concluídos vão para stale, entradas desatualizadas vão para archived, rótulos de projeto permanecem precisos).
 
 Observações:
 Importante: percorra uma por uma e arquive ou conserte as memórias desatualizadas ou que te induzem ao erro — prefira arquivar.
+Disciplina de arquivamento: antes de definir status=archived, você precisa nomear a evidência concreta (um fato verificado, uma conversa/verificação de arquivo provando que ficou inválido). Sem evidência, deixe como está ou verifique antes — nunca arquive só para "arrumar".
 Para uma memória que você considera muito importante, se estiver em dúvida sobre qual é a verdade, vá ler os arquivos do projeto e confira. Apenas para memórias que realmente importam.
 Quando terminar, responda "este grupo está consolidado" e não chame nenhuma outra ferramenta.
 

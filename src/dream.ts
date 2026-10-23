@@ -20,9 +20,12 @@
  *   09:00–12:00、14:00–18:00，API 峰谷电价峰时，及各自开始前 15 分钟）时不触发，
  *   等峰时结束后的下一个检查周期自然触发。进行中的 dream 不打断，只挡新启动；
  *   手动 memory_dream 不受峰时抑制。
- * - 串行：同一时刻只有一个进行中的 dream 任务；旧窗口（进程重启后无 live agent）
- *   会尝试从 session persistence 恢复 agent 再照常 dream（2026-09-01 用户拍板：
- *   符合条件就自动触发，不需要人碰窗口；恢复失败只记日志降级，绝不新建会话）。
+ * - 串行：同一时刻只有一个进行中的 dream 任务。
+ * - 0.32 硬化（修 #49 + 成本审计 R1/R2）：自动 dream **只在窗口有 live agent 时**触发，
+ *   绝不 resume 冷会话（旧 sessionController.resolveAgent / agents.resume 冷启动路径
+ *   已整体删除；挂着的旧窗口最多丢一次自动整理，绝不 cold-cache 烧三轮上下文）。
+ *   启动前另有三道成本闸（见「0.32 成本闸」）：会话上下文 token 估算 / 24h 窗口频次 /
+ *   超限后 24h 冷却。手动 /dream、memory_dream 是显式意愿，不受这三道闸限制。
  *
  * 冲突处理：memory_search 返回 top-k 后按 updated_at 重排 + 顶部提示；
  * agent 据"记忆时间戳"判断新旧（工具层乐观锁留待迭代）。
@@ -31,11 +34,10 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
-import { appendFileSync, existsSync, readdirSync, readFileSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { appendFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { getDb, projectList, type Level, type MemoryRow } from './db.js'
-import { decompressAllFrames } from './migrate-v0.js'
+import { getDb, projectList, storeTrustOf, type Level, type MemoryRow } from './db.js'
+import { activeHomeDir } from './home-dir.js'
 import { fillTemplate, keyedValue, resolveSlotText } from './prompt-loader.js'
 import { readSeen, readWritten } from './inject.js'
 import { workspaceOf } from './tools.js'
@@ -57,14 +59,302 @@ export function shortSessionId(sid: string): string {
   return (sid.startsWith('session-') ? sid.slice(8) : sid).slice(0, 8)
 }
 
-/** 同步文件日志：进程崩溃也不丢（崩溃点定位用）。 */
-function dreamLog(ws: string, dir: string, msg: string): void {
+/** 同步文件日志：进程崩溃也不丢（崩溃点定位用）。
+ *  0.32（成本/运维审计 R9/O3）：落点固定为全局目录 activeHomeDir()/dream-debug.log——
+ *  绝不写进用户工作区（不能往别人的 repo 里拉日志）；全局目录热切换后下一笔即落新目录。
+ *  日志失败静默（日志本身绝不阻塞 dream）。 */
+function dreamLog(msg: string): void {
   try {
-    appendFileSync(join(ws, dir, 'dream-debug.log'), `[${new Date().toISOString()}] ${msg}\n`)
+    appendFileSync(join(activeHomeDir(), 'dream-debug.log'), `[${new Date().toISOString()}] ${msg}\n`)
   } catch {
     /* 日志失败不阻塞 */
   }
 }
+
+/** 当前 dream-debug.log 落点（诊断/测试用；与 dreamLog 同口径，动态读全局目录）。 */
+export function dreamLogPath(): string {
+  return join(activeHomeDir(), 'dream-debug.log')
+}
+
+// ── 0.32 成本闸（修 #49；审计 cost R1/R2 / stability）─────────────────────────
+//
+// 审计结论（findings-risk §4）：dream 是「默认自动花 token」且无预算——一次 dream
+// 最多 3 轮全上下文请求，冷启动 resume 的窗口更是 cold-cache 三轮。0.32 的闸全部
+// 只挡**自动**触发（手动 /dream、memory_dream = 显式意愿，放行）：
+// ① 无 live agent 不 dream，且绝不 resume（旧冷启动路径已删除）；
+// ② 会话上下文估算超过 budget.dreamMaxContextTokens → 跳过，并把跳过原因落
+//    dream_meta（dreamskip:<sid>，跨进程/重启有效），24h 冷却期内不再重试；
+// ③ 同一窗口 24h 内自动 dream 次数 ≤ budget.dreamMaxPerWindowPerDay（默认 1，0=关闭），
+//    计数同样落 dream_meta（dreamauto:<sid>）。
+
+/** 预算字段（Lead 在 resolved.dream.budget 下传入；全部可选，缺省按 0.32 出厂默认）。
+ *  只消费配置，不在这里定义配置——默认值来源仍是 defaults.ts / config schema。 */
+export interface DreamBudget {
+  dreamMaxContextTokens?: number
+  dreamMaxPerWindowPerDay?: number
+  reflectMaxPerDay?: number
+  reflectMinIntervalMinutes?: number
+}
+
+export const DREAM_DEFAULT_MAX_CONTEXT_TOKENS = 40_000
+export const DREAM_DEFAULT_MAX_PER_WINDOW_PER_DAY = 1
+/** 上下文超限后的冷却期：同一窗口 24h 内不反复估算/重试（#49）。 */
+export const DREAM_CONTEXT_SKIP_COOLDOWN_MS = 24 * 3600_000
+/** 自动 dream 频次统计窗口（每窗口每 24h）。 */
+export const AUTO_DREAM_WINDOW_MS = 24 * 3600_000
+
+const DREAM_SKIP_META_PREFIX = 'dreamskip:'
+const DREAM_AUTO_META_PREFIX = 'dreamauto:'
+
+/** 非负有限数才算有效预算值（配置缺省/被写成垃圾时回默认，绝不让 NaN 放行）。 */
+function budgetNumber(v: unknown): number | undefined {
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined
+}
+
+/** budget.dreamMaxContextTokens（默认 40000）。 */
+export function dreamMaxContextTokens(cfg: DreamConfig | undefined): number {
+  const v = budgetNumber(cfg?.budget?.dreamMaxContextTokens)
+  return v !== undefined && v > 0 ? v : DREAM_DEFAULT_MAX_CONTEXT_TOKENS
+}
+
+/** budget.dreamMaxPerWindowPerDay（默认 1；0 = 关闭自动 dream）。 */
+export function dreamMaxPerWindowPerDay(cfg: DreamConfig | undefined): number {
+  return budgetNumber(cfg?.budget?.dreamMaxPerWindowPerDay) ?? DREAM_DEFAULT_MAX_PER_WINDOW_PER_DAY
+}
+
+/** 上下文估算的字符/token 比（审计口径：≈3.5 字符 = 1 token）。 */
+export const CONTEXT_CHARS_PER_TOKEN = 3.5
+
+/** 抽样上限：事件很多时只抽这么多条按比例放大（超大会话不 stringify 整个 log）。 */
+const CONTEXT_SAMPLE_MAX_EVENTS = 1000
+
+export interface ContextEstimate {
+  /** 估算 token（字符数 / 3.5，向上取整）。 */
+  tokens: number
+  /** 估算字符数（抽样时已按事件数放大）。 */
+  chars: number
+  /** 是否走了抽样（事件数 > 上限）。 */
+  sampled: boolean
+  totalEvents: number
+}
+
+/**
+ * 估算会话上下文 token 数（CJK 感知）：CJK 字符按 ≈1.7 字/token、其余按 ≈4 字/token。
+ * 0.32 review：旧的 chars/3.5 对中文会话低估近 2 倍（40k 闸实际≈70–90k token），
+ * 这里按字符类别分开算，宁可估高一点（成本闸是保护，不是精确计费）。
+ * 只读宿主内存里**已有**的 session 事件（绝不读盘、绝不 resume）；事件数超过上限时
+ * 等距抽样再按条数放大——数量级够用，且不会在 15min 扫描链上卡住主线程。
+ * 单条事件不可序列化（循环引用等）时跳过该条，绝不让估算把扫描带崩。
+ */
+export function estimateContextTokens(events: readonly unknown[], maxEvents = CONTEXT_SAMPLE_MAX_EVENTS): ContextEstimate {
+  const total = events.length
+  if (total === 0) return { tokens: 0, chars: 0, sampled: false, totalEvents: 0 }
+  const cap = Math.max(1, Math.floor(maxEvents))
+  const count = Math.min(total, cap)
+  let chars = 0
+  let cjkChars = 0
+  for (let i = 0; i < count; i++) {
+    // 等距取样（含首尾）：count===1 时固定取第 0 条
+    const idx = count === 1 ? 0 : Math.round((i * (total - 1)) / (count - 1))
+    const data = (events[idx] as { data?: unknown } | null | undefined)?.data
+    if (data === undefined) continue
+    try {
+      const text = JSON.stringify(data) ?? ''
+      chars += text.length
+      // CJK（含中文/日文假名/韩文）：1.7 字/token；其余（ASCII/标点）≈4 字/token。
+      cjkChars += (text.match(/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/g) ?? []).length
+    } catch {
+      /* 不可序列化的事件：跳过 */
+    }
+  }
+  const scale = count < total ? total / count : 1
+  chars = Math.round(chars * scale)
+  cjkChars = Math.round(cjkChars * scale)
+  const nonCjk = Math.max(0, chars - cjkChars)
+  const tokens = Math.ceil(cjkChars / 1.7 + nonCjk / 4)
+  return { tokens, chars, sampled: count < total, totalEvents: total }
+}
+
+/** 读 agent.session 的事件（与 index.ts sessionEventsOf 同口径：ownEvents() 优先，
+ *  旧宿主 events 属性兜底；任何异常都当空——估算跑在定时扫描链上，绝不能抛）。 */
+function agentSessionEvents(agent: unknown): readonly unknown[] {
+  const session = (agent as { session?: { events?: unknown; ownEvents?: unknown } } | undefined)?.session
+  if (session === undefined || session === null) return []
+  try {
+    const own = session.ownEvents
+    if (typeof own === 'function') {
+      const evs = (own as () => unknown).call(session)
+      return Array.isArray(evs) ? evs : []
+    }
+  } catch {
+    return []
+  }
+  return Array.isArray(session.events) ? (session.events as readonly unknown[]) : []
+}
+
+interface AutoDreamSkipState {
+  at: number
+  kind: 'context-oversize'
+  tokens: number
+  limit: number
+}
+
+/** 读上下文超限的跳过记录（dream_meta dreamskip:<sid>；缺失/损坏 → undefined）。 */
+export function readAutoDreamSkip(db: ReturnType<typeof getDb>, sessionId: string): AutoDreamSkipState | undefined {
+  let raw: string | undefined
+  try {
+    raw = db.getDreamMeta(DREAM_SKIP_META_PREFIX + sessionId)
+  } catch {
+    return undefined
+  }
+  if (raw === undefined) return undefined
+  try {
+    const v = JSON.parse(raw) as Partial<AutoDreamSkipState>
+    if (typeof v.at !== 'number' || !Number.isFinite(v.at)) return undefined
+    return {
+      at: v.at,
+      kind: 'context-oversize',
+      tokens: typeof v.tokens === 'number' ? v.tokens : 0,
+      limit: typeof v.limit === 'number' ? v.limit : 0,
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/** 清掉上下文超限冷却（手动 dream 启动成功后调用：显式整理过一次，旧记录作废）。 */
+export function clearAutoDreamSkip(db: ReturnType<typeof getDb>, sessionId: string): void {
+  try {
+    db.delDreamMeta(DREAM_SKIP_META_PREFIX + sessionId)
+  } catch {
+    /* 清理失败不阻塞 */
+  }
+}
+
+/** 最近 24h 内该窗口的自动 dream 启动时间戳（旧记录顺手裁掉；跨进程/重启共享）。 */
+export function autoDreamStartsInWindow(db: ReturnType<typeof getDb>, sessionId: string, now = Date.now()): number[] {
+  let raw: string | undefined
+  try {
+    raw = db.getDreamMeta(DREAM_AUTO_META_PREFIX + sessionId)
+  } catch {
+    return []
+  }
+  if (raw === undefined) return []
+  try {
+    const parsed = JSON.parse(raw) as { starts?: unknown }
+    if (!Array.isArray(parsed.starts)) return []
+    return parsed.starts
+      .filter((t): t is number => typeof t === 'number' && Number.isFinite(t) && now - t < AUTO_DREAM_WINDOW_MS)
+      .sort((a, b) => a - b)
+  } catch {
+    return []
+  }
+}
+
+/** 记一次自动 dream 启动（dream_meta dreamauto:<sid> → {starts: [...]}）。 */
+export function recordAutoDreamStart(db: ReturnType<typeof getDb>, sessionId: string, now = Date.now()): void {
+  const starts = [...autoDreamStartsInWindow(db, sessionId, now), now]
+  try {
+    db.setDreamMeta(DREAM_AUTO_META_PREFIX + sessionId, JSON.stringify({ starts }))
+  } catch {
+    /* 计数失败不阻塞：最坏退化成本轮不计数 */
+  }
+}
+
+/** 自动 dream 跳过原因（进程内日志去重用）。 */
+export type AutoDreamSkipReason = 'cooldown' | 'cap' | 'context-oversize'
+
+export interface AutoDreamGate {
+  allowed: boolean
+  reason?: AutoDreamSkipReason
+  /** 估算值/上限（跳过时写日志用）。 */
+  tokens?: number
+  limit?: number
+}
+
+/**
+ * 自动 dream 成本闸（只挡自动触发；手动 /dream、memory_dream 不经过这里）：
+ * ① 24h 上下文超限冷却（dream_meta dreamskip:<sid>）；
+ * ② 频次上限：24h 内自动启动次数 ≥ budget.dreamMaxPerWindowPerDay（默认 1，0=关闭）；
+ * ③ 本次会话上下文估算 > budget.dreamMaxContextTokens（默认 40000）→ 记 24h 冷却并拒绝。
+ * 估算只读内存里已有的事件；没有任何 resume / 读盘动作。
+ */
+export function evaluateAutoDreamGate(
+  db: ReturnType<typeof getDb>,
+  sessionId: string,
+  agent: unknown,
+  cfg: DreamConfig | undefined,
+  now = Date.now(),
+): AutoDreamGate {
+  const skip = readAutoDreamSkip(db, sessionId)
+  if (skip !== undefined && now - skip.at < DREAM_CONTEXT_SKIP_COOLDOWN_MS) {
+    return { allowed: false, reason: 'cooldown', tokens: skip.tokens, limit: skip.limit }
+  }
+  const maxPerDay = dreamMaxPerWindowPerDay(cfg)
+  if (maxPerDay <= 0) return { allowed: false, reason: 'cap' }
+  if (autoDreamStartsInWindow(db, sessionId, now).length >= maxPerDay) return { allowed: false, reason: 'cap' }
+  const limit = dreamMaxContextTokens(cfg)
+  const estimate = estimateContextTokens(agentSessionEvents(agent))
+  if (estimate.tokens > limit) {
+    try {
+      db.setDreamMeta(
+        DREAM_SKIP_META_PREFIX + sessionId,
+        JSON.stringify({ at: now, kind: 'context-oversize', tokens: estimate.tokens, limit }),
+      )
+    } catch {
+      /* 持久化失败不阻塞：至少本次不启动 */
+    }
+    return { allowed: false, reason: 'context-oversize', tokens: estimate.tokens, limit }
+  }
+  return { allowed: true, tokens: estimate.tokens, limit }
+}
+
+/** 闸跳过的日志去重（进程级）：同一窗口同一原因只记一次，15min/轮的扫描不刷屏。 */
+const autoDreamGateLogged = new Set<string>()
+const AUTO_DREAM_GATE_LOGGED_MAX = 1024
+
+function logAutoDreamGate(sessionId: string, gate: AutoDreamGate): void {
+  if (gate.allowed) return
+  const key = `${sessionId}:${gate.reason ?? 'skip'}`
+  if (autoDreamGateLogged.has(key)) return
+  autoDreamGateLogged.add(key)
+  while (autoDreamGateLogged.size > AUTO_DREAM_GATE_LOGGED_MAX) {
+    const oldest = autoDreamGateLogged.keys().next().value
+    if (oldest === undefined) break
+    autoDreamGateLogged.delete(oldest)
+  }
+  const sid = shortSessionId(sessionId)
+  if (gate.reason === 'context-oversize') {
+    dreamLog(`auto-dream skip sid=${sid} reason=context-oversize tokens≈${gate.tokens}/${gate.limit} -> 24h cooldown (#49)`)
+  } else if (gate.reason === 'cooldown') {
+    dreamLog(`auto-dream skip sid=${sid} reason=context-oversize-cooldown tokens≈${gate.tokens}/${gate.limit} (#49)`)
+  } else {
+    dreamLog(`auto-dream skip sid=${sid} reason=day-cap (#49)`)
+  }
+}
+
+/**
+ * 取窗口的 live agent（修 #49）：只认进程内**已经活着**的 agent——宿主 AgentRegistry
+ * （0.2.1 的 ctx.get('agents').get）优先，turn-stopping 注册的 liveAgents 兜底（老宿主
+ * 或 registry 不可用）。绝不 resume、绝不新建会话；取不到返回 undefined。
+ */
+export function liveAgentOf(ctx: Context, sessionId: string): unknown {
+  try {
+    const agentsSvc = (ctx as { get?: (name: string) => unknown }).get?.('agents') as
+      | { get?: (id: unknown) => unknown }
+      | undefined
+    if (agentsSvc !== undefined && typeof agentsSvc.get === 'function') {
+      const agent = agentsSvc.get(sessionId)
+      if (agent !== undefined && agent !== null) return agent
+    }
+  } catch {
+    /* registry 读失败：退回 liveAgents 注册表 */
+  }
+  return liveAgents.get(sessionId)
+}
+
+/** 无 live agent 的跳过日志去重（每会话一次，避免每 15min 一条刷日志）。 */
+const coldResumeSkipLogged = new Set<string>()
 
 // ── 分组与快照 ──────────────────────────────────────────────────────────────
 
@@ -109,6 +399,16 @@ function groupByProject(rows: MemoryRow[]): DreamGroup[] {
     .map(([name, rows]) => ({ name, rows }))
 }
 
+/** 单轮清单条目上限（0.32 成本审计：只归档不删除，长期窗口的清单会无限膨胀，
+ *  每轮 prompt 越滚越大）。取 created_at 最新的 N 条，跨 level 统一排序后截断。 */
+export const DREAM_MAX_ROWS_PER_ROUND = 60
+
+/** 取最新 N 条（created_at 降序；db.list 已按 level 分组返回，跨 level 必须自己排序）。 */
+function newestRows(rows: MemoryRow[], max = DREAM_MAX_ROWS_PER_ROUND): MemoryRow[] {
+  if (rows.length <= max) return rows
+  return [...rows].sort((a, b) => b.created_at - a.created_at).slice(0, max)
+}
+
 /** dream 记忆范围（用户拍板 2026-08-19，v0.17.0 扩展）：本窗口建立的 ∪ 本窗口
  *  提取过的（sessions/<id>.json：注入 injected + 检索 searched + 查阅 accessed）。
  *  分轮：第 1 轮=原子记忆（project/fact/lesson/rules/soul/user，不含 topic），空则跳过；
@@ -118,7 +418,10 @@ function groupByProject(rows: MemoryRow[]): DreamGroup[] {
  *  rules 防 churn（测评 2026-08-25）：updated_at 距今超 rulesReviewDays 天的稳定
  *  准则不进第 1 轮清单（0=不过滤）——每轮重审是低价值劳动且易诱发无意义 update；
  *  全局高 importance rules 每会话首轮都在注入，真矛盾会被当场 update、updated_at
- *  刷新后自动回到审查队列。 */
+ *  刷新后自动回到审查队列。
+ *  0.32 清单卫生（成本审计 §3.3/§5.2）：
+ *  ① status='archived' 的条目不再进任何一轮（旧行为会永远重喂已归档行）；
+ *  ② 每轮最多 DREAM_MAX_ROWS_PER_ROUND（60）条 created_at 最新条目，prompt 有上界。 */
 export function collectDreamRounds(
   db: ReturnType<typeof getDb>,
   sessionId: string,
@@ -135,20 +438,25 @@ export function collectDreamRounds(
   for (const level of ['project', 'fact', 'lesson', 'rules', 'soul', 'user'] as const) {
     for (const r of db.list(level)) {
       if (!(r.source_session === sessionId || seen.has(r.id))) continue
+      if (r.status === 'archived') continue // 0.32：已归档 = 不在整理范围（不再重喂旧行为）
       if (level === 'rules' && rulesReviewDays > 0 && Date.now() - r.updated_at > rulesReviewDays * 86_400_000) continue
       atomic.push(r)
     }
   }
   for (const r of db.list('topic')) {
+    if (r.status === 'archived') continue
     if (r.source_session === sessionId || seen.has(r.id)) topic.push(r)
   }
+  const atomicRows = newestRows(atomic)
+  const topicRows = newestRows(topic)
   const rounds: DreamRound[] = []
-  if (atomic.length > 0) rounds.push({ kind: 'atomic', groups: groupByProject(atomic) })
-  rounds.push({ kind: 'topic', groups: groupByProject(topic) }) // topic 轮默认触发（空轮也让 AI 回顾建新 topic）
+  if (atomicRows.length > 0) rounds.push({ kind: 'atomic', groups: groupByProject(atomicRows) })
+  rounds.push({ kind: 'topic', groups: groupByProject(topicRows) }) // topic 轮默认触发（空轮也让 AI 回顾建新 topic）
   // 第 3 轮=项目总结：项目集合=候选条目 project 并集（projectList 自动排除 全局/未标记；
   // db.list 不筛状态，前序轮归档不会让轮数中途变化）。没碰过任何项目就不发这一轮。
+  // 项目集合取自截断后的候选（与 prompt 里的条目清单口径一致）。
   const projects = new Set<string>()
-  for (const r of [...atomic, ...topic]) for (const p of projectList(r.project)) projects.add(p)
+  for (const r of [...atomicRows, ...topicRows]) for (const p of projectList(r.project)) projects.add(p)
   if (projects.size > 0) rounds.push({ kind: 'project-summary', groups: [], projects: [...projects].sort() })
   return rounds
 }
@@ -293,7 +601,7 @@ function safeSteer(agent: unknown, msg: unknown, workspace: string, dir: string,
     return true
   } catch (error: unknown) {
     const text = error instanceof Error ? error.message : String(error)
-    dreamLog(workspace, dir, `${tag} steer-failed err=${text}`)
+    dreamLog(`${tag} steer-failed err=${text}`)
     console.warn(`[meow-memory] ${tag}: agent.steer failed, dream skipped (${text})`)
     return false
   }
@@ -322,7 +630,7 @@ export function sendMemoryTurn(agent: unknown, msg: unknown, workspace: string, 
     return true
   } catch (error: unknown) {
     const text = error instanceof Error ? error.message : String(error)
-    dreamLog(workspace, dir, `${tag} followup-failed err=${text}`)
+    dreamLog(`${tag} followup-failed err=${text}`)
     console.warn(`[meow-memory] ${tag}: agent.followup failed, memory task skipped (${text})`)
     return false
   }
@@ -380,7 +688,7 @@ export function startWindowDream(ctx: Context, agent: { session?: { header?: { i
   if (rounds.length === 0) {
     // 无本窗口记忆（建立的 ∪ 提取过的都无）：也推进 last_dream_time（= 本窗口无可整理），避免 need=true 恒成立、每轮空扫到 24h
     db.finishDream(sessionId, Date.now())
-    dreamLog(workspace, dir, `dream skip-empty sid=${shortSessionId(sessionId)}`)
+    dreamLog(`dream skip-empty sid=${shortSessionId(sessionId)}`)
     onDreamState?.(sessionId, 'dreamed')
     return false
   }
@@ -400,7 +708,9 @@ export function startWindowDream(ctx: Context, agent: { session?: { header?: { i
     return false
   }
   armDreamHeartbeat(sessionId, workspace, dir) // 轮内心跳：单组 >30min 不再被判死收尾
-  dreamLog(workspace, dir, `dream start pid=${process.pid} session=${shortSessionId(sessionId)} rounds=${rounds.length} T=${T}`)
+  // 0.32：显式/自动启动成功过一次 → 作废上下文超限冷却；跨窗口的旧记录不再挡后续自动整理。
+  clearAutoDreamSkip(db, sessionId)
+  dreamLog(`dream start pid=${process.pid} session=${shortSessionId(sessionId)} rounds=${rounds.length} T=${T}`)
   return true
 }
 
@@ -424,7 +734,7 @@ export function advanceDream(agent: unknown, dir = '.dsh-meow', onDreamState?: D
   if (Date.now() - lease.progress_at > DREAM_LEASE_MS) {
     // 租约过期 = 主人已死：补收尾（不再推进），防止窗口永久 need=true 反复 start
     recoverInterruptedDream(db, sessionId, ws, dir)
-    dreamLog(ws, dir, `advanceDream expired-recover sid=${shortSessionId(sessionId)}`)
+    dreamLog(`advanceDream expired-recover sid=${shortSessionId(sessionId)}`)
     // 零进展释放（issue #36）≠ 整理完成：去月亮（active）而非加月亮（dreamed）；
     // 封存路径 last_dream_time 已置上，照旧 dreamed。
     const wAfter = db.getWindow(sessionId)
@@ -446,7 +756,7 @@ export function advanceDream(agent: unknown, dir = '.dsh-meow', onDreamState?: D
       const msg = buildDreamMessage(db, sessionId, lease.T, rounds, nextIdx)
       const tag = `dream group ${nextIdx + 1}/${rounds.length}`
       // 后续组用 steer（非 followup）：连在 dream 自己的 turn 里，多组不分轮
-      if (safeSteer(agent, msg, ws, dir, tag)) dreamLog(ws, dir, `${tag} steered`)
+      if (safeSteer(agent, msg, ws, dir, tag)) dreamLog(`${tag} steered`)
     }
     return
   }
@@ -464,10 +774,10 @@ function finalizeDream(db: ReturnType<typeof getDb>, sessionId: string, workspac
       `window dream ${reason}: ${shortSessionId(sessionId)} groups=${groupsCount} stamped=${stamped} T=${new Date(T).toISOString()}`,
       { before: undefined, after: undefined },
     )
-    dreamLog(workspace, dir, `dream ${reason} session=${shortSessionId(sessionId)} groups=${groupsCount} stamped=${stamped}`)
+    dreamLog(`dream ${reason} session=${shortSessionId(sessionId)} groups=${groupsCount} stamped=${stamped}`)
     onDreamState?.(sessionId, 'dreamed')
   } catch (e) {
-    dreamLog(workspace, dir, `dream ${reason} finish error: ${String(e)}`)
+    dreamLog(`dream ${reason} finish error: ${String(e)}`)
   }
 }
 
@@ -524,11 +834,23 @@ export function dreamTool(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamS
       //（注册期传入活读取 thunk，每次手动触发现读现用）。
       // 工作区停用（#28 硬开关）：手动触发也不放行（写了也进不去，白烧 token）。
       if (workspaceDisabled?.(workspace) === true) return { ok: false, note: '该工作区已停用记忆（disabledWorkspaces 名单）：dream 不可用。' }
+      // 0.32（修 #49）：手动 dream 也要求一个活着的窗口 agent（本工具的手动入口天然满足；
+      // 拿不到会话 id 说明宿主给的 agent 句柄不完整，明确拒绝，别伪装成"没有记忆"）。
+      const sessionId = exec.agent.session?.header?.id
+      if (typeof sessionId !== 'string' || sessionId.length === 0) {
+        return { ok: false, note: '无法确定本窗口的会话 id（live agent 句柄不完整）：dream 需要一个活着的窗口。' }
+      }
+      // 0.32 安全闸（review P1）：dream 会读条目/项目名并喂给模型——未受信工作区库一律不整理。
+      // 手动入口在本会话 pre-step 后触发（trust 已判定）；undefined 只可能是宿主/测试的
+      // 非标准装配，按放行处理（真实会话不存在这条路径）；显式 foreign 必须拒绝。
+      const trustManual = storeTrustOf(workspace, dir)
+      if (trustManual !== undefined && !trustManual.trusted) {
+        return { ok: false, note: '该工作区的记忆库未受信任（非本插件创建且未显式信任）：dream 已拒绝，避免把它库里的内容洗进模型。确认安全后设 security.trustWorkspaceMemory: true 并重载插件。' }
+      }
       const rrd = typeof rulesReviewDays === 'function' ? rulesReviewDays() : rulesReviewDays
       const ok = startWindowDream(ctx, exec.agent, workspace, dir, onDreamState, rrd)
       if (ok) return { ok, note: '整理任务已在后台启动，会话流中的任务气泡会显示进度与完成状态。' }
-      const sessionId = exec.agent.session?.header?.id
-      const lease = typeof sessionId === 'string' ? getDb(workspace, dir).getDreamLease(sessionId) : null
+      const lease = getDb(workspace, dir).getDreamLease(sessionId)
       return {
         ok,
         note: lease !== null
@@ -536,8 +858,9 @@ export function dreamTool(ctx: Context, dir = '.dsh-meow', onDreamState?: DreamS
           : '本窗口没有需要整理的记忆。',
       }
     },
-    presentCall(): { card: 'generic'; title: string; kind: 'write' } {
-      return { card: 'generic', title: 'memory_dream: 整理本窗口记忆', kind: 'write' }
+    presentCall(): { card: 'generic'; title: string; kind: 'edit' } {
+      // 0.2.1 的 ToolCallKind 没有 'write'（0.31.1 遗留编译不过），改用 'edit'。
+      return { card: 'generic', title: 'memory_dream: 整理本窗口记忆', kind: 'edit' }
     },
   }
 }
@@ -588,6 +911,12 @@ export function dreamCommandDefinition(ctx: Context, dir = '.dsh-meow', onDreamS
       if (workspaceDisabled?.(workspace) === true) {
         return { kind: 'error', text: '该工作区已停用记忆（disabledWorkspaces 名单）：/dream 不可用。' }
       }
+      // 0.32 安全闸（review P1）：未受信库不整理（内容会进模型轮）。undefined = 本会话
+      // pre-step 尚未判定（测试/非标准装配）放行；显式 foreign 拒绝。
+      const trustCmd = storeTrustOf(workspace, dir)
+      if (trustCmd !== undefined && !trustCmd.trusted) {
+        return { kind: 'error', text: '该工作区的记忆库未受信任（非本插件创建且未显式信任）：/dream 已拒绝。确认安全后设 security.trustWorkspaceMemory: true 并重载插件。' }
+      }
       const rrd = typeof rulesReviewDays === 'function' ? rulesReviewDays() : rulesReviewDays
       const ok = startWindowDream(ctx, agent, workspace, dir, onDreamState, rrd)
       if (ok) return { kind: 'success', text: '🧠 dream 已触发：整理任务已在后台运行，会话流中的任务气泡会显示进度与完成状态。' }
@@ -617,10 +946,10 @@ export function recoverInterruptedDream(db: ReturnType<typeof getDb>, sessionId:
     const fails = db.recordDreamFailure(sessionId, T)
     if (fails < DREAM_MAX_ATTEMPTS) {
       db.releaseDream(sessionId)
-      dreamLog(workspace, dir, `dream recovered zero-progress session=${shortSessionId(sessionId)} fails=${fails}/${DREAM_MAX_ATTEMPTS} -> released (retry next sweep)`)
+      dreamLog(`dream recovered zero-progress session=${shortSessionId(sessionId)} fails=${fails}/${DREAM_MAX_ATTEMPTS} -> released (retry next sweep)`)
       return 0
     }
-    dreamLog(workspace, dir, `dream recovered zero-progress session=${shortSessionId(sessionId)} fails=${fails} -> sealed (cap reached)`)
+    dreamLog(`dream recovered zero-progress session=${shortSessionId(sessionId)} fails=${fails} -> sealed (cap reached)`)
     console.warn(`[meow-memory] dream 连续失败 ${fails} 次后中断（窗口 ${shortSessionId(sessionId)}），按封存收尾不再自动重试；该窗口正常对话产生新活动后可重新自动整理，或手动 /dream`)
   }
   const stamped = db.stampDream(sessionId, T)
@@ -629,7 +958,7 @@ export function recoverInterruptedDream(db: ReturnType<typeof getDb>, sessionId:
     `window dream recovered (interrupted): ${shortSessionId(sessionId)} stamped=${stamped} T=${new Date(T).toISOString()}`,
     { before: undefined, after: undefined },
   )
-  dreamLog(workspace, dir, `dream recovered session=${shortSessionId(sessionId)} stamped=${stamped}`)
+  dreamLog(`dream recovered session=${shortSessionId(sessionId)} stamped=${stamped}`)
   return stamped
 }
 
@@ -650,12 +979,12 @@ export function handleMemoryTurnFailure(db: ReturnType<typeof getDb>, sessionId:
   if (fails >= DREAM_MAX_ATTEMPTS) {
     const stamped = db.stampDream(sessionId, lease.T)
     db.finishDream(sessionId, Date.now())
-    dreamLog(workspace, dir, `dream turn-failed cap sid=${shortSessionId(sessionId)} fails=${fails} -> sealed (stamped=${stamped})`)
+    dreamLog(`dream turn-failed cap sid=${shortSessionId(sessionId)} fails=${fails} -> sealed (stamped=${stamped})`)
     console.warn(`[meow-memory] dream 轮连续失败 ${fails} 次（窗口 ${shortSessionId(sessionId)}），已封存不再自动重试；详见 dream-debug.log`)
     return 'sealed'
   }
   db.releaseDream(sessionId)
-  dreamLog(workspace, dir, `dream turn-failed sid=${shortSessionId(sessionId)} fails=${fails}/${DREAM_MAX_ATTEMPTS} -> released (retry next sweep)`)
+  dreamLog(`dream turn-failed sid=${shortSessionId(sessionId)} fails=${fails}/${DREAM_MAX_ATTEMPTS} -> released (retry next sweep)`)
   return 'released'
 }
 
@@ -675,6 +1004,12 @@ export interface DreamConfig {
   timeZone: string
   /** rules 防 churn：updated_at 距今超该天数的稳定准则不进 dream 第 1 轮清单（0=不过滤，默认 2）。 */
   rulesReviewDays: number
+  /** 0.32（修 #49）：自动 dream 只接受 live agent（默认 true）。设为 false 也**不会**
+   *  恢复冷启动 resume——冷恢复路径已整体删除；该字段保留为显式部署意图 + 诊断日志。
+   *  手动 /dream、memory_dream 始终要求 live agent（调用即意味着窗口活着）。 */
+  requireLiveAgent?: boolean
+  /** 0.32 成本预算（Lead 从 resolved.budget 传入；缺省按 0.32 出厂默认）。 */
+  budget?: DreamBudget
 }
 
 /** rulesReviewDays 的单一默认来源（已抽到 defaults.ts，与 client 设置页「恢复默认」共用）：
@@ -740,100 +1075,6 @@ export function isDreamSuppressed(cfg: DreamConfig, date = new Date()): boolean 
   return false
 }
 
-/** 读会话持久化日志里最近一次 request/header 的路由。物理层与
- *  dsh-session-persistence-jsonl 同构（多帧 zstd 容器，逐帧解压），复用 migrate-v0
- *  的逐帧解压器；文件缺失/损坏/字段不合一律返回 null，绝不抛（调用方在 sweep 链上）。 */
-function readLastRouteFromSessionLog(sessionId: string): { provider: string; model: string } | null {
-  if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) return null // sid 拼路径前的防御（来自 windows 表，正常恒过）
-  const home = process.env.DSH_HOME || join(homedir(), '.dsh')
-  for (const rootName of ['sessions', 'archived-sessions']) {
-    const root = join(home, rootName)
-    let projDirs: string[]
-    try {
-      if (!existsSync(root)) continue
-      projDirs = readdirSync(root)
-    } catch {
-      continue
-    }
-    for (const proj of projDirs) {
-      // 两代文件名并存（v4 现行 / v0 旧名），与 migrate-v0 listSessionFiles 同款兼容
-      for (const file of [join(root, proj, sessionId, 'session.v4.jsonl.zstd'), join(root, proj, sessionId, 'session.jsonl.zstd')]) {
-        if (!existsSync(file)) continue
-        try {
-          const lines = decompressAllFrames(readFileSync(file)).toString('utf8').split('\n')
-          for (let i = lines.length - 1; i >= 0; i--) {
-            const line = lines[i]
-            if (!line.includes('"request/header"')) continue
-            let ev: { data?: { header?: { config?: { provider?: unknown; model?: unknown } } } }
-            try {
-              ev = JSON.parse(line) as typeof ev
-            } catch {
-              continue
-            }
-            const cfg = ev?.data?.header?.config
-            if (
-              cfg !== undefined && cfg !== null &&
-              typeof cfg.provider === 'string' && cfg.provider.length > 0 &&
-              typeof cfg.model === 'string' && cfg.model.length > 0
-            ) return { provider: cfg.provider, model: cfg.model }
-          }
-        } catch {
-          /* 单文件损坏/解压失败：试下一个候选 */
-        }
-      }
-    }
-  }
-  return null
-}
-
-/** resume 前解析该会话应使用的路由：原会话路由（会话日志）→ 部署默认选择 → null。 */
-function resolveResumeRoute(ctx: Context, sessionId: string): { provider: string; model: string; source: 'session-log' | 'default-selection' } | null {
-  const fromLog = readLastRouteFromSessionLog(sessionId)
-  if (fromLog !== null) return { ...fromLog, source: 'session-log' }
-  try {
-    const svc = (ctx as { get?: (name: string) => unknown }).get?.('agentDefaultModel') as
-      | { currentSelection?: () => { provider?: unknown; model?: unknown } }
-      | undefined
-    const sel = typeof svc?.currentSelection === 'function' ? svc.currentSelection() : null
-    if (
-      sel !== null && sel !== undefined &&
-      typeof sel.provider === 'string' && sel.provider.length > 0 &&
-      typeof sel.model === 'string' && sel.model.length > 0
-    ) return { provider: sel.provider, model: sel.model, source: 'default-selection' }
-  } catch {
-    /* 默认模型服务不可用/读失败：落到裸 resume（turn-failed 处理兜底） */
-  }
-  return null
-}
-
-/** Restore cold sessions through the ordinary-session owner when available, or
- *  the route-aware agents service on legacy Hosts, then recheck dream eligibility.
- *  Never create a replacement session on failure. The in-flight set prevents
- *  overlapping checks from restoring the same id twice. */
-const resumeInFlight = new Set<string>()
-
-/** resume 永久失败退避（进程级）：'session not found' 的窗口短期不会复活——会话文件
- *  不在本实例 home（跨实例窗口：两实例共享 windows 表，3080/3081 互试对方会话必失败；
- *  或已删除会话）。按周期重试纯属浪费+日志刷屏（2026-09-04/05 实测：每周期数十次
- *  'agent-resume-failed session not found'，dream-debug.log 一天 2MB+）。失败后 6h 内
- *  不再尝试本实例 resume；进程重启清零（每轮只多试一次，无害）。 */
-const RESUME_BACKOFF_MS = 6 * 3600_000
-const resumeFailedAt = new Map<string, number>()
-
-function resumeBackoffActive(sessionId: string): boolean {
-  const at = resumeFailedAt.get(sessionId)
-  return at !== undefined && Date.now() - at < RESUME_BACKOFF_MS
-}
-
-function markResumeFailed(sessionId: string): void {
-  resumeFailedAt.set(sessionId, Date.now())
-  if (resumeFailedAt.size <= 512) return
-  const now = Date.now()
-  for (const [sid, at] of resumeFailedAt) {
-    if (now - at >= RESUME_BACKOFF_MS) resumeFailedAt.delete(sid)
-  }
-}
-
 /** 子代理会话判定（与 index.ts 注入链路同口径）：origin === 'subagent' 为 dsh 权威标记；
  *  delegationDepth > 0 作双保险。不能只看 parentSession——GUI fork/续写的主会话也有
  *  parentSession（2026-08-17 真机踩坑 fca10feb 误判）。 */
@@ -845,101 +1086,57 @@ export function isSubagentAgent(agent: unknown): boolean {
   return typeof header.delegationDepth === 'number' && header.delegationDepth > 0
 }
 
-/** 已判定不参与自动 dream 的窗口（进程级缓存），两类来源：①origin/depth 判定为
- *  子代理会话；②resume resolve 但 agent 无可用 header（实测=子代理会话：dsh 对 fork
- *  子代理的 resume 返回不可用句柄，主会话 resume 恒返回完整 agent）。dream 只归主
- *  窗口——子代理会话（历史 delegate fork 的、或用户手动 fork 的）虽然会进 windows 表/windowIndex（它们也产生
- *  事件），但不是 dream 目标，否则 dream 子代理→再进表→再被 dream→depth 无限套娃
- *  （2026-09-05 真机实证 8fbc5d59→2f47c15b→63dad87b，猫猫拍板：主窗口主 session
- *  负责 dream）。手动 /dream 与 memory_dream 不经此过滤（手动=明确意愿）。
- *  进程重启清零：每窗口最多多 resume 一次，无害。 */
+/** 已判定不参与自动 dream 的窗口（进程级缓存）：origin/depth 判定为子代理会话。
+ *  dream 只归主窗口——子代理会话（历史 delegate fork 的、或用户手动 fork 的）虽然会
+ *  进 windows 表/windowIndex（它们也产生事件），但不是 dream 目标，否则 dream 子代理
+ *  →再进表→再被 dream→depth 无限套娃（2026-09-05 真机实证
+ *  8fbc5d59→2f47c15b→63dad87b，猫猫拍板：主窗口主 session 负责 dream）。
+ *  手动 /dream 与 memory_dream 不经此过滤（手动=明确意愿）。
+ *  0.32（#49）起自动路径不再 resume，缓存只为省掉子代理窗口的重复判定。 */
 const autoDreamSkipWindows = new Set<string>()
 
-/** resolveAgent 返回形状告警去重（进程级）：形状不认识的宿主每个窗口只记一次日志。 */
-const resumeShapeWarned = new Set<string>()
-
+/**
+ * @deprecated 0.32（修 #49）：自动 dream 不再冷启动 resume。保留导出名只为兼容旧调用方
+ *  （index.ts 仍重导出）；语义改为「live agent 存在时的自动复查」——进程内取不到该窗口
+ *  的 live agent 就记一次日志跳过，**绝不** resolveAgent / agents.resume、绝不新建会话。
+ *  旧 resume 机器（会话日志路由恢复 / sessionController.resolveAgent / not-found 退避 /
+ *  在途去重）已整体删除：自动 dream 只服务用户正在用、至少进程内活着的窗口。
+ *  与 dreamSweepOnce 共用同一套成本闸（上下文估算 / 24h 频次 / 超限冷却）。
+ */
 export async function resumeAndDream(ctx: Context, sessionId: string, workspace: string, dir: string, onDreamState: DreamStateCallback | undefined, cfg: DreamConfig): Promise<void> {
-  const log = (msg: string): void => dreamLog(workspace, dir, msg)
   const sid = shortSessionId(sessionId)
-  if (resumeInFlight.has(sessionId)) return
-  if (resumeBackoffActive(sessionId)) return // not-found 退避期内：静默跳过
-  resumeInFlight.add(sessionId)
-  try {
-    // The ordinary-session owner restores model selection, the preset and its tools.
-    // Raw factory resume, even with a model, omits the preset and scoped tools.
-    const sessionsSvc = (ctx as { get?: (name: string) => unknown }).get?.('sessionController') as
-      | { resolveAgent?: (id: string) => Promise<{ agent: unknown } | { error: { message: string } }> }
-      | undefined
-    let agent: unknown
-    if (sessionsSvc !== undefined && typeof sessionsSvc.resolveAgent === 'function') {
-      log(`check resume owner sid=${sid} via sessionController`)
-      const resolved = await sessionsSvc.resolveAgent(sessionId) as unknown
-      const r = resolved as Record<string, unknown> | null
-      // 形状守卫：认识的返回只有 {agent} / {error} 两种。宿主版本差异给出别的形状
-      // 时绝不能落到下面 unusable-agent 分支——那会进 autoDreamSkipWindows 永久跳过，
-      // 窗口的 auto-dream 被静默禁用到进程重启且现场无从排查。记一次日志、本周期
-      // 跳过、下个 sweep 重试（不进任何缓存表）。
-      if (r === null || typeof r !== 'object' || (!('agent' in r) && !('error' in r))) {
-        if (!resumeShapeWarned.has(sessionId)) {
-          resumeShapeWarned.add(sessionId)
-          const keys = r !== null && typeof r === 'object' ? Object.keys(r).join(',') : String(r)
-          log(`check resume owner sid=${sid} 未识别的 resolveAgent 返回形状（keys=${keys}）-> 本周期跳过，不记永久跳过`)
-        }
-        return
-      }
-      if ('error' in r) throw new Error(String((r as { error?: { message?: string } }).error?.message ?? 'resolveAgent error'))
-      agent = (r as { agent?: unknown }).agent
-    } else {
-      // Legacy Hosts do not expose the ordinary-session controller as a service.
-      const agentsSvc = (ctx as { get?: (name: string) => unknown }).get?.('agents') as
-        | { resume?: (options: { resumeSessionId: string; agentOptions?: { provider: string; model: string } }) => Promise<unknown> }
-        | undefined
-      if (agentsSvc === undefined || typeof agentsSvc.resume !== 'function') {
-        log(`check agent-resume-unavailable sid=${sid} service=${agentsSvc ? 'yes' : 'no'}`)
-        return
-      }
-      const route = resolveResumeRoute(ctx, sessionId)
-      if (route === null) log(`check resume no-route sid=${sid} -> resume without agentOptions (turn-failed 兜底)`)
-      else log(`check resume route sid=${sid} provider=${route.provider} model=${route.model} source=${route.source}`)
-      const resumed = await agentsSvc.resume({
-        resumeSessionId: sessionId,
-        ...(route === null ? {} : { agentOptions: { provider: route.provider, model: route.model } }),
-      })
-      agent = (resumed as { agent?: unknown })?.agent ?? resumed
+  const agent = liveAgentOf(ctx, sessionId)
+  if (agent === undefined || agent === null) {
+    // 每会话只记一次：15min/轮扫描不刷屏
+    if (!coldResumeSkipLogged.has(sessionId)) {
+      coldResumeSkipLogged.add(sessionId)
+      dreamLog(`check cold-resume-disabled sid=${sid} -> skip (no agents.resume, #49)`)
     }
-    const header = (agent as { session?: { header?: { id?: unknown; origin?: unknown; delegationDepth?: unknown } } })
-      ?.session?.header
-    if (header === undefined || header === null || typeof header.id !== 'string' || header.id.length === 0) {
-      // An unusable identity must not start a dream or be retried by every sweep.
-      autoDreamSkipWindows.add(sessionId)
-      log(`check resume unusable-agent sid=${sid} -> skip`)
-      return
-    }
-    log(`check agent-resumed sid=${sid}`)
-    if (isSubagentAgent(agent)) {
-      autoDreamSkipWindows.add(sessionId)
-      log(`check resume skip-subagent sid=${sid}`)
-      return // 子代理会话不是 dream 目标（dream 只归主窗口）
-    }
-    const db = getDb(workspace, dir)
-    const w = db.getWindow(sessionId)
-    if (!w || !windowNeedsDream(w)) return // 恢复期间超 24h / 已 dream 过
-    if (Date.now() - w.last_event_time < cfg.idleMinutes * 60_000) return // 恢复期间窗口被碰，空闲不足
-    if (db.getDreamLease(sessionId) !== null) return // 恢复期间别处已启动 dream
-    startWindowDream(ctx, agent as { session?: { header?: { id?: string } } }, workspace, dir, onDreamState, cfg.rulesReviewDays)
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error)
-    // 'session not found' = 会话文件不在本实例 home（跨实例/已删除）：永久性失败，
-    // 记退避止血；其余错误（瞬时异常）不退避，下周期照常重试。
-    if (msg.includes('not found')) markResumeFailed(sessionId)
-    log(`check agent-resume-failed sid=${sid} err=${msg}`)
-  } finally {
-    resumeInFlight.delete(sessionId)
+    return
+  }
+  if (isSubagentAgent(agent)) {
+    autoDreamSkipWindows.add(sessionId)
+    dreamLog(`check skip-subagent sid=${sid}`)
+    return // 子代理会话不是 dream 目标（dream 只归主窗口）
+  }
+  const db = getDb(workspace, dir)
+  const w = db.getWindow(sessionId)
+  if (!w || !windowNeedsDream(w)) return // 复查期间超 24h / 已 dream 过
+  if (Date.now() - w.last_event_time < cfg.idleMinutes * 60_000) return // 复查期间窗口被碰，空闲不足
+  if (db.getDreamLease(sessionId) !== null) return // 复查期间别处已启动 dream
+  const gate = evaluateAutoDreamGate(db, sessionId, agent, cfg)
+  if (!gate.allowed) {
+    logAutoDreamGate(sessionId, gate)
+    return
+  }
+  if (startWindowDream(ctx, agent as { session?: { header?: { id?: string } } }, workspace, dir, onDreamState, cfg.rulesReviewDays)) {
+    recordAutoDreamStart(db, sessionId)
   }
 }
 
 /** dream 自动扫描单轮（scheduleDream 定时驱动；导出供测试直调）。
  *  峰时抑制/全局检查门在 scheduleDream 里，这里只做窗口遍历与启动。
+ *  0.32（#49）：窗口必须有 live agent（绝不 resume 冷会话），且过成本闸才会 start。
  *  每轮最多 start 一个窗口（start 成功即返回，剩余下周期继续——清积压限速）。 */
 export function dreamSweepOnce(ctx: Context, cfg: DreamConfig, dir: string, windowIndex: Map<string, string>, onDreamState?: DreamStateCallback, workspaceDisabled?: (ws: string) => boolean): void {
   // 已归档会话集合（registry 全局归档；服务不可用时跳过检查）
@@ -956,6 +1153,13 @@ export function dreamSweepOnce(ctx: Context, cfg: DreamConfig, dir: string, wind
     if (archived.has(sessionId)) continue // 已归档 = 当不存在
     if (workspaceDisabled?.(workspace) === true) continue // 工作区停用（#28）：连库都不开
     if (autoDreamSkipWindows.has(sessionId)) continue // 子代理/不可恢复窗口：进程级缓存命中，连 agent 都不取
+    // 0.32 安全闸（review R4/P1）：信任判定必须先于 getDb——陌生库连打开/schema 升级/
+    // 索引写入都不允许；本进程还没判定过的工作区也跳过（宁可漏整理，不碰陌生库）。
+    const trustPre = storeTrustOf(workspace, dir)
+    if (trustPre?.trusted !== true) {
+      dreamLog(`check skip-untrusted sid=${shortSessionId(sessionId)} reason=${trustPre?.reason ?? 'unknown'}`)
+      continue
+    }
     const db = getDb(workspace, dir)
     // 用户跳过（v0.16.0 侧边栏菜单 toggle）：本窗口不自动 dream。
     // 只挡自动触发——/dream 命令与 memory_dream 工具（手动=明确意愿）不受限；
@@ -964,7 +1168,7 @@ export function dreamSweepOnce(ctx: Context, cfg: DreamConfig, dir: string, wind
     const w = db.getWindow(sessionId)
     if (!w || !windowNeedsDream(w)) continue
     const lease = db.getDreamLease(sessionId)
-    dreamLog(workspace, dir, `check sid=${shortSessionId(sessionId)} active=${lease !== null} idle=${Math.round((Date.now() - w.last_event_time) / 1000)}s`)
+    dreamLog(`check sid=${shortSessionId(sessionId)} active=${lease !== null} idle=${Math.round((Date.now() - w.last_event_time) / 1000)}s`)
     // 进行中 dream：只在租约过期（主人已死）时补收尾；活跃则跳过（别处正在 dream）
     if (lease !== null) {
       if (Date.now() - lease.progress_at > DREAM_LEASE_MS) {
@@ -980,30 +1184,39 @@ export function dreamSweepOnce(ctx: Context, cfg: DreamConfig, dir: string, wind
     // （空闲判定完全按窗口自身 last_event_time，与全局/其他窗口活动无关，
     //   避免活跃窗口拖累已空闲窗口导致 dream 永不触发。）
     if (Date.now() - w.last_event_time < cfg.idleMinutes * 60_000) continue
-    const agentsSvc = typeof ctx.get === 'function'
-      ? (ctx.get('agents') as { get?: (id: unknown) => unknown } | undefined)
-      : undefined
-    const agent =
-      liveAgents.get(sessionId) ??
-      (agentsSvc !== undefined && typeof agentsSvc.get === 'function' ? agentsSvc.get(sessionId) : undefined)
-    if (!agent) {
-      // 进程内无该窗口 agent（重启后 liveAgents 清空）：异步从 persistence 恢复
-      // （factory.resume，与 GUI 打开会话同路径）后再 dream——挂着的窗口不因重启
-      // 丢 dream 资格（2026-09-01 用户拍板）。fire-and-forget：不阻塞本轮检查，
-      // resumeInFlight 防重入，失败静默降级为旧行为（只跳过不 dream）。
-      dreamLog(workspace, dir, `check agent-missing sid=${shortSessionId(sessionId)} -> try resume`)
-      void resumeAndDream(ctx, sessionId, workspace, dir, onDreamState, cfg)
+    // 0.32（修 #49）：自动 dream 只认进程内 live agent，**绝不** resume 冷会话。
+    // 取不到 = 用户没开着这个窗口（或进程重启后尚未回来）：跳过，等窗口真的活着再说；
+    // 每会话只记一次日志（15min/轮扫描不刷屏）。
+    const agent = liveAgentOf(ctx, sessionId)
+    if (agent === undefined || agent === null) {
+      if (!coldResumeSkipLogged.has(sessionId)) {
+        coldResumeSkipLogged.add(sessionId)
+        // requireLiveAgent 默认 true；就算配成 false 也不会恢复冷启动 resume（#49 不变量），
+        // 只在日志里区分是"配置要求 live"还是"冷恢复已删除"。
+        const why = cfg.requireLiveAgent === false ? 'no cold resume' : 'requireLiveAgent'
+        dreamLog(`check agent-missing sid=${shortSessionId(sessionId)} -> skip (${why}, #49)`)
+      }
       continue
     }
     if (isSubagentAgent(agent)) {
       // 子代理会话窗口：不 dream（否则 dream 子代理→再进表→再被 dream 无限递归）。
       // 记入缓存后后续周期在循环顶部直接跳过，不再打 check 日志。
       autoDreamSkipWindows.add(sessionId)
-      dreamLog(workspace, dir, `check skip-subagent sid=${shortSessionId(sessionId)}`)
+      dreamLog(`check skip-subagent sid=${shortSessionId(sessionId)}`)
+      continue
+    }
+    // 0.32 成本闸（只挡自动触发；手动 /dream、memory_dream 不过这里）：
+    // 24h 频次上限 + 上下文超限 24h 冷却 + 本次会话上下文 token 估算。
+    const gate = evaluateAutoDreamGate(db, sessionId, agent, cfg)
+    if (!gate.allowed) {
+      logAutoDreamGate(sessionId, gate)
       continue
     }
     const started = startWindowDream(ctx, agent as never, workspace, dir, onDreamState, cfg.rulesReviewDays)
-    if (started) return // 一轮一个窗口
+    if (started) {
+      recordAutoDreamStart(db, sessionId) // 自动频次计数（手动 dream 不占额度）
+      return // 一轮一个窗口
+    }
   }
 }
 
@@ -1040,7 +1253,8 @@ export function dreamSweepTick(ctx: Context, cfg: DreamConfig | (() => DreamConf
  *  判定纯时间化（用户拍板）：窗口最后发言在 24h 内 且 最后动作不是 dream
  *  （last_dream_time < last_event_time）；不依赖 live agent 存在性。
  *  已归档的会话（workspaceRegistry.archivedSessionIds）视为不存在，不 dream（用户拍板）。
- *  执行时尝试取 agent（liveAgents 或 ctx.agents.get），进程重启后取不到 → 跳过（旧窗口精神）。
+ *  执行时只取进程内 live agent（ctx.agents.get → liveAgents 兜底），取不到即跳过；
+ *  0.32（#49）起绝不 resume 冷会话。
  *  自调度（issue #26）：checkMinutes 是活值——每 tick 现读现排下一轮（setInterval 的
  *  周期在启动时定型，改配置永远不生效）；cfg 支持对象（兼容旧调用/测试）或 getter
  *  （活配置）。enabled 状态转换打一行日志（静默跳过与没跑在日志里同形，去观测盲点）。 */

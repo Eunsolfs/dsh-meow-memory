@@ -1,8 +1,9 @@
-【meow-memory 首次建库提示】
-记忆库刚刚在当前工作区创建：{dbPath}。
+【aviso de criação do banco meow-memory】
+Um banco de memória acabou de ser criado no workspace atual: {dbPath}.
 
-两点须知：
-1. 这个文件在工作区的隐藏目录里，**误删无法恢复**（默认不进 git，也没有回收站）。请把它加入 .gitignore，避免意外提交或清理。
-2. 想把数据放到更安全的位置（工作区之外），可以对 AI 说"把记忆目录迁移到 dsh-storage"（memory_home 工具）；也可以在设置页开启自动备份（backup.enabled），每次整理收尾自动生成 memory.db.bak 快照。
+Três coisas importantes:
+1. Este arquivo fica num diretório oculto dentro do workspace e **não pode ser recuperado se apagado** (não há lixeira). O plugin já gravou ali um `.gitignore` auto-ignorante (fica fora do git por padrão); se você desativou `security.autoGitignore`, adicione a entrada manualmente.
+2. O banco de memória em si fica dentro do workspace atual e nunca é movido. `memory_home` / `homeDir` gerenciam **dados em nível de instância** (logs / window-index / estado de migração), não este `memory.db`. O diretório global de dados padrão fica em `.dsh-meow` sob a home do usuário do sistema: `{homePath}`. `memory_home` é somente consulta por padrão; a troca exige `security.allowHomeSwitch: true`.
+3. Quer backups automáticos: defina `backup.enabled: true` na configuração do profile (ao fim de cada dream é gerado um snapshot `memory.db.bak`).
 
-本提示只出现一次，无需回复；如用户问到记忆数据的存放或安全，以上是要点。
+Este aviso aparece uma única vez; não é preciso responder. Se o usuário perguntar onde ficam os dados de memória ou quão seguros são, os pontos acima são a resposta.

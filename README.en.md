@@ -1,182 +1,339 @@
-# meow-memory 🐱📝
+# meow-memory 🐱📝 · hardened fork
 
 | [中文](README.md) | [English](README.en.md) | [Português (BR)](README.pt-br.md) | [MIT License](LICENSE) |
 | :---: | :---: | :---: | :---: |
 
-Cross-session memory for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
+> **What this is**: a personal hardening fork of `Phant0Meow/dsh-meow-memory` **v0.31.1** (this repository, version **0.32.0**, branch `hardening`).
+> Upstream is MIT-licensed: <https://github.com/Phant0Meow/dsh-meow-memory>. This fork is **not affiliated with upstream**, does not publish on upstream's behalf, and does not represent upstream's views. All changes and remaining issues are in [CHANGELOG.md](CHANGELOG.md).
 
-Version **0.31.0** ｜ Changelog: [CHANGELOG.md](CHANGELOG.md) ｜ Supports **dsh 0.1.5**
+Cross-session memory for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): seven-layer SQLite memory, first-turn snapshot injection, per-message keyword hits, and automatic consolidation **with budget caps**.
 
-## ✨ Features
+Version **0.32.0** ｜ Changelog: [CHANGELOG.md](CHANGELOG.md) ｜ Verified host: **DSH Desktop 0.2.1-rc.2** (see [Compatibility](#compatibility))
 
-- **Seven memory layers**: `soul` (the AI itself) / `user` (user basics & preferences) / `project` (per-project info with `subcategory`) / `fact` (atomic facts) / `lesson` (mistakes & corrections) / `topic` (ongoing discussion arcs with a goal sentence) / `rules` (design principles & behavioral rules). One SQLite table per layer, UUIDs are time-prefixed so id order == creation order.
-- **First-turn injection (long-term memory block)**: before the first user message, soul / user / design principles / memory guide are injected. The memory is inserted as an independent plugin snapshot directly before the real user message; **the user's prompt is never rewritten**, and **no keyword hits run on the first turn** (hits start from the second message).
-- **Per-message keyword hits**: from the second user message on, every real user message is matched against fact/lesson/rules/topic (scope = global + current-project anchor) and the top-2 hits are injected. Matching is based on **entry keywords**, not full text.
-- **Current-project anchor**: any `memory_remember/search/update/project` call with a `project` parameter anchors the session's current project; unanchored sessions only hit global entries (casual chat stays unaffected).
-- **Cache-friendly by design**: the static `meow-memory:guide` section is registered in the system prompt once — constant text, so it cannot break the provider's KV cache.
-- **Post-compaction re-injection**: after a session is compacted, the next turn automatically re-injects the long-term snapshot plus the project overviews this session fetched via `memory_project`, plus the entries this session wrote or updated — so the AI never suddenly goes amnesiac after compaction.
-- **Three things on top of the layers**: writes dedup and merge automatically; displayed timestamps are always `updated_at`; global information uses the global marker (distinct from leaving the field blank).
-- **Per-window dream**: a window becomes dream-eligible once idle ≥ 3 hours, and its own main agent consolidates in rounds (atomic memories / topic / project summary); **peak-hour suppression** (09:00–12:00 and 14:00–18:00 in the configured `timeZone`, default Asia/Shanghai — the API's peak-tariff hours) prevents triggering. Typing `/dream` consolidates immediately on demand.
-- **Reflection**: after ≥7 consecutive tool steps within one task the plugin asks the model whether anything since the last consolidation is worth remembering. A turn whose last tool is a `memory_*` tool counts as already consolidated (no re-reflection).
-- **Client UI**: injected text collapses into a slim bar, reflection/dream turns collapse into one expandable card, and the session list shows dream state icons (🌙 consolidated / breathing moon in progress / muted-gray slashed moon skipped).
-- **Zero runtime dependencies**: `node:sqlite` + self-contained esbuild bundle (`lib/index.js`). No native modules.
+**Honesty note**: this README only claims behaviour that exists in the code. 0.32 removed several inflated upstream claims ("automatic dedupe/merge", "Ebbinghaus forgetting curve", per-message "BM25", "supports dsh 0.1.5") and states the real boundary at each point.
 
-## 📦 Install
+---
 
-### One-command install (recommended)
+## Read this first: it spends tokens automatically
 
-```sh
-dsh plugin --profile web add github:Phant0Meow/dsh-meow-memory
-```
+This is the plugin's most under-estimated cost. **With default settings it issues LLM requests without an explicit user command**; 0.32 put a cap on every kind, but did not switch any of them off (upstream default behaviour kept, only unbounded → bounded).
 
-One command and it works: the package compiles itself on install (it ships a `prepare` script), mounts automatically, and new sessions load the plugin after you restart `dsh web`.
+| Spend | When | 0.32 cap |
+|---|---|---|
+| **Static tax**: memory manual + every tool description/schema in the system prompt | **Every** model request, even a session that never uses memory | ≈**6.7k tokens/request** (measured, Chinese pack; ≈6.3k English; varies with language pack and tool-description length). Cannot be disabled per request; to avoid it entirely set `enabled: false` (or remove the plugin) |
+| **First-turn snapshot**: soul / user / global rules / memory guide | Once, before the first real user message of each session | `budget.snapshotMaxChars` default **6000 chars** (≈2.7k tokens zh) |
+| **Per-message keyword hits** | From the second message on, when keywords match | `hitTopK` default 2 × `budget.hitMaxChars` default **1500 chars/entry** (≈1.4k tokens/message worst case) |
+| **Post-compaction re-injection** | The turn after a session compaction | `budget.reinjectMaxChars` default **8000 chars** (≈3.6k tokens) |
+| **Automatic dream** | Window idle ≥ `dream.idleMinutes` (default 180), off-peak, **window has a live agent**, estimated context ≤ `budget.dreamMaxContextTokens` (default 40000) | Up to **3 full-context rounds**; `budget.dreamMaxPerWindowPerDay` default **1 per window/day**. A 30k-token session costs ≈90k input tokens per dream; the session history permanently gains ≈8–15k durable tokens |
+| **Reflection** | After a task with ≥ `reflectTurns` (default 7) consecutive tool steps | **1 full-context request**; `budget.reflectMaxPerDay` default 6/day/window (session), `budget.reflectMinIntervalMinutes` default 20; skipped when context exceeds `dreamMaxContextTokens` |
 
-> pnpm ≥10 blocks install-time build scripts by default: the first `add` may fail and mention `allowBuilds`. Add the keys it prints to the profile's `pnpm-workspace.yaml` and run it again.
-
-### Via npm (published package)
-
-```sh
-# 1. Install into the profile's node_modules (the loader resolves plugins there)
-cd $DSH_HOME/profiles/web          # default home: ~/.dsh/profiles/web
-npm install meow-memory
-
-# 2. Add the package to the profile's assembly bundles in package.json (recommended since v0.9.0):
-#    "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "meow-memory"] } }
-#    (the package ships a dsh.bundle.patch; bundle assembly inserts it. Profile-patch
-#     `insert` entries address existing ids — a new plugin not in the tree reports
-#     "entry not found", so new plugins go through the bundles array.)
-
-# 3. Restart dsh web. New sessions pick up the plugin automatically.
-```
-
-### Remove
-
-```sh
-dsh plugin --profile web remove meow-memory
-```
-
-### PT-BR fork
-
-For a build packaged for Brazilian Portuguese, see [coutogilson](https://github.com/coutogilson)'s fork:
-
-```sh
-dsh plugin --profile web add github:coutogilson/dsh-meow-memory
-```
-
-### By hand (any DSH install, no npm needed)
-
-1. Copy (or symlink) this package into the profile's `node_modules`:
-
-   ```sh
-   mkdir -p ~/.dsh/profiles/web/node_modules
-   ln -s /path/to/meow-memory ~/.dsh/profiles/web/node_modules/meow-memory
-   ```
-
-   (On Windows: `New-Item -ItemType Junction ...` — NTFS junction, no admin needed.)
-
-2. Add `meow-memory` to the profile `package.json`'s `dsh.profile.bundles` (same as above).
-
-3. Restart `dsh web`. New sessions pick up the plugin automatically.
-
-## 🔌 Compatibility
-
-Supports **dsh 0.1.5** (including the latest `0.1.5-rc.1`) and stays backward compatible with older releases — upgrading dsh needs no change to this plugin or its configuration.
-
-The plugin never hardcodes a version: it probes host capabilities at runtime, so new and old releases each take their correct branch. Both generations are verified — on `0.1.5-rc.1` first-turn injection, memory tool calls, and client rendering all work; on `0.1.1-rc.2` behavior is unchanged from previous releases.
-
-## ⚙️ Configuration
-
-All fields are optional (profile patch or `cordis.patch.yml`). **You don't have to hand-edit files**: the DSH settings page has a dedicated "喵记忆" tab for this plugin (peer of General/Models/Plugins) where every option below is editable in place, saved per-field with one-click restore-to-default (restoring means the plugin's built-in factory default, not the patch baseline); reload/restart the meow-memory plugin after saving for changes to take effect.
+**How to stop the automatic spend** (manual tools keep working):
 
 ```yaml
 - id: meow-memory
   name: 'meow-memory'
   config:
-    enabled: true          # master switch
-    projectDir: '.dsh-meow' # memory directory, relative to the workspace
-    promptLang: 'zh'       # ⚠️ set this on first use (see note below)
-    hitTopK: 2             # max keyword-hit entries injected per user message
+    reflect: false            # no automatic reflection
     dream:
-      enabled: true
-      idleMinutes: 180      # window is dream-eligible after ≥180 min (3 h) idle
+      enabled: false          # no automatic dream (/dream and memory_dream still work)
 ```
 
-**Every field, its type and its default are in [docs/configuration-reference.md](docs/configuration-reference.md)**, including `titleMax` / `autoMigrate` / `homeDir` / `disabledWorkspaces` / `backup` / `delegate`.
+Or per window: session row "…" menu → **Memory participation** → turn off "auto-injection" / "auto-consolidation". To avoid the ≈6.7k static tax entirely, disable the plugin.
 
-> ⚠️ **Set `promptLang` explicitly on first use.** It decides the language of injected/reflection/dream prompts and of tool descriptions, and it also shapes the language the model writes memory entries in — keywords are extracted in the entry's language. `zh` / `en` / `pt-br` ship built in. The value *is* the subdirectory name under `src/prompts/` and is matched **verbatim**: a name that does not exist (e.g. `pt`) raises nothing and silently falls back to the Chinese pack. See [docs/configuration-reference.md](docs/configuration-reference.md).
+> **Manual `/dream` / `memory_dream` do not go through the automatic cost gates** (explicit intent): no peak-hour / daily-frequency / context-size gate applies (manual invocation already requires a live window), and they run up to **3 rounds** over the **full session context** (atomic / topic / project summary). If the context is large, run `/compact` first — that is the only way to materially reduce a manual dream's cost.
+
+> These are **caps**, not promises. Actual spend depends on entry counts, content length and session length; the worst case per day is still bounded in orders of magnitude (≤1 dream + ≤6 reflection full-context turns). The "estimated tokens" used by the context gates are **approximate**: CJK ≈1.7 chars/token, non-CJK ≈4 chars/token (deliberately over-estimated), not exact billing.
+
+---
+
+## Security model
+
+### Where the data lives
+
+| Data | Location |
+|---|---|
+| Memory store (plaintext SQLite) | `<workspace>/<projectDir>/memory.db`, `projectDir` defaults to `.dsh-meow` |
+| Session bookkeeping (seen / queried) | `<workspace>/.dsh-meow/sessions/<id>.json` |
+| Store trust marker | `<workspace>/.dsh-meow/.owner.json` |
+| Self-ignoring `.gitignore` | `<workspace>/.dsh-meow/.gitignore` (content `*` — the directory ignores itself, so `git add .` never commits memories) |
+| Instance-level global directory (logs / window index / migrate state) | default `~/.dsh-meow` (**outside `DSH_HOME`**); change with `homeDir` or `MEOW_MEMORY_HOME` |
+| Prompt-copy instance overrides | `$DSH_HOME/storages/meow-memory/prompts/<lang>/<slot>.md` (fixed path; `$DSH_HOME` defaults to `~/.dsh`; **does not follow `homeDir`/`memory_home` switches**) |
+
+The `.gitignore` is written automatically (`security.autoGitignore: true`): `*` if the directory has none, and **a `*` line is appended if a pre-existing `.gitignore` lacks one** (prevents `!*`-style re-inclusion from committing `memory.db`). The store is **not encrypted** though: memory bodies are plaintext and may contain private data. Do not store secrets in memories; `.gitignore` only stops git, not backups, sync folders or other local processes.
+
+### Non-empty stores not created by this plugin are untrusted (#64-1 fix)
+
+Workspaces are often `git clone`d repositories — someone can drop a `.dsh-meow/memory.db` or `PROJECT.md` into a repo and have the AI inject attacker-written soul/user/global rules as if they were the user's long-term memory.
+
+0.32 rules:
+
+- the plugin trusts only stores **it created**, or those carrying a valid `.owner.json` marker. The marker must satisfy all of: `schema=1`; `installId` equal to this machine's **random install id** (persisted at `$DSH_HOME/storages/meow-memory/install-id`, not a machine fingerprint); and a recorded `workspace` matching the current workspace. Forged markers, other-machine markers and markers moved to another workspace path are rejected; if the install id cannot be persisted, marker verification is **fail-closed**;
+- **only when the `memory.db` file does not exist at all** is it created and trusted. **Any pre-existing `memory.db` — even a schema-only / row-empty one — is untrusted by default** (closes the "pre-seeded empty DB + SQLite triggers" poisoning path);
+- an untrusted store is **never opened by normal chat turns**: no schema upgrade, no index creation, no migration, no read — only one read-only trust probe touches the file. Its content is not injected, and **all memory tools (read and write), dream and reflection are refused**; a one-time notice explains how to trust it (`security.trustWorkspaceMemory: true`);
+- until you explicitly trust it or delete/rename it. Only enable trust for a store you know is yours;
+- `autoMigrate` **now defaults to `false`**: a workspace's `PROJECT.md` is no longer imported automatically.
+
+### `memory_home` is query-only by default (#64-2 fix)
+
+`memory_home` is a tool the model can call directly. Upstream let it move the whole global directory (where logs / window index / migrate state live) — a filesystem side effect the model should not have.
+
+Since 0.32:
+
+- `security.allowHomeSwitch: false` by default; `memory_home` can **only query**, and switch requests are explicitly refused;
+- set `security.allowHomeSwitch: true` only if you want the model to be able to switch directories;
+- the prompt-override directory resolves from the fixed `$DSH_HOME/storages/meow-memory/prompts/`, **not** from `homeDir` / `memory_home` / `MEOW_MEMORY_HOME`, and the old location is no longer read (no fallback) — so switching directories can never change injected instructions.
+
+### Network and auth
+
+- The plugin makes **no outbound network requests** (no telemetry, no egress). Dream/reflection model requests go through the host's existing agent turns, not the plugin itself.
+- The 3 client-side local routes (`/meow-memory/dreamed-sessions` etc.) go through the host `connection.requestRejection` auth gate since 0.31.1: cross-site requests get 401/403; 503 when the auth service is missing.
+- `security.debugLogs` defaults to `false`: `perf.log` and settings/configEditor diagnostic dumps are not written by default (enable `security.debugLogs: true` or `MEOW_MEMORY_DEBUG=1` when troubleshooting). `dream-debug.log` **is still written by default**, but only minimal info (session ids / counts / skip reasons, no memory text), with 48h cleanup and 5MB rotation at startup; `apply-error.log` / `settings-register-error.log` are error-only. **Do not read this as "zero logs by default".**
+
+### Uninstalling leaves data behind (clean up manually)
+
+Uninstalling does not delete memories. When you no longer need them:
+
+```
+<workspace>/.dsh-meow/                      # memory.db, sessions/, .owner.json, .gitignore
+~/.dsh-meow/                                # or your configured homeDir: logs, window-index, migrate-state
+$DSH_HOME/storages/meow-memory/prompts/     # prompt instance overrides (if you added any)
+~/.dsh/storages/meow-memory-home.json       # memory_home switch pointer (may not exist)
+```
+
+---
+
+## Features
+
+- **Seven memory layers**: `soul` (the AI itself) / `user` / `project` (with `subcategory`) / `fact` / `lesson` / `topic` (with a goal sentence) / `rules`. One SQLite table per layer, time-prefixed ids.
+- **First-turn injection (long-term block)**: soul / user / global rules / memory guide are injected before the first user message as an independent plugin snapshot **without rewriting the user prompt**; **no keyword hits on turn 1** (hits start from message 2).
+- **Per-message keyword hits**: from the second user message, fact/lesson/rules/topic are matched by entry **keywords** (not full text), scoped to global + the current project anchor, injecting up to `hitTopK`. 0.32 adds a `minScore` threshold (default 0.35) and `hit_count` reinforcement; **this is still keyword matching — no vector/semantic retrieval**, badly-keyworded entries are silently unreachable.
+- **Current-project anchor**: passing a project parameter anchors the session's current project; unanchored sessions hit global entries only.
+- **Cache-friendly**: the static `meow-memory:guide` system-prompt section is registered once with constant text and cannot break the provider's prefix cache.
+- **Post-compaction re-injection**: after compaction the next turn re-injects the long-term snapshot, project panoramas queried this session, and entries written this session (bounded by `reinjectMaxChars`).
+- **Dedupe reality**: only **same-level**, bigram Jaccard ≥ 0.8 (near-identical wording) entries merge automatically. **Paraphrases do not merge**, cross-level contradictions are not detected — use `memory_find_similar` + `memory_update`/`memory_forget`.
+- **Per-window dream**: when a window is idle ≥ `idleMinutes` (default 3 h), off-peak and has a live agent, its main agent consolidates in three rounds (atomic / topic / project summary). Since 0.32 automatic dream **no longer `agents.resume()`s a bare agent** (#49 fix), has context-size and frequency caps, excludes archived rows, and caps entry lists. `/dream` or `memory_dream` consolidates on demand.
+- **Reflection**: after ≥ `reflectTurns` consecutive tool steps in one task the model is asked whether anything is worth remembering; a `memory_*` last tool suppresses it. 0.32 adds per-day and minimum-interval caps.
+- **Client UI**: injected text folds into a slim bar, reflection/dream turns fold into a card, session list shows dream icons. This depends on 0.2.x host internals and is best-effort — a host patch can silently disable it (cosmetic only).
+- **Zero runtime dependencies**: `node:sqlite` + self-contained esbuild bundle, no native modules.
+
+### What it cannot do (do not misunderstand)
+
+- **"Global" memory is only global within one workspace**: the store is per-workspace (cwd). Switching workspaces gives an empty store; opening from a subdirectory or a symlink creates a new one.
+- **No semantic retrieval**, only keyword matching. `hit_count` now affects ranking but never rewrites keywords automatically.
+- **Forgetting is an exponential half-life, not an Ebbinghaus review curve**: `retrieval.halfLifeDays` default 30 days, `exp(-ln2 × days/30)` with an importance≥3 floor of 0.85. Dream stamps `updated_at` at consolidation time, so the decay input is itself affected by consolidation.
+- **Dream still keeps its instructions/responses/tool calls in the main session history**: folding is visual only, tokens persist.
+- **`memory_home` switching is off by default**; when enabled it is still a model-callable tool — evaluate the risk yourself.
+
+---
+
+## Install
+
+**This fork is not published to the npm registry.** Three routes; `npm install meow-memory` installs **upstream 0.31.1**, not this repository.
+
+### Route A: local directory / tarball (recommended, no GitHub required)
+
+1. Build once in the repository (this repo does not commit `lib/`):
+
+   ```sh
+   npm install
+   npm run build        # → lib/index.js, lib/client.js, lib/prompts/
+   ```
+
+2. Either:
+   - **local directory**: GUI **Plugins → Add plugin**, enter the **absolute path** of this repository (the plugin manager accepts absolute local paths);
+   - **tarball**: `npm pack` produces `meow-memory-0.32.0.tgz`; enter the absolute path of that `.tgz`.
+3. Restart `dsh web` (or hot-reload the plugin). New sessions load it automatically.
+
+> Local `file:`/`link:` installs do not run `prepare`, so **build first**; a tarball already contains `lib/`.
+
+### Route B: manual profile install (any DSH install)
+
+1. Copy (or symlink/junction) the package into the profile's `node_modules/meow-memory`:
+
+   ```sh
+   mkdir -p ~/.dsh/profiles/<profile>/node_modules
+   ln -s /absolute/path/to/meow-memory ~/.dsh/profiles/<profile>/node_modules/meow-memory
+   ```
+
+   Windows: `New-Item -ItemType Junction ...` (NTFS junction, no admin needed).
+
+2. Add `meow-memory` to the profile `package.json`'s `dsh.profile.bundles`.
+3. Restart `dsh web`.
+
+### Route C: `github:` one-liner (**not recommended**)
+
+```sh
+dsh plugin --profile <profile> add github:<your-fork-url>
+```
+
+⚠️ A `github:` / git dependency installs **devDependencies and runs `prepare` (esbuild build)**. It needs GitHub reachability, pnpm build-script approval (≥10 blocks it, add `allowBuilds`), and resolvable `@deepseek-ai/dsh-*` devDeps. Any failure rolls back. Use route A unless you are specifically validating the build chain.
+
+### ⚠️ Upgrading from upstream 0.31: the old store is untrusted by default
+
+A `memory.db` created by upstream 0.31 has no `.owner.json` marker, so on first run this fork classifies it as **foreign / untrusted**: its content is not injected, memory tools (read/write), dream and reflection are refused, and a one-time "workspace memory store not trusted" notice appears. **Even an empty upstream DB counts as pre-existing and is untrusted by default.**
+
+To keep the old memories, do one of:
+
+- explicitly set `security.trustWorkspaceMemory: true` in the profile config and reload the plugin (only after confirming the store is yours);
+- or delete/rename the old `memory.db` and start fresh (back it up first — deletion is irreversible).
+
+### Remove
+
+```sh
+dsh plugin --profile <profile> remove meow-memory
+```
+
+**Memory data is not deleted**; see the [security model](#security-model) for cleanup paths.
+
+---
+
+## Compatibility
+
+The environment this fork was actually verified on (not a "backward compatible with everything" claim):
+
+| Item | Value |
+|---|---|
+| Host | **DSH Desktop 0.2.1-rc.2** (Windows 11) |
+| Runtime | Electron 44.7.0 / Node **24.21.0**, `node:sqlite` available |
+| Verified | Isolated instance loads; 3 `/meow-memory/*` routes return 200 with auth / 401 without; settings namespace appears; no apply error. **Real LLM conversation turns / tool calls were not exercised in the isolated instance** (no credentials) |
+| Not verified | **0.1.x hosts** (this fork has not tested them; the "supports dsh 0.1.5" claim is removed); other 0.2.x patch releases |
+
+Known compatibility risks (upstream findings, unchanged by this fork):
+
+- **Settings save path**: after the 0.2.x settings service redesign the plugin takes a degraded path. The page renders, but "edit → save → reload → applied" was not verified in this fork; worst case values display but do not reach apply. Run the [self-check](#self-check-after-install) after installing.
+- **Client UI** (fold bars / moon icons / menu panel) depends on 0.2.x `ChatSnapshot` internals and DOM observation; a host patch may silently disable it (cosmetic only).
+- `node:sqlite` requires **Node ≥ 22.13** (22.5–22.12 needs `--experimental-sqlite`).
+
+---
+
+## Configuration
+
+All fields are optional. **The new 0.32 `security` / `budget` / `retrieval` groups are config-file only** (profile patch or `cordis.patch.yml`); the settings page still covers the 0.31 fields (settings-page code is outside this hardening pass).
+
+```yaml
+- id: meow-memory
+  name: 'meow-memory'
+  config:
+    enabled: true
+    projectDir: '.dsh-meow'
+    promptLang: 'zh'          # set explicitly on first use
+    hitTopK: 2
+    autoMigrate: false        # changed in 0.32: no automatic PROJECT.md import
+    security:
+      trustWorkspaceMemory: false   # trust a pre-existing memory.db (including empty/schema-only)
+      allowHomeSwitch: false        # allow memory_home to switch the global directory (query-only by default)
+      autoGitignore: true           # write/complete .dsh-meow/.gitignore (self-ignoring)
+      debugLogs: false              # perf/settings diagnostics off (dream-debug still writes minimal lines)
+    budget:
+      snapshotMaxChars: 6000        # first-turn snapshot cap (chars)
+      hitMaxChars: 1500             # per keyword-hit entry cap (chars)
+      reinjectMaxChars: 8000        # post-compaction re-injection cap (chars)
+      dreamMaxContextTokens: 40000  # skip automatic dream/reflection above this context estimate
+      dreamMaxPerWindowPerDay: 1    # automatic dream frequency cap
+      reflectMaxPerDay: 6           # daily reflection cap
+      reflectMinIntervalMinutes: 20 # minimum interval between reflections
+    retrieval:
+      halfLifeDays: 30              # exponential half-life (days)
+      minScore: 0.35                # keyword-hit injection threshold
+      hitBoost: true                # hit-count reinforcement
+      importanceWeight: true        # importance participates in ranking
+    dream:
+      enabled: true
+      idleMinutes: 180
+```
+
+**Every field, type, default and effect is in [docs/configuration-reference.md](docs/configuration-reference.md)** (including `titleMax` / `homeDir` / `disabledWorkspaces` / `backup` / `delegate`).
+
+> ⚠️ **Set `promptLang` explicitly on first use.** It decides the language of injected/reflection/dream prompts and tool descriptions, and shapes the language the model writes entries in — keywords are extracted per entry language. Built in: `zh` / `en` / `pt-br`. The value *is* the subdirectory name and is matched **verbatim**: a nonexistent value (e.g. `pt`) raises nothing and silently falls back to Chinese.
 
 ### UI language
 
-The plugin's UI copy follows DSH's Settings → General → Language (built in: 中文 / English / Português (Brasil)) and is a separate layer from `promptLang`; the two do not interfere. See [docs/configuration-reference.md](docs/configuration-reference.md).
+The plugin's UI copy follows DSH's Settings → General → Language (中文 / English / Português (Brasil)) — a separate layer from `promptLang`.
 
-## 🧠 How it works
+---
+
+## How it works
 
 ```
-First user message (turn 1)      Every message from turn 2            idle ≥3h, not peak
-┌────────────────────┐          ┌────────────────────┐        ┌──────────────────────┐
-│ ===== 长期记忆 ===== │          │ 可能相关的记忆，仅供  │        │ per-window dream:     │
-│ 【关于你】(soul)     │          │ 参考：keyword hits    │        │ three rounds (atomic/ │
-│ 【关于user】         │          │ top-2 (global +     │        │ topic, summary), 7+   │
-│ 【设计原则】(rules)   │          │ current-project     │        │ extracted, updated_at │
-│ 【记忆导引】          │          │ anchor)            │        │ stamped at T          │
-└────────────────────┘          └────────────────────┘        └──────────────────────┘
-independent snapshot message    seen ids recorded
-↓ pristine user prompt          per session (sessions/<id>.json)
-  injected once per             compaction signal → seen released
-  session, no hits on turn 1
+First user message (turn 1)      Every message from turn 2             idle ≥3h + off-peak + live agent
+┌────────────────────┐          ┌────────────────────┐               ┌──────────────────────┐
+│ ===== long-term =====│          │ possibly relevant,   │               │ per-window dream:     │
+│ [about you] (soul)   │          │ for reference only:  │               │ three rounds (incl.   │
+│ [about user]         │          │ keyword hits         │               │ project summary)      │
+│ [principles] (rules) │          │ top-K + minScore     │               │ context/frequency caps│
+│ [memory guide]       │          │ (global + project)   │               └──────────────────────┘
+└────────────────────┘          └────────────────────┘                consolidation turns stay
+independent snapshot            seen ids recorded per session          in main-session history
+↓ pristine user prompt          sessions/<id>.json                     (UI folding ≠ no tokens)
+once per session,               compaction → release seen + re-inject
+no hits on turn 1
 ```
 
-### Tools
+### Tools (10 in 0.32)
 
-| Tool | Purpose |
-|---|---|
-| `memory_remember` | Write one memory (content/project/keywords/importance required; dedups and merges) |
-| `memory_search` | Keyword search (BM25 × recency; level/project/status/days filters) |
-| `memory_project` | Fetch a project's whole-project injection paragraph (**`project` parameter required**) |
-| `memory_find_similar` | Duplicate & conflict detection |
-| `memory_read` | Read one entry's complete metadata by id |
-| `memory_update` | Correct status / importance / goal / keywords |
-| `memory_dream` | Manually trigger this window's consolidation |
-| `memory_home` | Inspect / switch the global data directory |
+| Tool | Band | Purpose |
+|---|---|---|
+| `memory_remember` | write | Write a memory (content/project/keywords/importance required; near-identical duplicates merge) |
+| `memory_search` | read | BM25 × exponential-recency search, with `explain` and level/project/status/days filters |
+| `memory_project` | read | Fetch a project's complete injection paragraph (`project` required) |
+| `memory_find_similar` | read | Duplicate & conflict detection |
+| `memory_read` | read | Read one entry's complete metadata by id |
+| `memory_update` | write | Fix status / importance / goal / keywords / content |
+| `memory_list` | read | **new in 0.32**: list ids/titles/keywords/status/timestamps, no bodies; supports level/project/status/limit/offset |
+| `memory_forget` | write | **new in 0.32**: archive/restore/delete by id. Archives by default; `mode:'delete'` hard-deletes and requires `confirm:true` |
+| `memory_dream` | write | Manually trigger this window's consolidation (same as `/dream`) |
+| `memory_home` | directory | Inspect the global data directory; **query-only by default since 0.32**, requires `security.allowHomeSwitch: true` to switch |
 
-There is also the `/dream` command: type `/dream` in the composer to consolidate this window right away, immune to peak-hour suppression.
+**Parameters, returns and side effects: [docs/tool-reference.md](docs/tool-reference.md)**.
 
-**Parameters, returns and side effects are in [docs/tool-reference.md](docs/tool-reference.md)** (including `memory_project`'s anchoring side effect and `memory_home`'s three preset directory markers).
+---
 
-## 🛠 Development
+## Development and testing
 
 ```sh
 npm install
-npm run build          # esbuild bundle → lib/index.js (self-contained)
-npm run test           # 228 logic tests: db / bm25 / migrate / inject / reflect / dream / tools / apply
+npm run build          # esbuild bundle → lib/index.js / lib/client.js (self-contained)
+npm run test           # build + language-pack check + full assertions (host + client suites)
+node scripts/check-lang.mjs en       # check one prompt language pack
 ```
 
-The `@deepseek-ai/*` packages live in the dsh-meow pnpm workspace, not in this package's
-`node_modules`. On Windows, `npm run link-workspace` (or `scripts/link-workspace.ps1`)
-creates junction mirrors of the workspace packages so esbuild can resolve them;
-`build.mjs` uses `nodePaths` to pick them up. The links are build-time only.
+Test assertions: `npm test` **1028 all green** (host 668 + client 360), 0 failed; plus 29 in `node smoke.mjs`; `scripts/check-lang.mjs` validates the en/pt-br packs (11 slots aligned).
 
-## 📚 Documentation
+The `@deepseek-ai/*` packages live in the dsh-meow pnpm workspace, not in this package's `node_modules`. On Windows, `npm run link-workspace` creates junction mirrors so esbuild can resolve them (build-time only).
+
+### Self-check after install
+
+1. One normal conversation turn: does the first turn show a long-term-memory fold bar? (No → the plugin is not running.)
+2. Change a setting → save → hot-reload the plugin → did the value apply? (Checks the 0.2.x settings drift.)
+3. After `/dream`, keep chatting: is the tool count normal? (Guards #66.)
+4. After a reflection turn, check the model selector: still the main model? (#71 can trigger only with `delegate.model` set.)
+5. Open a session in a cloned, untrusted repository: no long-term memory you did not write should appear (untrusted store + no auto-migration).
+
+---
+
+## Documentation
 
 | To learn about | Read |
 | --- | --- |
-| The seven tools: parameters, returns and side effects | [docs/tool-reference.md](docs/tool-reference.md) |
+| Parameters, returns and side effects of the 10 tools | [docs/tool-reference.md](docs/tool-reference.md) |
 | Every configuration field, type and default | [docs/configuration-reference.md](docs/configuration-reference.md) |
-| Why it is designed this way (cache, hits, dream, pitfalls) | [docs/design-notes.md](docs/design-notes.md) |
-| Install failures, poor search results, how to read errors | [docs/troubleshooting.md](docs/troubleshooting.md) |
-| Version history | [CHANGELOG.md](CHANGELOG.md) |
+| Why it is designed this way (cost and trade-offs) | [docs/design-notes.md](docs/design-notes.md) |
+| Install failures, poor recall, how to read errors | [docs/troubleshooting.md](docs/troubleshooting.md) |
+| Version history and known unfixed issues | [CHANGELOG.md](CHANGELOG.md) |
 | Adding a UI language | [src/i18n/README.md](src/i18n/README.md) |
 | Adding a prompt language pack | [src/prompts/README.md](src/prompts/README.md) |
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
-Thanks to every contributor who made meow-memory better:
+Most of the code comes from upstream and these contributors (original attribution kept):
 
 - **[daveycodez](https://github.com/daveycodez)** — English language pack & tokenizer ([PR #6](https://github.com/Phant0Meow/dsh-meow-memory/pull/6), shipped in v0.22.0)
 - **[chenmzh](https://github.com/chenmzh)** — isolated memory injections into independent plugin snapshot messages, fixing session title pollution ([PR #10](https://github.com/Phant0Meow/dsh-meow-memory/pull/10))
 - **[cuddly-guacamole](https://github.com/cuddly-guacamole)** — dual-version Session events compatibility for dsh 0.1.2-alpha.4 ([PR #11](https://github.com/Phant0Meow/dsh-meow-memory/pull/11))
-- **[coutogilson](https://github.com/coutogilson)** — Brazilian Portuguese prompt pack (`src/prompts/pt-br/`) and the UI copy layer that follows the DSH locale
+- **[coutogilson](https://github.com/coutogilson)** — Brazilian Portuguese prompt pack and the UI copy layer
 
-## 📄 License
+0.32 hardening changes (trust gates, budget caps, dream/reflection frequency, retrieval formula, management tools, documentation rewrite) are listed in [CHANGELOG.md](CHANGELOG.md).
 
-MIT — see [LICENSE](LICENSE).
+## License
+
+MIT — see [LICENSE](LICENSE). Upstream copyright belongs to the author of `Phant0Meow/dsh-meow-memory`; this fork keeps the original LICENSE and attribution.

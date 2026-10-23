@@ -26,7 +26,7 @@ import z from '@deepseek-ai/schemastery'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { backupMemoryDb, closeAllDbs, getDb, memoryDbPath } from './db.js'
+import { backupMemoryDb, closeAllDbs, ensureMemoryStore, getDb, memoryDbPath, storeTrustOf, type Level, type StoreTrust } from './db.js'
 import { parseModelSpec, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER, type AgentOptionsSpec } from './delegate.js'
 import { CONFIG_DEFAULTS } from './defaults.js'
 import { activeHomeDir, homeDirPresets, resolveHomeDir, switchHomeDir } from './home-dir.js'
@@ -50,9 +50,9 @@ import {
 } from './dream.js'
 import { buildHitInjection, buildInjection, buildReinjection, clearReinjectPending, isReinjectPending, markAccessed, markReinjectPending, markSearched, readProjectQueried, readSeen, readInjected, releaseSeen } from './inject.js'
 import { migrateLegacy } from './migrate.js'
-import { buildReflectMessage, consecutiveToolSteps, PLUGIN_SOURCE, REFLECT_MARKER, scanTurn } from './reflect.js'
+import { buildReflectMessage, checkReflectBudget, consecutiveToolSteps, PLUGIN_SOURCE, recordReflectSent, REFLECT_MARKER, scanTurn } from './reflect.js'
 import { isMeowSource } from './source.js'
-import { registerMemoryTools, setMemoryToolGate } from './tools.js'
+import { registerMemoryTools, setMemoryBudgetOptions, setMemoryRetrievalOptions, setMemoryToolGate } from './tools.js'
 import { authGate, connectionAuthOf } from './auth-gate.js'
 import { resolveSlotText, setPromptLang } from './prompt-loader.js'
 
@@ -60,6 +60,8 @@ import { resolveSlotText, setPromptLang } from './prompt-loader.js'
 const WELCOME_GUIDE_SEEN_ID = '__welcomeGuide__'
 /** 首建提示的 accessed 哨兵（issue #37 增量①；per-session 至多一次）。 */
 const FIRST_CREATE_NOTICE_SEEN_ID = '__firstCreateNotice__'
+/** 0.32 不可信工作区提示的 accessed 哨兵（per-session 至多一次）。 */
+const UNTRUSTED_STORE_SEEN_ID = '__untrustedStore__'
 import { collectDreamStates, headerOf, DreamStateBroadcast, type PersistedSessionLike } from './dream-signal.js'
 
 export const name = 'meow-memory'
@@ -128,6 +130,9 @@ let evtCount = 0
 let perfBoot = Date.now()
 let lastPerfLog = Date.now()
 function perf(msg: string): void {
+  // 0.32：性能诊断默认关（与 settings-diag 同一总闸；排障时 MEOW_MEMORY_DEBUG=1 或
+  // security.debugLogs: true）。dream-debug.log 是成本/触发链排障日志，仍保留但会轮转。
+  if (!diagOn()) return
   try {
     const file = join(activeHomeDir(), 'perf.log') // 动态取：全局目录热切换后下一笔即落新目录
     mkdirSync(dirname(file), { recursive: true })
@@ -154,7 +159,7 @@ function perfEvent(): void {
 // 刷新 mtime，天然防误删活日志。单文件失败（占用/权限）静默跳过，下次启动再试。
 const LOG_RETENTION_MS = 48 * 60 * 60 * 1000
 const PERF_LOG_ROTATE_BYTES = 5 * 1024 * 1024
-const HOME_LOGS = ['perf.log', 'perf.log.old', 'settings-register-error.log', 'apply-error.log']
+const HOME_LOGS = ['perf.log', 'perf.log.old', 'settings-register-error.log', 'apply-error.log', 'settings-diag.log', 'dream-debug.log']
 
 /** 启动清扫：白名单日志距上次写入超 48h 的删除；perf.log 超 5MB 轮转成 .old
  *  （覆盖上一代，历史保一代）。只在 apply（启动/热重载）时跑——废弃日志只有
@@ -185,7 +190,25 @@ export function sweepHomeLogs(dir = activeHomeDir(), now = Date.now()): { swept:
   } catch {
     /* 不存在（刚被 48h 清掉）/被另一实例占用：跳过，下次启动再轮转 */
   }
+  // dream-debug.log 同样按大小轮转（默认每次 dream/注入轮一行，长期窗口会堆积）。
+  try {
+    const cur = join(dir, 'dream-debug.log')
+    if (statSync(cur).size > PERF_LOG_ROTATE_BYTES) {
+      renameSync(cur, join(dir, 'dream-debug.log.old'))
+      rotated = true
+    }
+  } catch {
+    /* 同上 */
+  }
   return { swept, rotated }
+}
+
+/** 0.32 诊断日志总闸：默认关（安全审计 P1——旧宿主分支会把所有插件的原始配置
+ *  dump 到全局目录的 settings-diag.log）。排障时设环境变量 MEOW_MEMORY_DEBUG=1，
+ *  或在 profile 配置里设 security.debugLogs: true（resolved 之后生效）。 */
+let debugLogsEnabled = process.env.MEOW_MEMORY_DEBUG === '1' || process.env.MEOW_MEMORY_DEBUG === 'true'
+function diagOn(): boolean {
+  return debugLogsEnabled
 }
 
 /** homeDirPresets 的启动期快照（模块加载时取一次；异常回空表——meta 缺席只损失
@@ -225,8 +248,44 @@ const config = z.object({
   reflect: z.boolean().default(true),
   /** 单任务内连续工具 step 达到该值才在结束时触发反思（用户拍板：react ≥7 轮）。 */
   reflectTurns: z.number().min(1).max(50).default(7),
-  /** 首次打开库时自动迁移旧 PROJECT.md。 */
-  autoMigrate: z.boolean().default(true),
+  /** 首次打开库时自动迁移旧 PROJECT.md。0.32 起默认 false：工作区里来路不明的
+   *  PROJECT.md 不得零交互导入（安全审计 #64-1）；需要时显式打开并确认工作区可信。 */
+  autoMigrate: z.boolean().default(false),
+  /** 安全闸（0.32）：工作区已有但非本插件创建的 memory.db 默认不信任；memory_home
+   *  默认只读，不许模型自行搬全局目录（安全审计 #64-2）。改这些字段需重载插件。 */
+  security: z
+    .object({
+      /** 信任工作区里已有的非本插件创建的 memory.db（首轮 soul/user/全局 rules 会被注入）。 */
+      trustWorkspaceMemory: z.boolean().default(false),
+      /** 允许模型经 memory_home 切换全局数据目录（默认否，防 prompt 覆盖层/目录被接管）。 */
+      allowHomeSwitch: z.boolean().default(false),
+      /** 创建记忆目录时写自忽略 .gitignore（内容 `*`），防止 memory.db 被 git 提交。 */
+      autoGitignore: z.boolean().default(true),
+      /** 详细诊断日志（settings-diag/apply-error/perf 等）。默认关，排障时再开。 */
+      debugLogs: z.boolean().default(false),
+    })
+    .default({}),
+  /** 注入/整理预算（0.32）：给默认自动行为设上限，避免 token 无界增长。 */
+  budget: z
+    .object({
+      snapshotMaxChars: z.number().min(500).max(60000).default(6000),
+      hitMaxChars: z.number().min(200).max(20000).default(1500),
+      reinjectMaxChars: z.number().min(500).max(60000).default(8000),
+      dreamMaxContextTokens: z.number().min(4000).max(400000).default(40000),
+      dreamMaxPerWindowPerDay: z.number().min(0).max(24).default(1),
+      reflectMaxPerDay: z.number().min(0).max(100).default(6),
+      reflectMinIntervalMinutes: z.number().min(0).max(1440).default(20),
+    })
+    .default({}),
+  /** 检索/遗忘参数（0.32）：指数半衰、命中反馈、查询覆盖率、最低分门槛。 */
+  retrieval: z
+    .object({
+      halfLifeDays: z.number().min(1).max(3650).default(30),
+      minScore: z.number().min(0).max(1).default(0.35),
+      hitBoost: z.boolean().default(true),
+      importanceWeight: z.boolean().default(true),
+    })
+    .default({}),
   /** prompt 语言（prompts/<lang>/ 语言包目录名）：决定注入/反思/dream 文案、工具
    *  描述与 BM25 分词的语言。**首次使用建议显式配置**——记忆条目语言必须与 BM25
    *  关键词语言一致，否则检索匹配率崩（详见 README）。zh=内置默认；en 等社区语言包
@@ -251,6 +310,8 @@ const config = z.object({
       timeZone: z.string().default('Asia/Shanghai'),
       /** rules 防 churn（测评 2026-08-25）：updated_at 距今超该天数的稳定准则不进 dream 第 1 轮清单；0=不过滤。 */
       rulesReviewDays: z.number().min(0).default(DEFAULT_RULES_REVIEW_DAYS),
+      /** 0.32：自动 dream 只在窗口有活 agent 时跑；绝不 agents.resume()（修 #49）。 */
+      requireLiveAgent: z.boolean().default(true),
     })
     .default({}),
   /** 记忆停用工作区名单（#28）：cwd 精确匹配（路径归一：斜杠统一 + 去尾斜杠 + 大小写
@@ -418,6 +479,30 @@ interface ResolvedConfig {
   backup: { enabled: boolean }
   /** 工作区停用名单（#28）：原样保留，判定时路径归一。 */
   disabledWorkspaces: string[]
+  /** 安全闸（0.32）：注册期消费（改需重载）。 */
+  security: {
+    trustWorkspaceMemory: boolean
+    allowHomeSwitch: boolean
+    autoGitignore: boolean
+    debugLogs: boolean
+  }
+  /** 注入/整理预算（0.32）：注册期消费（改需重载）。 */
+  budget: {
+    snapshotMaxChars: number
+    hitMaxChars: number
+    reinjectMaxChars: number
+    dreamMaxContextTokens: number
+    dreamMaxPerWindowPerDay: number
+    reflectMaxPerDay: number
+    reflectMinIntervalMinutes: number
+  }
+  /** 检索/遗忘参数（0.32）。 */
+  retrieval: {
+    halfLifeDays: number
+    minScore: number
+    hitBoost: boolean
+    importanceWeight: boolean
+  }
 }
 
 function resolveConfig(config: unknown): ResolvedConfig {
@@ -425,6 +510,9 @@ function resolveConfig(config: unknown): ResolvedConfig {
   const d = (c.dream ?? {}) as Partial<DreamConfig>
   const dg = (c.delegate ?? {}) as { reflect?: boolean; model?: string }
   const bk = (c.backup ?? {}) as { enabled?: boolean }
+  const sec = (c.security ?? {}) as Partial<ResolvedConfig['security']>
+  const bud = (c.budget ?? {}) as Partial<ResolvedConfig['budget']>
+  const ret = (c.retrieval ?? {}) as Partial<ResolvedConfig['retrieval']>
   return {
     enabled: c.enabled ?? true,
     projectDir: c.projectDir ?? '.dsh-meow',
@@ -433,7 +521,7 @@ function resolveConfig(config: unknown): ResolvedConfig {
     titleMax: c.titleMax ?? 40,
     reflect: c.reflect ?? true,
     reflectTurns: c.reflectTurns ?? 7,
-    autoMigrate: c.autoMigrate ?? true,
+    autoMigrate: c.autoMigrate ?? false,
     promptLang: typeof c.promptLang === 'string' && c.promptLang.trim() ? c.promptLang.trim() : undefined,
     dream: {
       enabled: d.enabled ?? true,
@@ -443,6 +531,13 @@ function resolveConfig(config: unknown): ResolvedConfig {
       checkMinutes: d.checkMinutes ?? 15,
       timeZone: d.timeZone ?? 'Asia/Shanghai',
       rulesReviewDays: d.rulesReviewDays ?? DEFAULT_RULES_REVIEW_DAYS,
+      requireLiveAgent: (d as { requireLiveAgent?: boolean }).requireLiveAgent ?? true,
+      budget: {
+        dreamMaxContextTokens: bud.dreamMaxContextTokens ?? 40000,
+        dreamMaxPerWindowPerDay: bud.dreamMaxPerWindowPerDay ?? 1,
+        reflectMaxPerDay: bud.reflectMaxPerDay ?? 6,
+        reflectMinIntervalMinutes: bud.reflectMinIntervalMinutes ?? 20,
+      },
     },
     delegate: (() => {
       // 反思/梦境永远 steer（主窗口执行，v0.24 拍板）；modelSpec 仅供 agent/request
@@ -454,6 +549,27 @@ function resolveConfig(config: unknown): ResolvedConfig {
       : [],
     backup: {
       enabled: bk.enabled ?? false,
+    },
+    security: {
+      trustWorkspaceMemory: sec.trustWorkspaceMemory ?? false,
+      allowHomeSwitch: sec.allowHomeSwitch ?? false,
+      autoGitignore: sec.autoGitignore ?? true,
+      debugLogs: sec.debugLogs ?? false,
+    },
+    budget: {
+      snapshotMaxChars: bud.snapshotMaxChars ?? 6000,
+      hitMaxChars: bud.hitMaxChars ?? 1500,
+      reinjectMaxChars: bud.reinjectMaxChars ?? 8000,
+      dreamMaxContextTokens: bud.dreamMaxContextTokens ?? 40000,
+      dreamMaxPerWindowPerDay: bud.dreamMaxPerWindowPerDay ?? 1,
+      reflectMaxPerDay: bud.reflectMaxPerDay ?? 6,
+      reflectMinIntervalMinutes: bud.reflectMinIntervalMinutes ?? 20,
+    },
+    retrieval: {
+      halfLifeDays: ret.halfLifeDays ?? 30,
+      minScore: ret.minScore ?? 0.35,
+      hitBoost: ret.hitBoost ?? true,
+      importanceWeight: ret.importanceWeight ?? true,
     },
   }
 }
@@ -657,7 +773,7 @@ const SETTINGS_SOURCE_WAIT_MS = 250
 // 启动调用）保持冻结：热改需要 dispose+重入，设置页按「需重载」语义对待（#26 同口径）。
 
 const LIVE_CONFIG_KEYS = ['hitTopK', 'titleMax', 'reflect', 'reflectTurns', 'autoMigrate', 'promptLang', 'disabledWorkspaces'] as const
-const LIVE_DREAM_KEYS = ['enabled', 'idleMinutes', 'suppressWindows', 'suppressLeadMinutes', 'checkMinutes', 'timeZone', 'rulesReviewDays'] as const
+const LIVE_DREAM_KEYS = ['enabled', 'idleMinutes', 'suppressWindows', 'suppressLeadMinutes', 'checkMinutes', 'timeZone', 'rulesReviewDays', 'requireLiveAgent', 'budget'] as const
 
 /** 工作区路径归一（#28 匹配口径）：斜杠统一、去尾斜杠、大小写不敏感（Windows 盘符
  *  友好）。导出供测试直调。 */
@@ -806,7 +922,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       // 栈定位 configEditor 内具体抛点）落盘 settings-diag.log。仅加日志不改行为。
       // 必须在 installSectionCompat 之前装配：0.1.7 的服务无 installSection/register，
       // compat 会抛「neither」被 cordis 静默吞掉——那本身就是关键诊断信号，也要留痕。
-      try {
+      if (diagOn()) try {
         const svc = settingsCtx.settings as unknown as Record<string, unknown>
         const proto = Object.getPrototypeOf(svc) as { write?: (...args: unknown[]) => unknown; __writeProbe?: boolean }
         if (proto !== undefined && typeof proto.write === 'function' && proto.__writeProbe !== true) {
@@ -833,8 +949,10 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
         /* 取证壳装配失败忽略 */
       }
       // 宿主 configEditor 侧直接取证（write 的第一道门）：entries 的真实清单
-      try {
-        const ce = (svc as unknown as { ownerContext?: { configEditor?: { entries?: () => Array<Record<string, unknown>> } } }).ownerContext?.configEditor
+      if (diagOn()) try {
+        // 注意：`svc` 是上一个 if(diagOn()) 块的局部变量，这里必须重新取，
+        // 否则 debugLogs=true 时抛 ReferenceError 被 catch 吞掉（0.32 review 实测）。
+        const ce = (settingsCtx.settings as unknown as { ownerContext?: { configEditor?: { entries?: () => Array<Record<string, unknown>> } } }).ownerContext?.configEditor
         if (ce && typeof ce.entries === 'function') {
           const rows = ce.entries().map((entry) => {
             const o = entry as Record<string, any>
@@ -878,7 +996,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       // 宿主视角的三层配置 dump：SettingsForms.describe 的 meow-memory 视图
       // （value=最终生效 / base=出厂+patch / user=设置页层）。describe 无副作用，
       // 启动即采一次 + 5 秒后再采一次（等 entry 激活）。
-      try {
+      if (diagOn()) try {
         const svcAny = settingsCtx.settings as unknown as { describe?: () => unknown }
         if (typeof svcAny.describe === 'function') {
           const dumpDescribe = (): void => {
@@ -1039,7 +1157,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   // 节点/fiber 状态/Config 挂载，落 settings-diag.log。0.1.6 无此服务 → inject
   // 挂起不回调，天然跳过。诊断失败绝不影响插件启动。
   try {
-    ctx.inject(['configEditor'], (ce: {
+    if (diagOn()) ctx.inject(['configEditor'], (ce: {
       entries: () => Array<{ options?: { id?: unknown }; fiber?: { state?: unknown; runtime?: unknown }; parent?: { tree?: { ctx?: { fiber?: { entry?: { id?: unknown } } } } } }>
     }) => {
       try {
@@ -1063,7 +1181,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   // write 抛错只回 code 不回 message——在同进程内给原型方法包一层取证壳，把原始
   // 异常（含 message/栈，栈可定位 configEditor 内具体抛点）原样落盘。仅加日志不改
   // 行为；settings 服务不存在（0.1.6 老链/未装配）时静默跳过。
-  try {
+  if (diagOn()) try {
     const settingsSvc = (ctx as unknown as { get?: (name: string) => unknown }).get?.('settings') as
       | { write?: (...args: unknown[]) => unknown }
       | undefined
@@ -1107,6 +1225,8 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   const readLiveConfig = liveConfigReader(config, () => settingsGet?.() as Record<string, unknown> | undefined, SETTINGS_SOURCE_WAIT_MS)
   const resolved = applyLiveConfig(resolveConfig(merged), readLiveConfig)
   resolvedView = resolved
+  // 0.32：诊断日志总闸可由 profile 配置打开（需重载生效）；环境变量 MEOW_MEMORY_DEBUG=1 优先。
+  debugLogsEnabled = debugLogsEnabled || resolved.security.debugLogs
   if (sourceWaitArmed && settingsGet === undefined) {
     ctx.logger.warn('meow-memory: settings 服务在有界等待内未就绪——注册期字段本次启动按 patch 层默认值生效（需重载纠正）；热字段（注入/反思/dream）会在命名空间就绪后自动纠正（issue #26）')
   }
@@ -1117,6 +1237,8 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   const workspaceDisabled = (ws: string): boolean => workspaceDisabledMatch(readLiveConfig().disabledWorkspaces, ws)
   const memoryReadOff = (ws: string, sid: string): boolean => {
     if (workspaceDisabled(ws)) return true
+    // 0.32 安全闸：未受信工作区库不打开、不读（连 getDb 触发的 schema 升级/索引写入都不做）。
+    if (!trustOf(ws).trusted) return true
     if (!existsSync(memoryDbPath(ws, resolved.projectDir))) return false
     try {
       return getDb(ws, resolved.projectDir).getMemoryScope(sid).inject
@@ -1127,6 +1249,36 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   // ── 全局目录解析+切换（含首迁/回迁）：必须先于 sweep/loadWindowIndex——它们吃新目录。
   // disabled 检查之前执行：插件停用时配置变更也要生效（switchHomeDir 幂等，重复启动无害）。
   logHomeDirSwitch(ctx, switchHomeDir(resolveHomeDir(resolved.homeDir)))
+  // ── 工作区记忆库信任判定（0.32 安全闸，审计 #64-1）────────────────────────────
+  // 首次用到某工作区时：建目录、写自忽略 .gitignore、写 .owner.json 所有权标记。
+  // 非本插件创建的非空 memory.db 默认不信任 → 跳过它的 soul/user/全局 rules 注入与
+  // 工具读；用户确认安全后可显式 security.trustWorkspaceMemory: true。
+  const trustCache = new Map<string, StoreTrust>()
+  const trustOf = (ws: string): StoreTrust => {
+    const cached = trustCache.get(ws)
+    if (cached !== undefined) return cached
+    let trust: StoreTrust
+    try {
+      trust = ensureMemoryStore(ws, resolved.projectDir, {
+        autoGitignore: resolved.security.autoGitignore,
+        trustWorkspaceMemory: resolved.security.trustWorkspaceMemory,
+      })
+    } catch (e) {
+      ctx.logger.warn(`meow-memory: 记忆库信任判定失败（按不可信处理）: ${e instanceof Error ? e.message : String(e)}`)
+      trust = { trusted: false, reason: 'foreign' }
+    }
+    trustCache.set(ws, trust)
+    if (!trust.trusted) {
+      ctx.logger.warn(`meow-memory: 工作区已有非本插件创建的记忆库（${ws}${resolved.projectDir}），默认不信任：不自动注入其内容、工具读被拒。确认安全后可在配置里设 security.trustWorkspaceMemory: true。`)
+    }
+    return trust
+  }
+  /** 0.32：dream 调试日志统一落全局目录（不再往每个工作区写日志、不随工作区进 git）。 */
+  const dreamLog = (line: string): void => {
+    try {
+      appendFileSync(join(activeHomeDir(), 'dream-debug.log'), `[${new Date().toISOString()}] ${line}\n`)
+    } catch { /* 日志失败不阻塞 */ }
+  }
   // 诊断（issue #26）：把「设置源是否赶上」与关键解析值落到启动日志——配置不生效类
   // 报告先看这一行：sourceReady=否 即冷启动竞态（settings 服务晚于等待上限就绪）。
   ctx.logger.info(`meow-memory: config resolved (sourceReady=${settingsGet !== undefined}, enabled=${resolved.enabled}, dream.enabled=${resolved.dream?.enabled ?? 'default'}, promptLang=${resolved.promptLang ?? 'zh'}, projectDir=${resolved.projectDir ?? '.dsh-meow'})`)
@@ -1148,7 +1300,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   // v0 会话一次性迁移（issue #13）：标记未迁移时体检全部会话并把 source.memory 搬进
   // sections.__meta__，完成后置位 .dsh-meow/migrate-v0-state.json，此后启动直接跳过。
   // fire-and-forget：绝不阻塞 dsh 启动；单文件失败只记日志（用户拍板 2026-09-10）。
-  void ensureV0SessionsMigrated(resolved.projectDir, (m) => ctx.logger.info(m)).catch((e: unknown) => {
+  void (resolved.autoMigrate ? ensureV0SessionsMigrated(resolved.projectDir, (m) => ctx.logger.info(m)) : Promise.resolve()).catch((e: unknown) => {
     ctx.logger.warn(`meow-memory: migrate-v0 failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`)
   })
   perf(`window-index restored ${windowIndex.size} windows`)
@@ -1162,11 +1314,13 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   setMemoryToolGate({
     refuseRead: (ws, sid) => {
       if (workspaceDisabled(ws)) return '记忆对该工作区已停用（disabledWorkspaces 名单）：memory 工具不可用，请更换工作区或调整配置。'
+      if (!trustOf(ws).trusted) return '该工作区的记忆库不是本插件创建的，默认不信任（不注入/不检索）。确认安全后可在 profile 配置 security.trustWorkspaceMemory: true 并重载插件；或先删除/改名该记忆库。'
       if (sid === null || !existsSync(memoryDbPath(ws, resolved.projectDir))) return null
       return getDb(ws, resolved.projectDir).getMemoryScope(sid).inject ? '此窗口已停止读入记忆（记忆参与开关）：注入与检索均已关闭。' : null
     },
     refuseWrite: (ws, sid) => {
       if (workspaceDisabled(ws)) return '记忆对该工作区已停用（disabledWorkspaces 名单）：写入被拒绝。'
+      if (!trustOf(ws).trusted) return '该工作区的记忆库不是本插件创建的，默认不信任（不写入，避免与来路不明的数据混用）。确认安全后可在 profile 配置 security.trustWorkspaceMemory: true 并重载插件。'
       if (sid === null || !existsSync(memoryDbPath(ws, resolved.projectDir))) return null
       if (isPluginTurn.get(sid) === true) return null // 整理轮豁免：整理轮写入跟随整理档（#38 联动）
       return getDb(ws, resolved.projectDir).getMemoryScope(sid).write ? '此窗口已停止写入记忆（记忆参与开关）。' : null
@@ -1175,7 +1329,15 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
   registerMemoryTools((t) => {
     const dispose = ctx.tools.register(t)
     if (typeof dispose === 'function') toolDisposers.push(dispose)
-  }, resolved.projectDir)
+  }, resolved.projectDir, { allowHomeSwitch: () => resolved.security.allowHomeSwitch })
+  // 0.32：memory_search 与命中链路共用同一套检索/遗忘参数。
+  setMemoryRetrievalOptions({
+    halfLifeDays: resolved.retrieval.halfLifeDays,
+    hitBoost: resolved.retrieval.hitBoost,
+    importanceWeight: resolved.retrieval.importanceWeight,
+  })
+  // 0.32：项目全景输出预算（与重注入同量级；防大项目一次塞满上下文）。
+  setMemoryBudgetOptions({ projectMaxChars: Math.max(2000, resolved.budget.reinjectMaxChars) })
   // 会话列表"已 dream"小月牙信号（用户拍板 2026-08-19）：dream 开始推 dreaming、
   // 完成推 dreamed、有新活动推 active。
   const broadcast = new DreamStateBroadcast(ctx.logger)
@@ -1337,6 +1499,9 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     const last = lastWindowWrite.get(sid) ?? 0
     if (now - last < 5000) return // 节流：5 秒内同窗口只写一次
     lastWindowWrite.set(sid, now)
+    // 0.32 安全闸（review R4）：未受信工作区库不打开、不写窗口表/索引——陌生库
+    // 连 schema 升级/索引创建都不该发生；windowIndex 等它受信后再由注入链建账。
+    if (!trustOf(cwd).trusted) return
     const db = getDb(cwd, resolved.projectDir)
     db.touchWindow(sid, cwd, event.time)
     // dream 状态信号：该会话有新活动 → 若曾 dream 过，推 active（去月亮；client 幂等忽略）。
@@ -1389,6 +1554,26 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     const userMsgs = decision.messages.filter((m: { source?: { kind?: string } }) => m.source?.kind === 'user')
     if (userMsgs.length === 0) return decision // 工具轮/纯插件消息：不注入
 
+    // 0.32 安全闸：未受信工作区先发一次提示（独立 notice），再按「读停用」跳过全部
+    // 注入路径——提示必须在 memoryReadOff 之前，否则被静默吞掉（测试/审计都要求可见）。
+    if (ws !== null && !trustOf(ws).trusted) {
+      try {
+        if (!readSeen(ws, sid, resolved.projectDir).has(UNTRUSTED_STORE_SEEN_ID)) {
+          markAccessed(ws, sid, [UNTRUSTED_STORE_SEEN_ID], resolved.projectDir)
+          let notice: string
+          try {
+            notice = resolveSlotText('untrusted-store', { projectDir: join(ws, resolved.projectDir), homePath: homedir() })
+          } catch {
+            notice = `本工作区已有非 meow-memory 创建的记忆库：${join(ws, resolved.projectDir)}\n出于安全考虑，本次不会注入其中的长期记忆。确认该库可信后，在 profile 配置里设置 security.trustWorkspaceMemory: true（或先删除/改名该库）再重载插件。`
+          }
+          const anchor = userMsgs[0]
+          const rewritten = [...decision.messages]
+          rewritten.splice(rewritten.indexOf(anchor), 0, createMemoryNoticeMessage(notice))
+          ctx.logger.warn(`meow-memory: untrusted workspace store notice injected (${shortSessionId(sid)})`)
+          return { ...decision, messages: rewritten }
+        }
+      } catch { /* 提示失败不阻塞注入链 */ }
+    }
     // 记忆门控（issue #38/#28）：本窗口「停止读入」或工作区被配置停用 → 跳过全部
     // 注入路径（重注入/首轮快照/引导/命中链）。读的入口统一在此封口。
     if (ws !== null && memoryReadOff(ws, sid)) return decision
@@ -1403,6 +1588,8 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       const reinj = buildReinjection(db, ws, sid, readProjectQueried(ws, sid, resolved.projectDir), {
         hitTopK: resolved.hitTopK,
         titleMax: resolved.titleMax,
+        trust: trustOf(ws),
+        reinjectMaxChars: resolved.budget.reinjectMaxChars,
       }, resolved.projectDir)
       clearReinjectPending(ws, sid, resolved.projectDir)
       if (reinj !== null) {
@@ -1422,17 +1609,14 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
         const evt = e as { type?: string; data?: { source?: { kind?: string } } }
         if (evt?.type === 'user/message' && evt.data?.source?.kind === 'user') priorUser++
       }
-      if (ws) {
-        try {
-          appendFileSync(join(ws, resolved.projectDir, 'dream-debug.log'), `[${new Date().toISOString()}] pre-step first pid=${process.pid} sid=${shortSessionId(sid)} priorUser=${priorUser} userMsgs=${userMsgs.length}\n`)
-        } catch { /* 日志失败不阻塞 */ }
-      }
+      if (ws) dreamLog(`pre-step first pid=${process.pid} sid=${shortSessionId(sid)} priorUser=${priorUser} userMsgs=${userMsgs.length}`)
       if (priorUser === 0) {
         // 会话首条消息：只注入长期记忆快照，不跑命中链路。
         if (ws) {
           const firstUser = userMsgs[0]
           const db = getDb(ws, resolved.projectDir)
-          if (resolved.autoMigrate && existsSync(join(ws, resolved.projectDir, 'PROJECT.md'))) {
+          // 0.32 安全闸：外来/未信任库连 PROJECT.md 迁移都不做（#64-1 的 PROJECT.md 向量）。
+          if (resolved.autoMigrate && trustOf(ws).trusted && existsSync(join(ws, resolved.projectDir, 'PROJECT.md'))) {
             const n = migrateLegacy(db, ws, resolved.projectDir)
             if (n !== null) ctx.logger.info(`meow-memory: migrated legacy PROJECT.md → SQLite (${n} entries)`)
           }
@@ -1443,6 +1627,8 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
           const injected = buildInjection(db, ws, sid, firstText, {
             hitTopK: resolved.hitTopK,
             titleMax: resolved.titleMax,
+            trust: trustOf(ws),
+            snapshotMaxChars: resolved.budget.snapshotMaxChars,
           }, resolved.projectDir)
           if (injected) {
             const rewritten = [...decision.messages]
@@ -1507,10 +1693,17 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
         const hit = buildHitInjection(db, ws, sid, text, {
           hitTopK: resolved.hitTopK,
           titleMax: resolved.titleMax,
+          trust: trustOf(ws),
+          hitMaxChars: resolved.budget.hitMaxChars,
+          minScore: resolved.retrieval.minScore,
+          halfLifeDays: resolved.retrieval.halfLifeDays,
+          hitBoost: resolved.retrieval.hitBoost,
+          importanceWeight: resolved.retrieval.importanceWeight,
+          onHit: (level, id) => {
+            try { db.bumpHit(level as Level, id) } catch { /* 反馈失败不影响注入 */ }
+          },
         }, resolved.projectDir)
-        try {
-          appendFileSync(join(ws, resolved.projectDir, 'dream-debug.log'), `[${new Date().toISOString()}] hit-chain pid=${process.pid} sid=${shortSessionId(sid)} textLen=${text.length} hit=${hit === null ? 'null' : 'yes'}\n`)
-        } catch { /* 日志失败不阻塞 */ }
+        dreamLog(`hit-chain pid=${process.pid} sid=${shortSessionId(sid)} textLen=${text.length} hit=${hit === null ? 'null' : 'yes'}`)
         if (hit !== null) {
           const rewritten = [...decision.messages]
           rewritten.splice(rewritten.indexOf(lastUser), 0, createMemorySnapshotMessage(hit.text, { kind: 'hit', ids: hit.injectedIds }))
@@ -1555,11 +1748,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     const dreamTurn = wasDreamTurn(sessionEventsOf(agent.session))
     const wsTs = workspaceOfAgent(agent)
     const sidTs = sessionIdOfAgent(agent)
-    if (wsTs) {
-      try {
-        appendFileSync(join(wsTs, resolved.projectDir, 'dream-debug.log'), `[${new Date().toISOString()}] turn-stopping pid=${process.pid} sid=${shortSessionId(sidTs)} reason=${endReason ?? 'none'} wasDream=${dreamTurn}\n`)
-      } catch { /* 日志失败不阻塞 */ }
-    }
+    if (wsTs) dreamLog(`turn-stopping pid=${process.pid} sid=${shortSessionId(sidTs)} reason=${endReason ?? 'none'} wasDream=${dreamTurn}`)
     // 用户按停止（aborted/interrupted）：不反思、不推进下一组；但 dream 轮必须立即收尾，
     // 否则 DB 租约残留，窗口要等租约过期（30min）才能再 dream。
     if (endReason === 'aborted' || endReason === 'interrupted') {
@@ -1583,6 +1772,8 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     // 窗口/工作区整理门控（issue #38/#28）：「跳过整理」或工作区停用 → 自动反思一并
     // 挡下（手动 /dream 不受限，手动=明确意愿）。dream 轮推进在上方分支已处理，不受此守卫影响。
     if (wsTs !== null) {
+      // 0.32 安全闸：未受信工作区库不做自动反思（否则会把它库里的项目名/内容洗进模型轮）。
+      if (!trustOf(wsTs).trusted) return
       try {
         if (workspaceDisabled(wsTs) || (existsSync(memoryDbPath(wsTs, resolved.projectDir)) && getDb(wsTs, resolved.projectDir).getMemoryScope(sidTs).dream)) return
       } catch {
@@ -1602,11 +1793,24 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     if (!sawToolCall) return // 纯聊天轮，不反思
     if (lastToolName !== undefined && lastToolName.startsWith('memory_')) return // 已主动记忆
     if (consecutiveToolSteps(sessionEventsOf(agent.session)) < resolved.reflectTurns) return // 单任务内连续工具 step 不足
+    // 0.32 成本闸（审计 P0）：最小间隔 / 每日次数 / 上下文大小——默认自动花 token 必须有上限。
+    const reflectGate = checkReflectBudget({
+      workspace: ws,
+      sessionId: sidTs,
+      dir: resolved.projectDir,
+      events: sessionEventsOf(agent.session),
+      cfg: resolved as unknown as { budget?: Record<string, number>; dream?: Record<string, unknown> },
+    })
+    if (!reflectGate.allowed) {
+      ctx.logger.info(`meow-memory: ${reflectGate.message}`)
+      return
+    }
     const message = buildReflectMessage(ws, turnText, resolved.projectDir)
     // 反思任务送主会话独立新轮（v0.24 拍板进主会话；2026-09-10 起走 followup 另起
     // 一轮——steer 延续同 turn 会把 AI 的工作汇报顶成中间步骤，见 sendMemoryTurn）。
     // 换模型由下方 agent/request waterfall 承接——本 turn 带 REFLECT_MARKER 时自动覆盖模型。
     if (sendMemoryTurn(agent, message, ws, resolved.projectDir, `reflect sid=${shortSessionId(sidTs)}`)) {
+      recordReflectSent(ws, sidTs, resolved.projectDir)
       if (turn !== undefined) {
         reflectQueuedTurn.set(sidTs, turn)
         // 进程级 Map 兜底上限：只保最近 MAX_REFLECT_TRACKED 个会话（Map 保留插入序）。
@@ -1673,10 +1877,10 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
       // #57：动态路由全部过鉴权闸（与官方 /api 同闸）——webServer.register 不经过
       // dsh-client-connection 的鉴权层，裸注册曾跨站可读可写。连接服务整个缺失时
       // 保守 503（鉴权不可用就宁可不可用）。静态资源型路由（本插件无）保持开放。
-      const connection = connectionAuthOf(ctx)
+      // 0.32：按请求惰性读取 connection——冷启动竞态下不再把路由永久钉在 503。
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const gated = (handler: (req: any, res: any) => void): ((req: unknown, res: unknown) => void) =>
-        authGate(connection, handler) as (req: unknown, res: unknown) => void
+        authGate(() => connectionAuthOf(ctx), handler) as (req: unknown, res: unknown) => void
       const registerOne = (route: { kind: 'exact'; path: string; handler: (req: unknown, res: unknown) => void }): void => {
         try {
           routeDisposers.push(ctx.effect(() => ws.register(route)))
@@ -1938,6 +2142,8 @@ export function loadWindowIndex(dir = '.dsh-meow', indexFile = join(activeHomeDi
     // 绝不为「恢复索引」新建目录或空库（collectDreamStates / skip-dreams 同款守卫）。
     // json 里的 sid→workspace 映射不受影响（上面已恢复），只是不去打开它的库。
     if (!existsSync(ws) || !existsSync(memoryDbPath(ws, dir))) continue
+    // 0.32 安全闸（review R4）：启动期还没判定 trust 的库不打开（防陌生库被升级/写索引）。
+    if (storeTrustOf(ws, dir)?.trusted !== true) continue
     try {
       for (const w of getDb(ws, dir).listWindows()) {
         if (typeof w.workspace === 'string' && w.workspace.length > 0) windowIndex.set(w.session_id, w.workspace)
@@ -1970,13 +2176,13 @@ function persistWindowIndex(): void {
 export { PLUGIN_SOURCE, REFLECT_MARKER }
 export { parseModelSpec, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER } from './delegate.js'
 export { collectDreamStates, headerOf, type PersistedSessionLike } from './dream-signal.js'
-export { MemoryDb, memoryDbPath, getDb, closeAllDbs, backupMemoryDb, LEVELS, newId, PROJECT_SUBCATEGORIES, projectList, projectCovers, projectLabel, relativeTime, isGlobalProject, isGlobalScope, globalProjectMarker, GLOBAL_PROJECT_CANON, GLOBAL_PROJECT_CANON_EN } from './db.js'
+export { MemoryDb, memoryDbPath, getDb, closeAllDbs, backupMemoryDb, ensureMemoryStore, storeTrustOf, resetStoreTrustCache, type StoreTrust, LEVELS, newId, PROJECT_SUBCATEGORIES, projectList, projectCovers, projectLabel, relativeTime, isGlobalProject, isGlobalScope, globalProjectMarker, GLOBAL_PROJECT_CANON, GLOBAL_PROJECT_CANON_EN } from './db.js'
 export { migrateLegacy } from './migrate.js'
 export { buildHitInjection, buildInjection, buildReinjection, buildProjectSectionText, readSeen, markSearched, markAccessed, readInjected, markInjected, markProjectQueried, readProjectQueried, markWritten, readWritten, markReinjectPending, clearReinjectPending, isReinjectPending, MAX_REINJECT_PROJECTS, MAX_REINJECT_WRITTEN, sessionsFile, getCurrentProject, setCurrentProject, releaseSeen } from './inject.js'
-export { buildReflectMessage, consecutiveToolSteps, scanTurn } from './reflect.js'
+export { buildReflectMessage, checkReflectBudget, consecutiveToolSteps, recordReflectSent, scanTurn } from './reflect.js'
 export { tokenize, stemEn, search, findSimilar, topicDrift, recencyWeight } from './bm25.js'
 export { fillTemplate, keyedValue, resolveSlotText, setPromptLang, getPromptLang, DEFAULT_LANG, SLOTS } from './prompt-loader.js'
 export { DEFAULT_HOME_DIR, activeHomeDir, setActiveHomeDir, dshHomeDir, pluginRootDir, homeDirPresets, resolveHomeDir, switchHomeDir, type HomeDirSwitch } from './home-dir.js'
 export { setMemoryToolGate, registerMemoryTools } from './tools.js'
 export { authGate, connectionAuthOf } from './auth-gate.js'
-export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, handleMemoryTurnFailure, dreamSweepTick, dreamCommandDefinition, isSubagentAgent, dreamSweepOnce, type DreamConfig } from './dream.js'
+export { collectDreamRounds, buildDreamMessage, windowNeedsDream, DREAM_MARKER, noteActivity, hourInTimeZone, minutesInTimeZone, isDreamSuppressed, startWindowDream, resumeAndDream, advanceDream, abortDream, recoverInterruptedDream, handleMemoryTurnFailure, dreamSweepTick, dreamCommandDefinition, isSubagentAgent, dreamSweepOnce, estimateContextTokens, evaluateAutoDreamGate, dreamMaxContextTokens, dreamLogPath, DREAM_MAX_ROWS_PER_ROUND, type DreamConfig } from './dream.js'

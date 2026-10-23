@@ -13,3 +13,7 @@ mytrashbin/
 /.pr-body.md
 /.pr-body-*.md
 /storage/
+# 0.32 audit/verification sandboxes (isolated DSH homes, never committed)
+/.verify-home/
+/.audit-home/
+/.audit-pack/

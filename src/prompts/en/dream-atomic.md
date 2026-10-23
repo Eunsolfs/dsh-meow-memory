@@ -14,15 +14,17 @@ Is there anything here you think should be tidied up or updated? If so, update i
 8. Is any entry too long, carrying too much? -> Split it into several, using update to rewrite and remember to create the new ones.
 9. Are the keywords accurate? -> If they are, leave the keywords parameter out; if you think they are off, fix them with memory_update's keywords parameter — when the user's prompt hits an entry's keywords, that entry gets pulled in. So think backwards: "which words in a user prompt should make this memory surface?" That is your standard. Don't use the project name as a keyword; use words specific to the entry. Prefer core entities, the semantic center, proper nouns. Plain dictionary form — the tokenizer stems English words, so a singular already matches its plural, and stopwords retrieve nothing. 8-13 of them.
 10. Are the project labels right? Is anything labeled with a project when it is really global information? Then the project label should go. Does anything clearly belong to a project but carry no project information? Then add it.
-11. Learning without reflection is wasted — generalize more:
-- This is an excellent moment to abstract and consolidate. Are there general rules worth distilling? Add them as new memories.
-- You may now understand some entries better and more deeply than when you wrote them. Update them.
+11. Add only with evidence — no "generalizing for the sake of generalizing":
+- Add or rewrite a memory only when the entries already in the list above, or facts verifiable in this window, directly support it. Never invent general rules or fill in details the list does not back.
+- If you do add a summary-type memory, its content must state which existing entries/facts it is based on, and you must run memory_find_similar first to avoid creating a claim that contradicts the old entries.
+- You may understand some entries better now than when you wrote them — such updates need the same evidence; guesses are not accepted.
 12. Look at what gets injected on the first turn. Do you still think all of it matters? Does it really need to be injected at the start of every session? Anything that doesn't, you can lower in importance or move to another level (fact, for instance).
 The first turn injects only: soul (the AI itself) / user (the user's preferences) / global rules (importance>=2). To get something into the first turn: a global rule -> move it to rules with importance>=2 (project "global"); something about the user -> move it to user; something about you -> move it to soul.
 13. memory_project shows project-level entries (completed todos, only the 5 most recent) plus project-specific rules; the checks above apply there too (completed todos go stale, out-of-date entries go archived, project labels stay accurate).
 
 Notes:
 Important: go through them one by one, and archive or fix memories that are out of date or that mislead you — prefer archiving.
+Archiving discipline: before setting status=archived you must be able to name the concrete evidence (a verified fact, a conversation/file check proving it is void). Without evidence, leave the entry as it is or verify first — never archive just to "tidy up".
 For a memory you consider very important, if you are unsure what the truth is, go read the project's files and check. Only for memories that really matter.
 When you are finished, reply "this group is consolidated" and call no other tools.
 

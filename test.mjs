@@ -7,6 +7,14 @@
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, utimesSync } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
 import { join, resolve } from 'node:path'
+
+// 0.32 信任门：stable DSH_HOME + 固定 install-id，既让 apply 级 fixture 能写合法
+// `.owner.json`，又不把 install-id 落到真实 ~/.dsh（测试全程隔离）。
+const TEST_DSH_HOME = mkdtempSync(join(tmpdir(), 'mm-test-dsh-'))
+process.env.DSH_HOME = TEST_DSH_HOME
+mkdirSync(join(TEST_DSH_HOME, 'storages', 'meow-memory'), { recursive: true })
+writeFileSync(join(TEST_DSH_HOME, 'storages', 'meow-memory', 'install-id'), 'test-install-id\n')
+
 import {
   apply,
   fillTemplate,
@@ -84,6 +92,15 @@ import {
   switchHomeDir,
   authGate,
   connectionAuthOf,
+  ensureMemoryStore,
+  storeTrustOf,
+  resetStoreTrustCache,
+  recencyWeight,
+  checkReflectBudget,
+  recordReflectSent,
+  estimateContextTokens,
+  evaluateAutoDreamGate,
+  dreamLogPath,
 } from './lib/index.js'
 
 let passed = 0
@@ -329,74 +346,69 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   rmSync(wsBk, { recursive: true, force: true })
 }
 
-// v0.23.1：进程重启后 agent-missing 窗口从 persistence 恢复 agent → dream 自动触发（不需要人碰窗口）
+// ── 0.32（#49）：自动 dream 只服务 live agent，绝不 resume 冷会话 ────────────────
+// 旧冷启动链（agents.resume / sessionController.resolveAgent / 会话日志路由恢复 /
+// not-found 退避 / 在途去重）已整体删除。这里锁定新不变量：只有进程内活着的 agent
+// 才会被自动 dream；冷窗口跳过且**绝不**调用任何 resume API。
 {
   const cfgR = { enabled: true, idleMinutes: 180, checkMinutes: 15, suppressWindows: [], suppressLeadMinutes: 15, timeZone: 'Asia/Shanghai', rulesReviewDays: 2 }
-  const wsR = mkdtempSync(join(tmpdir(), 'mm-resume-'))
+  const wsR = mkdtempSync(join(tmpdir(), 'mm-live-'))
   const dbR = getDb(wsR, '.dsh-meow')
-  const widR = 'win-resume-1'
-  dbR.touchWindow(widR, wsR, Date.now() - 4 * 3600_000) // 空闲 4h，need=true
-  dbR.insert({ level: 'fact', content: '恢复后要整理的记忆', project: 'dsh', source_session: widR, created_at: 100 })
+  const addWindow = (id) => {
+    dbR.touchWindow(id, wsR, Date.now() - 4 * 3600_000) // 空闲 4h，need=true
+    dbR.insert({ level: 'fact', content: `窗口 ${id} 的记忆`, project: 'dsh', source_session: id, created_at: 100 })
+  }
   const steered = []
-  const resumedAgent = { session: { header: { id: widR } }, steer: (m) => steered.push(m) }
-  // Resolve through the ordinary-session owner, never the raw Agent factory.
-  let rawResumes = 0
-  let resolvedId
-  const ctxR = { get: (name) => {
-    if (name === 'agents') return { resume: async () => { rawResumes++; throw new Error('raw resume must not run') } }
-    if (name === 'sessionController') return { resolveAgent: async (id) => { resolvedId = id; return { agent: resumedAgent } } }
+  const liveAgent = { session: { header: { id: 'win-live-1' } }, steer: (m) => steered.push(m) }
+  let resumeCalls = 0
+  let resolveCalls = 0
+  const liveCtx = { get: (name) => {
+    if (name === 'agents') return { get: () => liveAgent, resume: async () => { resumeCalls++; throw new Error('agents.resume must never run (#49)') } }
+    if (name === 'sessionController') return { resolveAgent: async () => { resolveCalls++; throw new Error('sessionController must never run (#49)') } }
     return undefined
   } }
-  await resumeAndDream(ctxR, widR, wsR, '.dsh-meow', undefined, cfgR)
-  check('resume: agent restored → dream started (steered + lease)', steered.length === 1 && dbR.getDreamLease(widR) !== null)
-  check('resume: ordinary-session owner receives the exact id', resolvedId === widR)
-  check('resume: raw factory is never called', rawResumes === 0)
-  const unavailableId = 'win-resume-no-owner'
-  dbR.touchWindow(unavailableId, wsR, Date.now() - 4 * 3600_000)
-  await resumeAndDream({ get: () => undefined }, unavailableId, wsR, '.dsh-meow', undefined, cfgR)
-  check('resume: missing controller and agents service skips safely', rawResumes === 0 && dbR.getDreamLease(unavailableId) === null)
+  addWindow('win-live-1')
+  await resumeAndDream(liveCtx, 'win-live-1', wsR, '.dsh-meow', undefined, cfgR)
+  check('auto-dream: live agent → dream started (steered + lease)', steered.length === 1 && dbR.getDreamLease('win-live-1') !== null)
+  check('auto-dream: live path never calls agents.resume (#49)', resumeCalls === 0)
+  check('auto-dream: live path never calls sessionController.resolveAgent (#49)', resolveCalls === 0)
+  dbR.finishDream('win-live-1', Date.now())
 
-  const wsR2 = mkdtempSync(join(tmpdir(), 'mm-resume-fail-'))
-  const dbR2 = getDb(wsR2, '.dsh-meow')
-  const widR2 = 'win-resume-2'
-  dbR2.touchWindow(widR2, wsR2, Date.now() - 4 * 3600_000)
-  dbR2.insert({ level: 'fact', content: '恢复失败窗口的记忆', project: 'dsh', source_session: widR2, created_at: 100 })
-  const ctxR2 = { get: (name) => (name === 'sessionController' ? { resolveAgent: async () => ({ error: { message: 'session file gone' } }) } : undefined) }
-  await resumeAndDream(ctxR2, widR2, wsR2, '.dsh-meow', undefined, cfgR)
-  check('resume: failure degrades silently (no lease, no throw)', dbR2.getDreamLease(widR2) === null)
+  // 冷窗口：agents.get() 返回 undefined（无 live agent）→ 跳过；resume 即便提供也绝不调用
+  addWindow('win-cold-1')
+  let coldResume = 0
+  let coldResolve = 0
+  const coldCtx = { get: (name) => {
+    if (name === 'agents') return { get: () => undefined, resume: async () => { coldResume++; return { agent: liveAgent } } }
+    if (name === 'sessionController') return { resolveAgent: async () => { coldResolve++; return { agent: liveAgent } } }
+    return undefined
+  } }
+  await resumeAndDream(coldCtx, 'win-cold-1', wsR, '.dsh-meow', undefined, cfgR)
+  check('auto-dream: cold window (no live agent) skipped — no lease', dbR.getDreamLease('win-cold-1') === null)
+  check('auto-dream: cold window never resumed (#49)', coldResume === 0 && coldResolve === 0)
+  // requireLiveAgent:false 是部署意图/诊断字段，不恢复冷启动 resume（#49 不变量）
+  await resumeAndDream(coldCtx, 'win-cold-1', wsR, '.dsh-meow', undefined, { ...cfgR, requireLiveAgent: false })
+  check('auto-dream: requireLiveAgent=false still never resumes (#49)', coldResume === 0 && dbR.getDreamLease('win-cold-1') === null)
+  // 服务完全缺失：安全跳过不抛
+  await resumeAndDream({ get: () => undefined }, 'win-cold-1', wsR, '.dsh-meow', undefined, cfgR)
+  check('auto-dream: missing services skips safely', dbR.getDreamLease('win-cold-1') === null)
 
-  const wsR3 = mkdtempSync(join(tmpdir(), 'mm-resume-dedup-'))
-  const dbR3 = getDb(wsR3, '.dsh-meow')
-  const widR3 = 'win-resume-3'
-  dbR3.touchWindow(widR3, wsR3, Date.now() - 4 * 3600_000)
-  dbR3.insert({ level: 'fact', content: '防重入窗口的记忆', project: 'dsh', source_session: widR3, created_at: 100 })
-  let resumeCalls = 0
-  let releaseResume
-  const gate = new Promise((r) => { releaseResume = r })
-  const ctxR3 = { get: (name) => (name === 'sessionController' ? { resolveAgent: async () => { resumeCalls++; await gate; return { agent: resumedAgent } } } : undefined) }
-  const p1 = resumeAndDream(ctxR3, widR3, wsR3, '.dsh-meow', undefined, cfgR)
-  const p2 = resumeAndDream(ctxR3, widR3, wsR3, '.dsh-meow', undefined, cfgR)
-  releaseResume()
-  await Promise.all([p1, p2])
-  check('resume: in-flight dedup (single resume call)', resumeCalls === 1)
+  // 子代理 live agent → 不 dream（递归防护）
+  addWindow('win-sub-live')
+  const subLiveAgent = { session: { header: { id: 'win-sub-live', origin: 'subagent', delegationDepth: 1 } }, steer: () => {} }
+  await resumeAndDream({ get: (n) => (n === 'agents' ? { get: () => subLiveAgent } : undefined) }, 'win-sub-live', wsR, '.dsh-meow', undefined, cfgR)
+  check('auto-dream: subagent live agent skipped (no lease)', dbR.getDreamLease('win-sub-live') === null)
 
-  // not-found 退避（2026-09-05）：跨实例/已删除窗口的 resume 永久失败，6h 内不再重试
-  const wsR4 = mkdtempSync(join(tmpdir(), 'mm-resume-backoff-'))
-  const dbR4 = getDb(wsR4, '.dsh-meow')
-  const widR4 = 'win-resume-backoff-1'
-  dbR4.touchWindow(widR4, wsR4, Date.now() - 4 * 3600_000)
-  dbR4.insert({ level: 'fact', content: 'not-found 退避窗口的记忆', project: 'dsh', source_session: widR4, created_at: 100 })
-  let resumeCalls4 = 0
-  const ctxR4 = { get: (name) => (name === 'sessionController' ? { resolveAgent: async () => { resumeCalls4++; return { error: { message: 'session "win-resume-backoff-1" not found' } } } } : undefined) }
-  await resumeAndDream(ctxR4, widR4, wsR4, '.dsh-meow', undefined, cfgR)
-  check('resume: not-found degrades silently (no lease)', dbR4.getDreamLease(widR4) === null && resumeCalls4 === 1)
-  await resumeAndDream(ctxR4, widR4, wsR4, '.dsh-meow', undefined, cfgR)
-  check('resume: not-found backed off (no retry within window)', resumeCalls4 === 1)
-  dbR4.close()
-  rmSync(wsR4, { recursive: true, force: true })
+  // agents.get 抛错：安全跳过
+  addWindow('win-get-throws')
+  await resumeAndDream({ get: (n) => (n === 'agents' ? { get: () => { throw new Error('registry broken') } } : undefined) }, 'win-get-throws', wsR, '.dsh-meow', undefined, cfgR)
+  check('auto-dream: agents.get throw skips safely', dbR.getDreamLease('win-get-throws') === null)
+
+  dbR.close()
+  rmSync(wsR, { recursive: true, force: true })
 }
 
-// Legacy Hosts expose agents.resume but no ordinary-session controller.
+// 0.32（#49）：旧宿主/旧链路的 resume API 全部成为死代码——提供也不许调用。
 {
   const ws = mkdtempSync(join(tmpdir(), 'mm-legacy-resume-'))
   const savedHome = process.env.DSH_HOME
@@ -405,19 +417,20 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   const cfg = { enabled: true, idleMinutes: 180, checkMinutes: 15, suppressWindows: [], suppressLeadMinutes: 15, timeZone: 'UTC', rulesReviewDays: 2 }
   const options = []
   const steered = []
-  const agent = id => ({ session: { header: { id } }, steer: message => steered.push(message) })
   const window = id => {
     db.touchWindow(id, ws, Date.now() - 4 * 3600_000)
     db.insert({ level: 'fact', content: 'legacy resume memory', project: 'legacy', source_session: id, created_at: 100 })
   }
-  const legacyCtx = (resume, selection) => ({ get: name => name === 'agents' ? { resume } : name === 'agentDefaultModel' && selection ? { currentSelection: selection } : undefined })
+  const agent = id => ({ session: { header: { id } }, steer: message => steered.push(message) })
+  const legacyCtx = (resume, selection) => ({ get: name => name === 'agents' ? { resume } : name === 'agentDefaultModel' && selection ? { currentSelection: selection } : name === 'sessionController' ? { resolveAgent: async () => ({ agent: undefined }) } : undefined })
   try {
-    const defaultId = 'legacy-default-route'
-    window(defaultId)
-    await resumeAndDream(legacyCtx(async value => { options.push(value); return { agent: agent(defaultId), dispose() {} } }, () => ({ provider: 'deepseek-official', model: 'deepseek-flash' })), defaultId, ws, '.dsh-meow', undefined, cfg)
-    check('legacy resume: exact session id and default route passed to agents service', options[0].resumeSessionId === defaultId && options[0].agentOptions?.provider === 'deepseek-official' && options[0].agentOptions?.model === 'deepseek-flash')
-    check('legacy resume: handle unwrapped and cold dream started', steered.length === 1 && db.getDreamLease(defaultId) !== null)
+    // 冷窗口：agents.resume 提供但不许调用（旧实现会冷启动恢复并 dream）
+    const coldId = 'legacy-cold-1'
+    window(coldId)
+    await resumeAndDream(legacyCtx(async value => { options.push(value); return { agent: agent(coldId), dispose() {} } }, () => ({ provider: 'deepseek-official', model: 'deepseek-flash' })), coldId, ws, '.dsh-meow', undefined, cfg)
+    check('legacy resume: cold window never calls agents.resume (#49)', options.length === 0 && steered.length === 0 && db.getDreamLease(coldId) === null)
 
+    // 会话日志路由恢复（sessions/archived-sessions 的 zstd 日志）也已删除：写日志不产生 dream
     const { zstdCompressSync } = await import('node:zlib')
     for (const [root, filename] of [['sessions', 'session.v4.jsonl.zstd'], ['archived-sessions', 'session.jsonl.zstd']]) {
       const id = root === 'sessions' ? 'legacy-log-route' : 'legacy-archive-route'
@@ -425,53 +438,19 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
       const folder = join(process.env.DSH_HOME, root, 'project', id)
       mkdirSync(folder, { recursive: true })
       const event = model => JSON.stringify({ type: 'request/header', data: { header: { config: { provider: 'recorded-provider', model } } } }) + '\n'
-      // Separate zstd frames match the persisted append-only session container.
       writeFileSync(join(folder, filename), Buffer.concat([zstdCompressSync(event('older-model')), zstdCompressSync(event('latest-model') + '{"type":"request/header"}\n')]))
       let received
-      await resumeAndDream(legacyCtx(async value => { received = value; return agent(id) }, () => { throw new Error('default selection must not run for a recorded route') }), id, ws, '.dsh-meow', undefined, cfg)
-      check(`legacy resume: ${root} uses last valid recorded route before defaults`, received?.agentOptions?.provider === 'recorded-provider' && received?.agentOptions?.model === 'latest-model')
-      check(`legacy resume: ${root} direct agent starts dream`, db.getDreamLease(id) !== null)
+      await resumeAndDream(legacyCtx(async value => { received = value; return agent(id) }, () => { throw new Error('default selection must not run') }), id, ws, '.dsh-meow', undefined, cfg)
+      check(`legacy resume: ${root} log route no longer recovers a cold window`, received === undefined && db.getDreamLease(id) === null)
     }
 
-    const noRouteId = 'legacy-no-route'
-    window(noRouteId)
-    let noRouteOptions
-    await resumeAndDream(legacyCtx(async value => { noRouteOptions = value; return agent(noRouteId) }), noRouteId, ws, '.dsh-meow', undefined, cfg)
-    check('legacy resume: no route preserves prior bare resume behavior', noRouteOptions?.resumeSessionId === noRouteId && !('agentOptions' in noRouteOptions) && db.getDreamLease(noRouteId) !== null)
-
-    const failedId = 'legacy-not-found'
-    window(failedId)
-    let failedCalls = 0
-    const failingCtx = legacyCtx(async () => { failedCalls++; throw new Error('session not found') })
-    await resumeAndDream(failingCtx, failedId, ws, '.dsh-meow', undefined, cfg)
-    await resumeAndDream(failingCtx, failedId, ws, '.dsh-meow', undefined, cfg)
-    check('legacy resume: not-found keeps backoff and no dream lease', failedCalls === 1 && db.getDreamLease(failedId) === null)
-
-    const dedupId = 'legacy-inflight'
-    window(dedupId)
-    let release
-    const gate = new Promise(resolve => { release = resolve })
-    let calls = 0
-    const dedupCtx = legacyCtx(async () => { calls++; await gate; return agent(dedupId) })
-    const first = resumeAndDream(dedupCtx, dedupId, ws, '.dsh-meow', undefined, cfg)
-    const second = resumeAndDream(dedupCtx, dedupId, ws, '.dsh-meow', undefined, cfg)
-    release()
-    await Promise.all([first, second])
-    check('legacy resume: in-flight dedup preserves one resume and dream', calls === 1 && db.getDreamLease(dedupId) !== null)
-
-    const subagentId = 'legacy-subagent'
-    window(subagentId)
-    await resumeAndDream(legacyCtx(async () => ({ agent: { session: { header: { id: subagentId, origin: 'subagent' } } } })), subagentId, ws, '.dsh-meow', undefined, cfg)
-    check('legacy resume: subagents remain excluded from automatic dream', db.getDreamLease(subagentId) === null)
-
-    for (const throws of [false, true]) {
-      const id = `controller-error-${throws}`
-      window(id)
-      let fallbacks = 0
-      const ctx = { get: name => name === 'sessionController' ? { resolveAgent: async () => { if (throws) throw new Error('owner unavailable'); return { error: { message: 'owner unavailable' } } } } : name === 'agents' ? { resume: async () => { fallbacks++; return agent(id) } } : undefined }
-      await resumeAndDream(ctx, id, ws, '.dsh-meow', undefined, cfg)
-      check(`resume: controller ${throws ? 'throw' : 'error result'} never invokes legacy fallback`, fallbacks === 0 && db.getDreamLease(id) === null)
-    }
+    // 同一 ID 的窗口若有 live agent，仍照常 dream（resume 依旧不调用）
+    const liveId = 'legacy-live-1'
+    window(liveId)
+    const liveSteered = []
+    const liveCtx = { get: name => name === 'agents' ? { get: () => ({ session: { header: { id: liveId } }, steer: (m) => liveSteered.push(m) }), resume: async (value) => { options.push(value); return agent(liveId) } } : undefined }
+    await resumeAndDream(liveCtx, liveId, ws, '.dsh-meow', undefined, cfg)
+    check('legacy host: live agent still dreams without resume', liveSteered.length === 1 && db.getDreamLease(liveId) !== null && options.length === 0)
   } finally {
     if (savedHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = savedHome
@@ -480,8 +459,8 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   }
 }
 
-// ── #59 跟进：resolveAgent 返回形状守卫——不认识的形状本周期跳过、不进永久跳过表
-//（下个 sweep 重试）；认识但不可用（{agent:undefined}）仍安全无租约 ──
+// ── 0.32（#49）删除形态守卫：不再有 resolveAgent 调用，因此也没有"形状不认识"分支；
+//    冷窗口无论宿主提供什么形状的 API 都不会被碰。重复调用也绝不 resume。
 {
   const ws = mkdtempSync(join(tmpdir(), 'mm-shape-'))
   const savedHome = process.env.DSH_HOME
@@ -493,20 +472,18 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
     db.insert({ level: 'fact', content: 'shape guard memory', project: 'dsh', source_session: id, created_at: 100 })
   }
   try {
-    const junkId = 'win-shape-junk'
-    window(junkId)
-    let junkCalls = 0
-    const junkCtx = { get: (name) => (name === 'sessionController' ? { resolveAgent: async () => { junkCalls++; return { totally: 'unknown' } } } : undefined) }
-    await resumeAndDream(junkCtx, junkId, ws, '.dsh-meow', undefined, cfg)
-    await resumeAndDream(junkCtx, junkId, ws, '.dsh-meow', undefined, cfg)
-    check('unrecognized shape: no lease, no dream', db.getDreamLease(junkId) === null)
-    check('unrecognized shape: retried next sweep (not permanently skipped)', junkCalls === 2, `calls=${junkCalls}`)
-
-    const undefId = 'win-shape-undef'
-    window(undefId)
-    const undefCtx = { get: (name) => (name === 'sessionController' ? { resolveAgent: async () => ({ agent: undefined }) } : undefined) }
-    await resumeAndDream(undefCtx, undefId, ws, '.dsh-meow', undefined, cfg)
-    check('recognized unusable agent: no lease', db.getDreamLease(undefId) === null)
+    const coldId = 'win-shape-cold'
+    window(coldId)
+    let ownerCalls = 0
+    let resumeCalls = 0
+    const ctx = { get: (name) => {
+      if (name === 'sessionController') return { resolveAgent: async () => { ownerCalls++; return { agent: { session: { header: { id: coldId } }, steer: () => {} } } } }
+      if (name === 'agents') return { resume: async () => { resumeCalls++; return { agent: { session: { header: { id: coldId } }, steer: () => {} } } } }
+      return undefined
+    } }
+    await resumeAndDream(ctx, coldId, ws, '.dsh-meow', undefined, cfg)
+    await resumeAndDream(ctx, coldId, ws, '.dsh-meow', undefined, cfg)
+    check('cold window: owner/resume APIs never called, no lease', ownerCalls === 0 && resumeCalls === 0 && db.getDreamLease(coldId) === null)
   } finally {
     if (savedHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = savedHome
@@ -563,26 +540,29 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
   rmSync(wsF, { recursive: true, force: true })
 }
 
-// The ordinary-session owner, not the memory plugin, resolves the model and preset.
+// 0.32（#49）：模型/preset 解析属于会话 owner，自动 dream 不再请求它（也不碰 resume）
 {
   const cfgR2 = { enabled: true, idleMinutes: 180, checkMinutes: 15, suppressWindows: [], suppressLeadMinutes: 15, timeZone: 'Asia/Shanghai', rulesReviewDays: 2 }
-  const wsS2 = mkdtempSync(join(tmpdir(), 'mm-resume-route-'))
+  const wsS2 = mkdtempSync(join(tmpdir(), 'mm-live-route-'))
   const dbS2 = getDb(wsS2, '.dsh-meow')
   const widS2 = 'win-route-1'
   dbS2.touchWindow(widS2, wsS2, Date.now() - 4 * 3600_000)
   dbS2.insert({ level: 'fact', content: '带路由恢复的记忆', project: 'dsh', source_session: widS2, created_at: 100 })
   const resumedWith = []
-  const agentS2 = { session: { header: { id: widS2 } }, steer: () => {} }
+  const steeredS2 = []
+  const agentS2 = { session: { header: { id: widS2 } }, steer: (m) => steeredS2.push(m) }
+  let modelSelectionCalls = 0
   const ctxS2 = {
-    get: (name) => name === 'sessionController'
-      ? { resolveAgent: async (id) => { resumedWith.push(id); return { agent: agentS2 } } }
+    get: (name) => name === 'agents'
+      ? { get: () => agentS2, resume: async (id) => { resumedWith.push(id); return { agent: agentS2 } } }
       : name === 'agentDefaultModel'
-        ? { currentSelection: () => { throw new Error('Model selection belongs to the session owner') } }
+        ? { currentSelection: () => { modelSelectionCalls++; throw new Error('Model selection belongs to the session owner') } }
         : undefined,
   }
   await resumeAndDream(ctxS2, widS2, wsS2, '.dsh-meow', undefined, cfgR2)
-  check('resume: model selection delegated to the ordinary-session owner', resumedWith.length === 1 && resumedWith[0] === widS2)
-  check('resume: dream started with route', dbS2.getDreamLease(widS2) !== null)
+  check('auto-dream: live agent dreams without touching owner model selection', steeredS2.length === 1 && dbS2.getDreamLease(widS2) !== null && modelSelectionCalls === 0)
+  check('auto-dream: no resume even when agents.resume provided', resumedWith.length === 0)
+  dbS2.finishDream(widS2, Date.now())
   dbS2.close()
   rmSync(wsS2, { recursive: true, force: true })
 }
@@ -643,8 +623,8 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
 }
 
 // 递归 dream 修复（2026-09-05 猫猫拍板）：delegate fork 的子代理会话会进 windows 表，
-// 但 dream 只归主窗口——dream 子代理→再进表→再被 dream，depth 无限套娃（真机实证
-// 8fbc5d59→2f47c15b→63dad87b）。自动扫描跳过 origin=subagent；手动路径不受影响。
+// 但 dream 只归主窗口——自动扫描跳过 origin=subagent；手动路径不受影响。
+// 0.32（#49）：自动扫描只认 live agent，取不到即跳过且绝不 resume；子代理命中进进程级缓存。
 {
   // 判定函数口径（与 index.ts 注入链同源）：origin 权威 + depth 双保险；parentSession 不参与
   check('isSubagentAgent: origin=subagent → true', isSubagentAgent({ session: { header: { origin: 'subagent' } } }) === true)
@@ -655,54 +635,46 @@ check('check gate passes after interval', dbW.claimCheckGate(0) === true)
 
   const cfgS = { enabled: true, idleMinutes: 180, checkMinutes: 15, suppressWindows: [], suppressLeadMinutes: 15, timeZone: 'Asia/Shanghai', rulesReviewDays: 2 }
   const wsS = mkdtempSync(join(tmpdir(), 'mm-subagent-'))
+  // 0.32 信任门：dream sweep 只整理可信库（reviews P1）。先建本机库再取句柄。
+  ensureMemoryStore(wsS, '.dsh-meow', { autoGitignore: false, trustWorkspaceMemory: false })
   const dbS = getDb(wsS, '.dsh-meow')
-  const widS = 'win-subagent-1'
-  dbS.touchWindow(widS, wsS, Date.now() - 4 * 3600_000) // 空闲 4h，need=true
-  dbS.insert({ level: 'fact', content: '子代理窗口的记忆', project: 'dsh', source_session: widS, created_at: 100 })
+  const addWindow = (id) => {
+    dbS.touchWindow(id, wsS, Date.now() - 4 * 3600_000) // 空闲 4h，need=true
+    dbS.insert({ level: 'fact', content: `窗口 ${id} 的记忆`, project: 'dsh', source_session: id, created_at: 100 })
+  }
 
-  // ① sweep 单轮：live agent 是子代理 → 不 start，且窗口进缓存（下轮连 agent 都不取）
-  const subAgent = { session: { header: { id: widS, origin: 'subagent', delegationDepth: 1 } }, steer: () => {} }
-  let getS = 0
-  const ctxS = { get: (name) => (name === 'agents' ? { get: () => { getS++; return subAgent } } : undefined) }
-  const winIndexS = new Map([[widS, wsS]])
-  dreamSweepOnce(ctxS, cfgS, '.dsh-meow', winIndexS)
-  check('sweep: subagent window not dreamed (no lease)', dbS.getDreamLease(widS) === null)
-  // ② 缓存命中：第二轮不再取 agent（无 resume/无重复判定开销）
-  dreamSweepOnce(ctxS, cfgS, '.dsh-meow', winIndexS)
-  check('sweep: subagent cache hit (agent fetched only once)', getS === 1)
+  // ① sweep：无 live agent → 跳过，且绝不 resume
+  const widNo = 'win-sweep-no-agent'
+  addWindow(widNo)
+  let sweepResumes = 0
+  const ctxNo = { get: (name) => name === 'agents' ? { get: () => undefined, resume: async () => { sweepResumes++; return { agent: {} } } } : name === 'sessionController' ? { resolveAgent: async () => ({ agent: {} }) } : undefined }
+  dreamSweepOnce(ctxNo, cfgS, '.dsh-meow', new Map([[widNo, wsS]]))
+  check('sweep: no live agent → no dream, no resume (#49)', dbS.getDreamLease(widNo) === null && sweepResumes === 0)
 
-  // ③ resume 链：resume 成功但 header.origin=subagent → 不 start
-  const widS2 = 'win-subagent-2'
-  dbS.touchWindow(widS2, wsS, Date.now() - 4 * 3600_000)
-  dbS.insert({ level: 'fact', content: '子代理恢复窗口的记忆', project: 'dsh', source_session: widS2, created_at: 100 })
-  const ctxS2 = { get: (name) => (name === 'sessionController' ? { resolveAgent: async () => ({ agent: { session: { header: { id: widS2, origin: 'subagent' } } } }) } : undefined) }
-  await resumeAndDream(ctxS2, widS2, wsS, '.dsh-meow', undefined, cfgS)
-  check('resume: subagent restored but not dreamed (no lease)', dbS.getDreamLease(widS2) === null)
+  // ② sweep：live 主窗口 → dream 启动（一轮一个窗口）
+  const widMain = 'win-sweep-main'
+  addWindow(widMain)
+  const mainSteered = []
+  const mainAgent = { session: { header: { id: widMain } }, steer: (m) => mainSteered.push(m) }
+  let mainGets = 0
+  const ctxMain = { get: (name) => name === 'agents' ? { get: () => { mainGets++; return mainAgent } } : undefined }
+  dreamSweepOnce(ctxMain, cfgS, '.dsh-meow', new Map([[widMain, wsS]]))
+  check('sweep: live main window dreamed (steered + lease)', mainSteered.length === 1 && dbS.getDreamLease(widMain) !== null)
 
-  // ③b resume 链：resume resolve 但 agent 无可用 header（真机实测=子代理会话的 resume
-  // 行为，主会话恒返回完整 agent）→ 不 start 且标缓存，下轮 sweep 直接跳过
-  const widS2b = 'win-subagent-2b'
-  dbS.touchWindow(widS2b, wsS, Date.now() - 4 * 3600_000)
-  dbS.insert({ level: 'fact', content: '不可恢复句柄窗口的记忆', project: 'dsh', source_session: widS2b, created_at: 100 })
-  let resumeCalls2b = 0
-  const ctxS2b = { get: (name) => (name === 'sessionController' ? { resolveAgent: async () => { resumeCalls2b++; return { agent: undefined } } } : undefined) }
-  await resumeAndDream(ctxS2b, widS2b, wsS, '.dsh-meow', undefined, cfgS)
-  check('resume: unusable agent not dreamed (no lease)', dbS.getDreamLease(widS2b) === null)
-  const winIndexS2b = new Map([[widS2b, wsS]])
-  dreamSweepOnce(ctxS, cfgS, '.dsh-meow', winIndexS2b)
-  check('resume: unusable agent cached (sweep skips without resume)', resumeCalls2b === 1)
+  // ③ sweep：live 子代理 → 跳过并进进程级缓存（第二轮连 agent 都不取）
+  const widSub = 'win-sweep-sub'
+  addWindow(widSub)
+  const subAgent = { session: { header: { id: widSub, origin: 'subagent', delegationDepth: 1 } }, steer: () => {} }
+  let getSub = 0
+  const ctxSub = { get: (name) => name === 'agents' ? { get: () => { getSub++; return subAgent } } : undefined }
+  dreamSweepOnce(ctxSub, cfgS, '.dsh-meow', new Map([[widSub, wsS]]))
+  check('sweep: subagent live agent not dreamed (no lease)', dbS.getDreamLease(widSub) === null)
+  dreamSweepOnce(ctxSub, cfgS, '.dsh-meow', new Map([[widSub, wsS]]))
+  check('sweep: subagent cache hit (agent fetched only once)', getSub === 1)
 
-  // ④ 主窗口不受影响：同库主窗口 agent（无 origin）正常 start
-  const widS3 = 'win-main-1'
-  dbS.touchWindow(widS3, wsS, Date.now() - 4 * 3600_000)
-  dbS.insert({ level: 'fact', content: '主窗口的记忆', project: 'dsh', source_session: widS3, created_at: 100 })
-  const mainAgent = { session: { header: { id: widS3 } }, steer: () => {} }
-  dreamSweepOnce({ get: (name) => (name === 'agents' ? { get: () => mainAgent } : undefined) }, cfgS, '.dsh-meow', new Map([[widS3, wsS]]))
-  check('sweep: main window still dreamed (lease held)', dbS.getDreamLease(widS3) !== null)
-
-  // ⑤ 手动路径豁免：startWindowDream 直呼（/dream、memory_dream 走这里）不被判定拦截
+  // ④ 手动路径豁免：startWindowDream 直呼（/dream、memory_dream 走这里）不被子代理判定拦截
   const steeredS = []
-  const manualAgent = { session: { header: { id: widS, origin: 'subagent' } }, steer: (m) => steeredS.push(m) }
+  const manualAgent = { session: { header: { id: widSub, origin: 'subagent' } }, steer: (m) => steeredS.push(m) }
   startWindowDream({ get: () => undefined }, manualAgent, wsS, '.dsh-meow')
   check('manual startWindowDream not blocked for subagent', steeredS.length === 1)
 
@@ -782,7 +754,7 @@ const eRounds = collectDreamRounds(dbE, 'win-e', wsE, '.dsh-meow')
 check('empty window still gets topic round', eRounds.length === 1 && eRounds[0].kind === 'topic' && eRounds[0].groups.length === 0)
 const eMsg = buildDreamMessage(dbE, 'win-e', 5000, eRounds, 0)
 const et = eMsg.content.map((b) => (b.type === 'text' ? b.text : '')).join('')
-check('empty topic round hints new topic creation', et.includes('第 1/1 组 - topic记忆条目') && et.includes('很可能就是一个新topic'))
+check('empty topic round is honest about skipping (0.32 prompt fix)', et.includes('第 1/1 组 - topic记忆条目') && et.includes('跳过这一步') && et.includes('不要为了"新建"而猜测或编造') && !et.includes('很可能就是一个新topic'))
 dbE.close()
 
 // startWindowDream 抢占 + advanceDream 收尾 + 补收尾 + abortDream（租约链路）
@@ -1005,6 +977,7 @@ check('suppress: invalid window skipped', isDreamSuppressed({ ...suppressCfg, su
 
 // migrate
 const ws2 = mkdtempSync(join(tmpdir(), 'mm-mig-'))
+ownStore(ws2)
 mkdirSync(join(ws2, '.dsh-meow'), { recursive: true })
 const legacy = [
   '# PROJECT.md — 项目记忆',
@@ -1077,8 +1050,14 @@ const inj2 = buildInjection(db2, ws2, 'test-session-1', '3081 又怎么了？', 
 check('dedup same session', inj2 === null || !inj2.text.includes('3081 端口是喵版 dsh'))
 // 首轮不命中（只注入长期记忆）；命中链路从第二轮起（buildHitInjection）
 setCurrentProject(ws2, 'test-session-2', 'dsh', '.dsh-meow')
-const inj3 = buildHitInjection(db2, ws2, 'test-session-2', '3081 又怎么了？', { hitTopK: 3 }, '.dsh-meow')
+const inj3 = buildHitInjection(db2, ws2, 'test-session-2', '3081 又怎么了？', { hitTopK: 3, minScore: 0 }, '.dsh-meow')
 check('new session gets hits', inj3 !== null && inj3.text.includes('3081 端口是喵版 dsh'))
+// v0.32 检索阈值（0.35）：单关键词命中在默认阈值下照常注入；完全不匹配返回 null
+setCurrentProject(ws2, 's-threshold-1', 'dsh', '.dsh-meow')
+const hitSingle = buildHitInjection(db2, ws2, 's-threshold-1', '喵版端口', { hitTopK: 3 }, '.dsh-meow')
+check('minScore: single-keyword match passes default 0.35', hitSingle !== null && hitSingle.text.includes('3081 端口是喵版 dsh'), JSON.stringify(hitSingle?.injectedIds))
+const hitZero = buildHitInjection(db2, ws2, 's-threshold-0', '完全无关的查询词汇xyz', { hitTopK: 3 }, '.dsh-meow')
+check('minScore: zero match returns null', hitZero === null)
 // #67：已注入先排除再截断——top-K 被旧命中占满时本轮补位下一名，而不是颗粒无收
 {
   const wsH = mkdtempSync(join(tmpdir(), 'mm-hitorder-'))
@@ -1138,54 +1117,48 @@ function makeCtx(subagents) {
   return { ctx, tools, handlers, effects }
 }
 
+// 0.32 信任门 fixture：apply 级测试自己造的工作区库需要本机归属标记，否则
+// ensureMemoryStore 会把"已有数据但无标记"判成 foreign（不注入/工具读被拒）。
+// 标记必须带本机 installId（顶层已固定 test-install-id）——不再有"极简标记免检"。
+function ownStore(workspace, dir = '.dsh-meow') {
+  mkdirSync(join(workspace, dir), { recursive: true })
+  writeFileSync(join(workspace, dir, '.owner.json'), JSON.stringify({ schema: 1, installId: 'test-install-id', workspace, createdAt: Date.now() }), 'utf8')
+}
+ownStore(ws)
+ownStore(ws2)
+
 const { ctx, tools, handlers } = makeCtx()
 await apply(ctx, { enabled: true, projectDir: '.dsh-meow', promptLang: 'zh' })
-check('eight tools registered', tools.length === 8 && ['memory_remember', 'memory_search', 'memory_find_similar', 'memory_read', 'memory_update', 'memory_dream', 'memory_project', 'memory_home']
+check('ten tools registered', tools.length === 10 && ['memory_remember', 'memory_search', 'memory_find_similar', 'memory_read', 'memory_update', 'memory_dream', 'memory_project', 'memory_list', 'memory_forget', 'memory_home']
   .every((name) => tools.some((t) => t.name === name)), `got ${tools.map((t) => t.name).join(',')}`)
 
-// memory_home 工具：查询 / 非法 target 防误切 / 合法切换（走 switchHomeDir 真链路）
-// DSH_HOME 整块隔离（#70 起切换会写 $DSH_HOME/storages 指针，不许污染真实宿主目录）
+// memory_home 工具（0.32 安全闸）：默认只读——查询模式给状态文本，任何 target 都拒绝切换
+// （allowHomeSwitch=false）。切换链路本身在 tests/hardening.mjs 里用显式开启的 apply 覆盖。
 {
   const home = tools.find((t) => t.name === 'memory_home')
-  const saved = activeHomeDir()
   const tmpH = mkdtempSync(join(tmpdir(), 'meow-home-tool-'))
   const savedReal = activeHomeDir()
   const savedDshHome = process.env.DSH_HOME
   process.env.DSH_HOME = join(tmpH, 'dsh-home')
   mkdirSync(process.env.DSH_HOME, { recursive: true })
-
-  const r1 = await home.execute({})
-  check('memory_home: 查询模式返回当前目录与预设', String(r1.note).includes('当前全局数据目录') && String(r1.note).includes('dsh-storage'))
-
-  setActiveHomeDir(join(tmpH, 'from'))
-  const r2 = await home.execute({ target: 'not-a-legal-target' })
-  check('memory_home: 非法 target 防误切', String(r2.note).includes('无法识别') && activeHomeDir() === join(tmpH, 'from'))
-
-  mkdirSync(join(tmpH, 'from2'))
-  writeFileSync(join(tmpH, 'from2', 'seed.txt'), 'x')
-  setActiveHomeDir(join(tmpH, 'from2'))
-  const r3 = await home.execute({ target: join(tmpH, 'to-home') })
-  check('memory_home: 合法切换生效且留标记', String(r3.note).includes('已切换为') && existsSync(join(tmpH, 'to-home', 'home-dir.json')) && activeHomeDir() === join(tmpH, 'to-home'))
-
-  const r4 = await home.execute({ target: 'dsh-storage' })
-  check('memory_home: 预设标记解析并切换', typeof r4.note === 'string' && r4.note.length > 0)
-
-  // #70：切换持久化——稳定位置指针写盘；无 env/配置时启动回落链读到它
-  setActiveHomeDir(join(tmpH, 'from3'))
-  mkdirSync(join(tmpH, 'from3'), { recursive: true })
-  writeFileSync(join(tmpH, 'from3', 'seed.txt'), 'x')
-  const r5 = await home.execute({ target: join(tmpH, 'persist-home') })
-  const pointerPath = join(tmpH, 'dsh-home', 'storages', 'meow-memory-home.json')
-  check('memory_home: 切换写稳定位置指针 (#70)', existsSync(pointerPath), r5.note)
-  check('memory_home: 指针指向新目录', JSON.parse(readFileSync(pointerPath, 'utf8')).homeDir === join(tmpH, 'persist-home'))
-  check('resolveHomeDir 回落链读到指针（env 缺省时）', resolveHomeDir(undefined) === join(tmpH, 'persist-home'))
-  rmSync(join(tmpH, 'persist-home'), { recursive: true, force: true })
-  check('指针目标已删 → 静默回平台默认', resolveHomeDir(undefined) === DEFAULT_HOME_DIR)
-
-  if (savedDshHome === undefined) delete process.env.DSH_HOME
-  else process.env.DSH_HOME = savedDshHome
-  setActiveHomeDir(savedReal)
-  rmSync(tmpH, { recursive: true, force: true })
+  try {
+    const before = activeHomeDir()
+    const r1 = await home.execute({})
+    check('memory_home: query mode returns current dir + presets + switch disabled',
+      String(r1.note).includes('当前全局数据目录') && String(r1.note).includes('dsh-storage') && String(r1.note).includes('切换能力：已禁用'),
+      r1.note)
+    const r2 = await home.execute({ target: 'dsh-storage' })
+    check('memory_home: target refused while security.allowHomeSwitch=false',
+      String(r2.note).includes('拒绝切换') && activeHomeDir() === before, r2.note)
+    const r3 = await home.execute({ target: join(tmpH, 'to-home') })
+    check('memory_home: absolute target also refused, no filesystem switch',
+      String(r3.note).includes('拒绝切换') && activeHomeDir() === before && !existsSync(join(tmpH, 'to-home')))
+  } finally {
+    if (savedDshHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = savedDshHome
+    setActiveHomeDir(savedReal)
+    rmSync(tmpH, { recursive: true, force: true })
+  }
 }
 
 // memory_dream 工具入口：子代理会话拒绝（与 /dream 命令守卫同语义——fork 播种父
@@ -1193,6 +1166,7 @@ check('eight tools registered', tools.length === 8 && ['memory_remember', 'memor
 // 底层 startWindowDream 的手动豁免不受影响（见上方"manual startWindowDream"用例）。
 {
   const wsT = mkdtempSync(join(tmpdir(), 'mm-dream-tool-'))
+  ownStore(wsT)
   const dbT = getDb(wsT, '.dsh-meow')
   const dreamToolT = tools.find((t) => t.name === 'memory_dream')
   const subExec = { agent: { session: { header: { cwd: wsT, id: 'win-subagent-tool', origin: 'subagent' } } } }
@@ -1234,6 +1208,7 @@ check('search status=archived single filter (#68)', sArch.hits.length >= 1 && sA
 // #51：可解释检索——explain=true 时每条命中带分项得分；默认不带
 {
   const wsE = mkdtempSync(join(tmpdir(), 'mm-explain-'))
+  ownStore(wsE)
   const dbE = getDb(wsE, '.dsh-meow')
   dbE.insert({ level: 'fact', content: '解释检索测试 独特词源', project: 'dsh', created_at: Date.now() })
   const execE = { agent: { session: { header: { cwd: wsE, id: 't-explain' } } } }
@@ -1242,9 +1217,9 @@ check('search status=archived single filter (#68)', sArch.hits.length >= 1 && sA
   check('search explain=true carries breakdown (#51)', hitE !== undefined && hitE.explain !== undefined &&
     typeof hitE.explain.bm25 === 'number' && hitE.explain.bm25 > 0 &&
     hitE.explain.status === 'active' && hitE.explain.recencyWeight > 0, JSON.stringify(hitE))
-  check('search explain breakdown: score ≈ bm25 × recencyWeight (#51)',
-    Math.abs(hitE.explain.bm25 * hitE.explain.recencyWeight - hitE.score) < 0.02,
-    JSON.stringify({ bm25: hitE.explain.bm25, rw: hitE.explain.recencyWeight, score: hitE.score }))
+  check('search explain breakdown: score ≈ bm25 × recencyWeight × importanceWeight (#51)',
+    Math.abs((hitE.explain.bm25 * hitE.explain.recencyWeight * (0.85 + 0.05 * hitE.explain.importance)) - hitE.score) < 0.02,
+    JSON.stringify({ bm25: hitE.explain.bm25, rw: hitE.explain.recencyWeight, importance: hitE.explain.importance, score: hitE.score }))
   const noE = await searchTool.execute({ query: '解释检索测试' }, execE)
   check('search default: no explain field (#51)', noE.hits[0] !== undefined && noE.hits[0].explain === undefined)
   dbE.close()
@@ -1256,6 +1231,7 @@ check('search shows keywords + relative time, no content', searchRender.some((b)
 // search 5+5 分段（用户拍板 2026-08-19）：前 5 条无脑取（不排除已见/本 session 建立的），
 // 第 6 名起绕开已见（injected+searched）补齐。分数相同时排名稳定=插入序。
 const wsSplit = mkdtempSync(join(tmpdir(), 'mm-split-'))
+ownStore(wsSplit)
 const dbSplit = new MemoryDb(memoryDbPath(wsSplit))
 for (let i = 1; i <= 12; i++) {
   dbSplit.insert({ level: 'fact', content: `分段检索测试 内容${i} 特异性词${i}`, project: 'dsh', source_session: i === 5 || i === 12 ? 's-split' : 'win-other' })
@@ -1306,6 +1282,7 @@ check('update importance unbounded (no clamp)', up5.ok === true && db.findById(k
 // #62：短 id 歧义——写路径必须拒绝并列出候选，不能 findById 首条静默改错条目
 {
   const wsA = mkdtempSync(join(tmpdir(), 'mm-ambig-'))
+  ownStore(wsA)
   const dbA = getDb(wsA, '.dsh-meow')
   const T = 1_700_000_000_000
   const a1 = dbA.insert({ level: 'fact', content: '歧义条目甲 唯一内容甲', project: 'dsh', id: newId(T) }).id
@@ -1399,6 +1376,7 @@ check('remember requires importance', missI.includes('importance 参数必填'))
 // 真机现象：schema 声明 array，通道到达 execute 时却是 '["a","b"]' 文本，旧实现只认
 // Array.isArray → 一律报「keywords 必填」，该类宿主上 memory_remember 完全不可用。
 const wsCh = mkdtempSync(join(tmpdir(), 'mm-chan-'))
+ownStore(wsCh)
 const dbCh = new MemoryDb(memoryDbPath(wsCh))
 const chCtx = { agent: { session: { header: { cwd: wsCh, id: 't-chan' } } } }
 const ch1 = await rememberTool.execute({ content: '通道甲', level: 'fact', project: 'dsh', keywords: '["通道","兜底","数组","文本","解析"]', importance: '3' }, chCtx)
@@ -1422,6 +1400,7 @@ dbCh.close()
 
 // 压缩信号释放 seen：compaction 事件 → sessions 文件清空 → 记忆可再次命中
 const wsSeen = mkdtempSync(join(tmpdir(), 'mm-seen-'))
+ownStore(wsSeen)
 const dbSeen = new MemoryDb(memoryDbPath(wsSeen))
 dbSeen.insert({ level: 'fact', content: '压缩后应能重新命中的记忆', project: 'dsh', source_session: 'win-other' })
 markSearched(wsSeen, 's-comp', ['fake-id-1'], '.dsh-meow')
@@ -1435,6 +1414,7 @@ dbSeen.close()
 
 // ── 压缩重注入（v0.21.0）：查阅留痕 / compaction/end 置待办 / buildReinjection ──
 const wsReinj = mkdtempSync(join(tmpdir(), 'mm-reinj-'))
+ownStore(wsReinj)
 const dbReinj = new MemoryDb(memoryDbPath(wsReinj))
 dbReinj.insert({ level: 'soul', content: '重注入测试 soul 条目' })
 dbReinj.insert({ level: 'user', content: '重注入测试 user 条目' })
@@ -1473,6 +1453,7 @@ check('compaction/end with error does not arm', isReinjectPending(wsReinj, 's-re
 
 // ── 写痕迹（v0.23.0）：memory_remember/memory_update 落库记 written；LRU / releaseSeen 保留 ──
 const wsWritten = mkdtempSync(join(tmpdir(), 'mm-written-'))
+ownStore(wsWritten)
 const dbWritten = new MemoryDb(memoryDbPath(wsWritten))
 const rememberToolW = tools.find((t) => t.name === 'memory_remember')
 const updateToolW = tools.find((t) => t.name === 'memory_update')
@@ -1526,6 +1507,8 @@ dbW3.close()
 
 // 插件注入轮（反思/dream steer 消息轮）内的事件不刷新窗口活跃度（防 dream 反复触发）
 const wsWin = mkdtempSync(join(tmpdir(), 'mm-win-'))
+// 0.32 信任门：窗口事件只写可信库；先建本机库+标记（否则 pre-existing 空库会被判 foreign）。
+ensureMemoryStore(wsWin, '.dsh-meow', { autoGitignore: false, trustWorkspaceMemory: false })
 const evtHandler = handlers['session/event']
 const sessWin = { id: 's-win', header: { cwd: wsWin } }
 const tPlugin = Date.now()
@@ -1897,6 +1880,7 @@ dbReinj.close()
 // 首次设置引导（v0.19.0）：promptLang 未配置 → 插件生效后第一条真实用户消息注入
 // 设置任务；seen（accessed '__welcomeGuide__'）记账 → 同会话不重复；显式配置 → 永久短路。
 const wsGuide = mkdtempSync(join(tmpdir(), 'mm-guide-'))
+ownStore(wsGuide)
 const { ctx: guideApplyCtx, handlers: guideHandlers } = makeCtx()
 await apply(guideApplyCtx, { enabled: true, projectDir: '.dsh-meow' }) // 不传 promptLang = 未配置
 const guidePreStep = guideHandlers['agent/pre-step']
@@ -1995,14 +1979,17 @@ check('no steer on 6 tool steps', steered6.length === 0)
 // issue #19（v0.26.0 回归）：反思走 followup 排进 next-turn，本 turn 事件流里看不见，
 // 而 turn-stopping 在一次收尾窗口内会多次触发 → 同一 turn 反复排队（真机实测连发 4 次）。
 // 判重按宿主载荷里的 turn 号：同一 turn 只排一条，换 turn 自动放行。
+// 0.32 追加：换 turn 也要过成本闸（默认最小间隔 20min）——把上次反思时间拨老 21min
+// 模拟"早已过间隔"，验证不是永久闩。
 const steered19 = []
 const agent19 = { session: { header: { cwd: ws, id: 's19' }, events: sevenSteps }, steer: (m) => steered19.push(m) }
 stopping({ agent: agent19, turn: 41, signal: new AbortController().signal })
 stopping({ agent: agent19, turn: 41, signal: new AbortController().signal })
 stopping({ agent: agent19, turn: 41, signal: new AbortController().signal })
 check('issue#19 同 turn 收尾窗口内只排一条反思', steered19.length === 1, `got ${steered19.length}`)
+getDb(ws, '.dsh-meow').setDreamMeta('reflectstat:s19', JSON.stringify({ lastAt: Date.now() - 21 * 60_000, day: new Date().toISOString().slice(0, 10), count: 1 }))
 stopping({ agent: agent19, turn: 42, signal: new AbortController().signal })
-check('issue#19 换 turn 后放行（不是永久闩）', steered19.length === 2, `got ${steered19.length}`)
+check('issue#19 换 turn 后放行（不是永久闩；已过 20min 最小间隔）', steered19.length === 2, `got ${steered19.length}`)
 const steered19b = []
 const agent19b = {
   session: {
@@ -2248,7 +2235,7 @@ setPromptLang('zh')
 // ③ 未被 user 层覆盖的字段仍按 patch 层跑（user 层是字段级覆盖、不是整层替换）
 const sc3 = makeSettingsCtx({ promptLang: 'zh' })
 await apply(sc3.ctx, { enabled: true, projectDir: '.dsh-meow', hitTopK: 9 })
-check('issue#21 未被 user 层覆盖的字段仍走 patch（工具照常注册）', sc3.tools.length === 8, `got ${sc3.tools.length}`)
+check('issue#21 未被 user 层覆盖的字段仍走 patch（工具照常注册）', sc3.tools.length === 10, `got ${sc3.tools.length}`)
 
 // ── 0.1.7 宿主盲区补丁：describe 值冻结修正 + homeDirPresets 注入 + write 热切换 ──
 // 0.1.7 的 SettingsForms.write 只落盘从不重载 entry：describe 的 value 冻结在启动值、

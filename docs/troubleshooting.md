@@ -1,166 +1,191 @@
-# Troubleshooting
+# Troubleshooting (0.32 fork)
 
-Start here when installation fails, search results are poor, or behaviour is unexpected.
+Start here when installation fails, recall is poor, or behaviour is unexpected.
 
 ---
 
 ## Installation
 
-### The first `dsh plugin add` fails and mentions `allowBuilds`
+### Where do I install this fork from?
 
-pnpm ≥10 blocks install-time build scripts by default: the first `add` may fail and mention `allowBuilds`. Add the keys it prints to the profile's `pnpm-workspace.yaml` and run it again.
+**It is not published to the npm registry.** Two supported routes:
 
-This package compiles itself through a `prepare` script (`node build.mjs`) on install, so that build step is required.
+1. **Local directory / tarball**: in this repository run `npm install && npm run build`, then GUI **Plugins → Add plugin** with the repository's absolute path, or with the absolute path of the `.tgz` produced by `npm pack`;
+2. **Manual profile install**: copy/junction the package into `~/.dsh/profiles/<profile>/node_modules/meow-memory` and add it to `dsh.profile.bundles`.
 
-### Node version requirement
+> `npm install meow-memory` installs **upstream 0.31.1**, not this fork.
 
-`node:sqlite` is the runtime dependency: **default-enabled on Node ≥22.13**; **22.5–22.12 needs `--experimental-sqlite`**. There are no native module dependencies.
+### Why not `dsh plugin add github:...`?
 
-### Manual install (developers, any DSH installation, no npm)
+A `github:` / git dependency installs **devDependencies and runs `prepare` (esbuild build)**. That needs GitHub reachability, pnpm build-script approval (`allowBuilds` — pnpm ≥10 blocks it by default) and resolvable `@deepseek-ai/dsh-*` devDeps. Any failure rolls the profile back. Use the prebuilt tarball/local directory instead.
 
-1. Copy (or symlink) this package into the profile's `node_modules`:
+### First `dsh plugin add` fails mentioning `allowBuilds`
 
-   ```sh
-   mkdir -p ~/.dsh/profiles/web/node_modules
-   ln -s /path/to/meow-memory ~/.dsh/profiles/web/node_modules/meow-memory
-   ```
+pnpm ≥10 blocks install-time build scripts. Add the printed keys to the profile's `pnpm-workspace.yaml` and retry. Only github/git or raw-source installs need a build; a prebuilt tarball does not.
 
-   (On Windows: `New-Item -ItemType Junction ...` — NTFS junction, no admin needed.)
+### Node version
 
-2. Add `meow-memory` to the profile `package.json`'s `dsh.profile.bundles`.
+`node:sqlite` is a runtime dependency: **Node ≥22.13 by default**; 22.5–22.12 needs `--experimental-sqlite`. No native modules.
 
-3. Restart `dsh web`. New sessions pick up the plugin automatically.
+### Peer dependency `@deepseek-ai/schemastery`
 
-### A note on the `@deepseek-ai/schemastery` peer dependency
+It is declared as a **peerDependency** and kept external at build time so the config schema uses the same constructor as the running host. Profile-bundle installs resolve it from the host; no action needed. If the settings page and the plugin disagree on schema behaviour, prefer the dsh plugin channel.
 
-The plugin declares `@deepseek-ai/schemastery` as a **peerDependency** and keeps it external at build time: the config schema must be built by the same constructor the running DSH Host uses, so volatile root references behave identically on both sides. When installed through the dsh plugin channel / profile bundles, the Host resolves it — nothing to do. When installed standalone via npm, npm 7+ auto-installs a second copy for the peer; schema validation then runs against the plugin's own copy. If the settings page and the plugin ever disagree about schema behavior, prefer the dsh plugin channel install.
+### Does uninstalling delete my memories?
 
-### Remove
+**No.** Uninstalling only removes the code. Clean up manually if desired:
 
-```sh
-dsh plugin --profile web remove meow-memory
 ```
+<workspace>/.dsh-meow/
+~/.dsh-meow/                    # or your configured homeDir
+~/.dsh/storages/meow-memory-home.json
+```
+
+### After upgrading from upstream 0.31 my memories don't work / the store is "not trusted"
+
+The old `memory.db` has no `.owner.json` marker, so this fork classifies it as **foreign/untrusted** on first run (**even an empty upstream DB counts as pre-existing**): the store is not opened (no upgrade/index/migration/read), its content is not injected, memory tool reads/writes plus dream/reflection are refused, and the one-time untrusted-store notice appears. To keep the old memories:
+
+- set `security.trustWorkspaceMemory: true` in the profile config and reload the plugin (only after confirming the store is yours); or
+- delete/rename the old store and start fresh (back it up first — deletion is irreversible).
+
+---
+
+## Cost and automatic behaviour
+
+### Why is it spending tokens when I never asked it to remember anything?
+
+By default the plugin automatically: attaches the static manual + tool descriptions to **every request** (≈6.7k tokens measured, Chinese pack; ≈6.3k English), injects a snapshot on the first turn, and runs automatic dream/reflection (full-context requests) when conditions hold. That is the inherent cost of automatic memory and does not depend on you calling tools.
+
+Full list and caps: [README cost section](../README.en.md#read-this-first-it-spends-tokens-automatically). To turn the automatic parts off:
+
+```yaml
+config:
+  reflect: false
+  dream:
+    enabled: false
+```
+
+Or per window: session row "…" menu → **Memory participation** → turn off auto-injection / auto-consolidation.
+
+### Why didn't dream run / reflection fire?
+
+0.32's automatic consolidation is bounded by default; all conditions must hold:
+
+| Possible reason | Detail |
+|---|---|
+| Window not idle long enough | Idle ≥ `dream.idleMinutes` (default 180 min) |
+| In a suppression window | Default Beijing 09:00–12:00, 14:00–18:00 plus 15 min before each |
+| **No live agent** | Since 0.32 automatic dream never `agents.resume()`s a bare agent (#49) |
+| Context too large | Estimated context > `budget.dreamMaxContextTokens` (default 40000) |
+| Already dreamt today | `budget.dreamMaxPerWindowPerDay` default 1 |
+| Window marked skipped | Restore from the session row "…" menu |
+| Too old / archived | No live agent and >24h old, or archived sessions, are skipped |
+| Last message older than last dream | Only windows whose last message is newer than the last dream are consolidated |
+
+Reflection additionally has `budget.reflectMinIntervalMinutes` (default 20) and `budget.reflectMaxPerDay` (default 6). With `security.debugLogs: true` the skip reason is logged.
+
+### How do I consolidate right now?
+
+Type `/dream` in the composer (same as the `memory_dream` tool; **not** subject to peak suppression or the daily cap).
 
 ---
 
 ## Retrieval and hits
 
-### Why was there no keyword hit on the first message?
+### Why no keyword hit on the first message?
 
-**No keyword hits run on the first turn** (they start from the second message). The first turn injects the long-term memory snapshot instead — a deliberate design, see [Design notes](design-notes.md).
+**The first turn does not run keyword hits** (they start from the second message); it injects the long-term snapshot only. See [design notes](design-notes.md).
 
-Even when the first user message arrives batched with a plugin notice (e.g. an approval-policy change notification), the snapshot still lands directly before the real user message and hits never fire early.
+### Low recall / misses
 
-### Poor hit rate / memories not being found
+Most likely causes:
 
-In order of likelihood:
+1. **`promptLang` not set explicitly** — it shapes the entry language and keywords are extracted per entry language. The value is matched verbatim against a subdirectory name; a typo silently falls back to Chinese.
+2. **Hits match keywords, not full text** — fix keywords with `memory_update`, or find the entry with `memory_list` and rewrite it. Since 0.32 `minScore` (default 0.35) filters weak hits; raise it for a quieter chain, lower for more recall.
+3. **`hit_count` feedback needs time** — since 0.32 hit counts participate in ranking, but they cannot make an entry precise on their own.
+4. **`pt-br` has no Portuguese stemming/stopwords**, so Portuguese recall is weaker than English (known limitation).
 
-1. **`promptLang` was never set explicitly.** `promptLang` also shapes the language the model writes memory entries in — keywords are extracted in the entry's language. **Set it explicitly on first use.** The value *is* the subdirectory name and is matched **verbatim**: a name that does not exist under `src/prompts/` (e.g. `pt`) raises nothing and silently falls back to the Chinese pack.
-2. **The entry keywords are weak.** Matching is based on **entry keywords** (LLM-extracted or auto bigram), not full text — full-text matching is noisy. Correct them with `memory_update`'s `keywords`.
-3. **You are looking at the list, not the answer.** `memory_search` returns a metadata view (origin + id + relative time + keywords) and **not the entry text**; use `memory_read` for the text and `memory_project` for a project's whole picture.
+### Hits are metadata, not answers
 
-> A language mismatch between queries and stored entries does not degrade recall: the BM25 tokenizer is language-independent since v0.20.0 (category routing); `en` additionally enables English normalization (stopword filter + Porter stemmer), so inflected queries still hit stored entries (`tokenizers` matches `tokenizer`).
+`memory_search` returns a metadata view (project, id, time, keywords, truncated content). Use `memory_read` for the full text, `memory_project` for the project panorama, and `memory_list` for a whole-store metadata inventory.
 
-### Casual chat hit another project's memories
+### Casual chat hits an unrelated project
 
-Unanchored hits search the global scope only, so casual chat stays unaffected. Any `memory_remember/search/update/project` call with a `project` parameter anchors that session's current project.
+Unanchored sessions only hit global entries. A `project` argument on `memory_remember/search/update/project` anchors the session's current project.
 
-### What should I put in `project` for global memories?
+### What goes in the global marker?
 
-Global information uses the **global marker** (the active language pack's `project.global` value in `labels.md`: the Chinese pack uses 「全局」, the English pack uses `"global"`), which is distinct from leaving the field blank. When it applies to several projects, separate them with commas (e.g. `"dsh, femo"`) — search and hits decide by "contains the current project name OR global".
-
----
-
-## Consolidation (dream)
-
-### dream never triggers
-
-Check in order:
-
-| Possible cause | Explanation |
-|---|---|
-| The window has not been idle long enough | A window becomes eligible after ≥ `idleMinutes` (default **180 min = 3 hours**) idle |
-| It is inside a peak-hour window | **Peak-hour suppression** (computed in `timeZone`, default Asia/Shanghai): `suppressWindows` defaults to 09:00–12:00 and 14:00–18:00, plus the `suppressLeadMinutes` (default 15) before each starts. It fires on the next check cycle after the peak ends |
-| The window is skipped | Restore it from the "…" menu on its session row |
-| The window is too old or archived | Old windows (no live agent, >24h) and archived sessions are left alone |
-| Its last chat precedes its last dream | Only windows whose last chat is newer than their last dream get consolidated |
-
-A dream already in progress is never interrupted.
-
-Cold sessions resume through DSH's ordinary-session controller when available, restoring their recorded model selection, preset and tools. Legacy Hosts without that controller API use `agents.resume()` with the last valid recorded provider/model, then the deployment's default selection; if neither is available, they retain the prior bare-resume behavior. The legacy path does not restore preset-scoped tools. Errors from an available controller never fall back to a second raw resume. Live-session consolidation is unchanged.
-
-### How do I consolidate right now instead of waiting?
-
-Type `/dream` in the composer to start consolidating this window immediately (same semantics as the `memory_dream` tool, **immune to peak-hour suppression**). It is executed by the dsh command plane, never sent to the model, and shows up in the `/` autocomplete menu. A consolidation already in progress is reported clearly instead of being started twice.
-
-### One window should not be auto-consolidated
-
-Open the "…" menu on that session's sidebar row and click **"跳过梦境整理记忆" (skip dream consolidation)**; click **"取消跳过梦境整理记忆" (un-skip)** to restore. Skipped windows are never picked up by the idle timer again (while `/dream` and `memory_dream` keep working), and their session row shows a **muted-gray "moon with slash" icon** at a glance. The skip flag persists across restarts and stays consistent across both instances (shared memory database).
-
-### What do the session-list icons mean?
-
-| Icon | Meaning |
-|---|---|
-| **Pale-yellow crescent moon 🌙** | dream has consolidated this session's memory and there has been no new conversation since |
-| **White→gold breathing moon** | a dream turn is running (sits to the left of dsh's status dots so it cannot be mistaken for normal work) |
-| **Muted-gray "moon with slash"** | this session's dream consolidation is skipped (un-skipping falls back automatically) |
-
-Priority: **breathing > skipped > crescent**. New activity removes the icon.
-
-### A throwaway-task workspace polluted the memory db
-
-List it in `disabledWorkspaces`: cwd is matched exactly (path normalisation: unified slashes + trailing slash removed + case-insensitive), and a matching workspace has memory **fully disabled** (reads, consolidation and writes all refused, **including a manual `/dream`**).
+Information that applies everywhere uses the **global marker** (`project.global` in the current language pack: `全局` in zh, `global` in en/pt-br). Applies to several projects: comma-separated, e.g. `"dsh, femo"`.
 
 ---
 
-## Data and directories
+## Security and trust
 
-### Where does the memory live?
+### Will my memories end up in git?
 
-- Workspace level: `<workspace>/<projectDir>/memory.db` (`projectDir` defaults to `.dsh-meow`)
-- Session level traces: `<workspace>/<projectDir>/sessions/<id>.json`
-- Instance-level global directory (logs / window-index / prompts overrides / migrate state): decided by `homeDir`
+By default no: when creating the memory directory the plugin writes `.gitignore` with `*` (self-ignoring), and **appends a `*` line if a pre-existing `.gitignore` lacks one** (blocks `!*` re-inclusion), so `git add .` will not commit `memory.db`. It is **not encrypted** though — do not put secrets in memories; `.gitignore` does not protect backups or sync folders.
 
-### How do I switch the global data directory?
+### Why does the plugin say my store is not trusted?
 
-Just tell the AI (the `memory_home` tool) — no code and no restart. Or set a preset marker / absolute path in the settings page or the `homeDir` field.
+If the workspace already contains a `.dsh-meow/memory.db` that this plugin did not create (a valid `.owner.json` is what proves ownership), 0.32 treats it as **untrusted — even when it is empty/schema-only**: the store is not opened (no upgrade/index/migration/read), its content is not injected, and **every memory tool (read and write), dream and reflection is refused** with an untrusted-store error. That blocks #64-1 (a cloned repo planting poisoned memories) and the "pre-seeded empty DB + triggers" path.
 
-A switch persists across restarts: on success the tool writes a pointer file at `$DSH_HOME/storages/meow-memory-home.json`, which startup reads back (explicit `homeDir` config and the `MEOW_MEMORY_HOME` env still take precedence). A missing/corrupt pointer or a deleted target silently falls back to the platform default.
+A valid marker requires: `schema=1`, `installId` equal to this machine's random install id, and `workspace` matching the current path. If the store is yours: set `security.trustWorkspaceMemory: true` and reload, or delete/rename the file and rebuild.
 
-A switch = same-volume move / cross-volume copy; **the old directory is never deleted automatically**; if the target already holds content it is enabled as-is without overwriting; an invalid `target` never switches by mistake (it reports clearly and keeps the current directory); a failure leaves data untouched and can be retried later.
+### Is my old `PROJECT.md` migrated automatically?
 
-> If several dsh instances on this machine share the old directory, update their settings too after switching.
+**Not since 0.32** (`autoMigrate` defaults to `false`). Enable it explicitly and only for a workspace you trust.
 
-### How do I back it up?
+### Why can't `memory_home` switch directories anymore?
 
-Set `backup.enabled: true`: at the end of each dream, `memory.db` is snapshotted to `memory.db.bak` (`VACUUM INTO` consistent backup, mtime-based incrementality). **Consumed at registration; a change needs a reload.**
+Since 0.32 it is query-only by default (`security.allowHomeSwitch: false`): the tool is model-callable and the directory is also the prompt-override root, so the model must not be able to move it (#64-2). Enable it explicitly in the config if you need switching.
 
-### Will a legacy `PROJECT.md` be lost?
+### Where does the data live?
 
-`autoMigrate` defaults to `true`: a legacy `PROJECT.md` is migrated when the db is first opened.
+- Workspace: `<workspace>/<projectDir>/memory.db` (`projectDir` default `.dsh-meow`)
+- Session bookkeeping: `<workspace>/.dsh-meow/sessions/<id>.json`
+- Trust marker: `<workspace>/.dsh-meow/.owner.json`
+- Instance-level global directory (logs / window index / migrate state): default `~/.dsh-meow` (**outside `DSH_HOME`**), or `homeDir` / `MEOW_MEMORY_HOME`
+- Prompt instance overrides: `$DSH_HOME/storages/meow-memory/prompts/<lang>/<slot>.md` (fixed; does not follow `homeDir`/`memory_home` switches)
+
+---
+
+## Compatibility (0.2.1-rc.2)
+
+### Which DSH versions are supported?
+
+This fork was **verified on DSH Desktop 0.2.1-rc.2** (Electron 44.7.0 / Node 24.21.0, Windows 11): isolated load succeeded, the 3 routes returned 200/401 under auth, the settings namespace appeared, no apply error. **0.1.x was not tested**; the "supports dsh 0.1.5" claim is gone.
+
+### Settings page saves but nothing changes
+
+On 0.2.x the settings service was redesigned and the plugin takes a degraded path. The page renders, but "edit → save → reload → applied" was not verified by this fork; worst case it displays values without reaching apply. Run the [README self-check list](../README.en.md#self-check-after-install); otherwise edit the profile patch config directly.
+
+### Tool set shrinks after dream / model changes
+
+- **#66 (unfixed)**: after a dream the session tool set can lock to 9 memory tools and requires a **dsh restart**. The plugin sets no tool filter, indicating host background-turn policy; 0.32's automatic dream uses the live-agent path, but manual dream can still trigger it.
+- **#71 (unfixed)**: only when `delegate.model` is set; the default empty value does not trigger.
+- On either signal, restart dsh; if it persists, open an issue with `security.debugLogs: true` logs.
+
+### Client UI (fold bars, moon icons) disappeared
+
+They depend on 0.2.x `ChatSnapshot` internals and DOM observation; a host patch can silently disable them. Cosmetic only — memory data and tools are unaffected.
 
 ---
 
 ## Extending and languages
 
-### Why do the UI language and the prompt language differ?
+### Why are the UI language and the prompt language different?
 
-The plugin's UI copy (fold bars, delegate bubbles, session menu item, settings page) goes through a separate **UI copy layer** that follows DSH's Settings → General → Language, while injected prompts keep following `promptLang`. The two layers do not interfere.
+UI copy follows DSH's Settings → General → Language (UI layer); model prompts follow `promptLang` (prompt layer). They do not interfere.
 
-On old hosts (no locale service) it degrades to the browser language plus the built-in dictionaries, ending at `zh`.
+### Adding a UI language / a prompt language
 
-### How do I add a UI language?
-
-One dictionary file plus one line in `SUPPORTED_UI_LOCALES` (no UI code changes). See [`src/i18n/README.md`](../src/i18n/README.md).
-
-### How do I add a prompt language pack?
-
-Prompt copy is data (one directory per language under `src/prompts/`, hot-read at runtime — no code changes needed). See [`src/prompts/README.md`](../src/prompts/README.md) for the contributor guide and `npm run check-lang`. Instance-level overrides: drop same-named slot files into `<home>/.dsh-meow/prompts/<lang>/` (partial overrides welcome).
+UI: add a dictionary file + one `SUPPORTED_UI_LOCALES` entry — see [`src/i18n/README.md`](../src/i18n/README.md).  
+Prompts: add `src/prompts/<lang>/` and make `node scripts/check-lang.mjs <lang>` green — see [`src/prompts/README.md`](../src/prompts/README.md). Instance overrides go under `$DSH_HOME/storages/meow-memory/prompts/<lang>/<slot>.md` (fixed path; does not follow `homeDir`/`memory_home` switches).
 
 ---
 
-## See also
+## Related docs
 
-- [Tool reference](tool-reference.md) — the seven tools' parameters and returns
-- [Configuration reference](configuration-reference.md) — every configuration field
-- [Design notes](design-notes.md) — why it is designed this way
+- [Tool reference](tool-reference.md)
+- [Configuration reference](configuration-reference.md)
+- [Design notes](design-notes.md)

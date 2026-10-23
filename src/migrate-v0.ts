@@ -263,6 +263,10 @@ function migrateLine(line: string): { line: string; changed: number; note?: stri
 
 /* ---------------- 文件枚举与帧级处理 ---------------- */
 
+/** 会话日志文件名：0.2.1-rc.2 起落 session.v4.jsonl.zstd，旧宿主是 session.jsonl.zstd。
+ *  两个都扫（同一会话目录只会有其一；都不存在 = 该会话无日志，保持 no-op）。 */
+const SESSION_LOG_FILES = ['session.v4.jsonl.zstd', 'session.jsonl.zstd'] as const
+
 function listSessionFiles(home: string): string[] {
   const files: string[] = []
   for (const rootName of ['sessions', 'archived-sessions']) {
@@ -274,8 +278,10 @@ function listSessionFiles(home: string): string[] {
       try { st = statSync(projDir) } catch { continue }
       if (!st.isDirectory()) continue
       for (const sid of readdirSync(projDir)) {
-        const f = join(projDir, sid, 'session.jsonl.zstd')
-        if (existsSync(f)) files.push(f)
+        for (const name of SESSION_LOG_FILES) {
+          const f = join(projDir, sid, name)
+          if (existsSync(f)) files.push(f)
+        }
       }
     }
   }

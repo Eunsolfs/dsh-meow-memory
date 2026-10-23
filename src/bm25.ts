@@ -5,8 +5,8 @@
  * 字母/数字（\p{L}\p{N}）整词；NFKC 归一化；标点/符号/emoji 丢弃。
  * en 语言包贡献（PR #6）：en 模式下对产出 tokens 追加英语归一化（停用词过滤 +
  * Porter 词干还原，见下方 EN 段）；其他语言维持基线（stemming 扩展点见 prompts/README.md）。
- * 打分：标准 BM25 × 艾宾浩斯近期权重；importance≥3 或超级匹配（≥0.85×本轮
- *       最高原始分）时豁免衰减。
+ * 打分：标准 BM25 × 指数遗忘权重（半衰期可配，默认 30 天；importance≥3 只有 0.85 下限，
+ *       不再整体豁免）；可选 importance 参与排名（importanceWeight）与 hit_count 加成（hitBoost）。
  * 偏离信号：turn 文本向量 vs 各 topic 质心（title+goal+content+keywords 词频
  *       向量）的余弦相似度；top1 相似度过低 → "疑似新话题"提示。topic 数 < 3
  *       （冷启动）不提示。信号只提醒不拍板，归属判定由模型用目标句测试完成。
@@ -21,6 +21,8 @@ export interface Doc {
   content: string
   keywords: string[]
   importance: number
+  /** 历史命中/查阅次数（bumpHitCount 累计）——hitBoost 用；旧生产者/测试构造的 Doc 可缺省。 */
+  hit_count?: number
   created_at: number
   /** 记忆时间戳 = 最后更新时间（艾宾浩斯按它算年龄）。 */
   updated_at: number
@@ -85,7 +87,7 @@ export function tokenize(text: string): string[] {
 //
 // 两步，都是英语特有、中文不需要的：
 // 1. 停用词过滤：英语功能词（the/of/is…）在每条记忆里都出现，BM25 的 idf 已经压得很低，
-//    但命中链路的覆盖率分母（keywordHitScore 的 coverage）会被它们稀释，且撇号切分
+//    但会把噪音词条带进命中链路的匹配/覆盖率统计，且撇号切分
 //    （"user's" → user + s）会漏出 s/t/ll 这类碎片，一并在此丢弃。
 // 2. Porter 词干还原：英语有屈折变化，caches/caching/cached 必须归到同一词干，
 //    否则用户 prompt 写复数、记忆条目写单数就永远命中不了（中文无屈折，故 zh 分支不做）。
@@ -206,19 +208,30 @@ function docText(d: Doc): string {
   return [d.title ?? '', d.content, ...d.keywords].join(' ')
 }
 
-/** 艾宾浩斯复习间隔分桶（年龄天数 → 权重）。 */
-export function recencyWeight(ageMs: number): number {
-  const days = ageMs / 86_400_000
-  if (days < 1) return 1.0
-  if (days < 2) return 0.9
-  if (days < 4) return 0.8
-  if (days < 7) return 0.65
-  if (days < 15) return 0.5
-  if (days < 30) return 0.35
-  if (days < 60) return 0.25
-  if (days < 180) return 0.15
-  return 0.08
+/**
+ * 指数遗忘权重（艾宾浩斯曲线）：0.05 + 0.95·e^(−ln2·ageDays/halfLifeDays)。
+ * - age=0 → 1，越旧越接近下限 0.05；半衰期默认 30 天（v0.32 起由 retrieval.halfLifeDays 传入）；
+ * - importance ≥ 3 的条目只保留 0.85 下限（旧实现整体豁免衰减——那样"重要性高=永远新鲜"，
+ *   审计判定过度；现在仍会衰减，只是压不过 0.85）；
+ * - 非有限/负年龄按最旧处理（缺 updated_at 的旧数据不会虚高）；一参旧调用依旧有效。
+ */
+export function recencyWeight(ageMs: number, opts: { halfLifeDays?: number; importance?: number } = {}): number {
+  const halfLifeDays =
+    typeof opts.halfLifeDays === 'number' && Number.isFinite(opts.halfLifeDays) && opts.halfLifeDays > 0
+      ? opts.halfLifeDays
+      : 30
+  const ageDays = Number.isFinite(ageMs) ? Math.max(0, ageMs) / 86_400_000 : Infinity
+  const w = 0.05 + 0.95 * Math.exp((-Math.LN2 * ageDays) / halfLifeDays)
+  return opts.importance !== undefined && opts.importance >= 3 ? Math.max(0.85, w) : w
 }
+
+/** hit_count 加成：min(2, 1 + 0.15·ln(1+hit_count))；无 hit_count/非正值视为 ×1（仅 hitBoost 开时用）。 */
+function hitBoostWeight(hitCount: number | undefined): number {
+  if (hitCount === undefined || !Number.isFinite(hitCount) || hitCount <= 0) return 1
+  return Math.min(2, 1 + 0.15 * Math.log(1 + hitCount))
+}
+
+const round3 = (n: number): number => Math.round(n * 1000) / 1000
 
 export interface RankedHit {
   id: string
@@ -228,11 +241,13 @@ export interface RankedHit {
   importance: number
   updated_at: number
   score: number
-  /** 分项得分（#51，explain=true 时才有）：bm25=关键词原始分、importance=条目重要度、
-   *  recencyWeight=艾宾浩斯权重（importance≥3 或分数贴近榜首时不衰减，恒 1）、
-   *  score=最终分（bm25 × recencyWeight）。状态过滤（active/stale）是检索前的二值
-   *  过滤、不进打分，工具层在 explain 里补 status 字段。 */
-  explain?: { bm25: number; importance: number; recencyWeight: number; score: number }
+  /** 分项得分（#51，explain=true 时才有）：bm25=关键词原始分（未乘任何系数）、importance=条目重要度、
+   *  recencyWeight=该条目的指数遗忘权重（importance≥3 时有 0.85 下限）、
+   *  importanceWeight=importance 乘数（importanceWeight 开启时才有）、
+   *  hitBoost=hit_count 乘数（hitBoost 开启且该条有 hit_count 时才有）、
+   *  score=最终分（bm25 × recencyWeight × (importanceWeight??1) × (hitBoost??1)）。状态过滤
+   *  （active/stale）是检索前的二值过滤、不进打分，工具层在 explain 里补 status 字段。 */
+  explain?: { bm25: number; importance: number; recencyWeight: number; importanceWeight?: number; hitBoost?: number; score: number }
 }
 
 export interface SearchOptions {
@@ -241,15 +256,29 @@ export interface SearchOptions {
   now?: number | null
   /** 附带每条命中的分项得分（#51 可解释检索）：只加字段，不改排序。 */
   explain?: boolean
+  /** 指数遗忘半衰期（天）；默认 30。 */
+  halfLifeDays?: number
+  /** 最终分阈值：低于它的命中不返回。search 只在显式传入时过滤（keywordHitScore 由调用方传契约默认 0.35）。 */
+  minScore?: number
+  /** hit_count 加成：默认开（传 false 关闭，兼容旧行为）。 */
+  hitBoost?: boolean
+  /** importance 参与最终分：默认开（传 false 关闭，回退到 importance 不进排名）。 */
+  importanceWeight?: boolean
 }
 
 /**
- * BM25 × 近期权重检索。docs 中 importance≥3 或原始分 ≥0.85×本轮最高分的
- * 条目豁免衰减。返回按最终分降序。
+ * BM25 × 遗忘权重检索（教科书 BM25 数学不变：recency/importance/hit_count 只乘最终分）。
+ * - 遗忘权重按条目自己的 importance 计算（importance≥3 有 0.85 下限，不再整体豁免）；
+ * - importanceWeight 默认开：最终分 × (0.85 + 0.05·importance)；
+ * - hitBoost 默认开：最终分 × min(2, 1 + 0.15·ln(1+hit_count))（Doc.hit_count 缺省视为 ×1）；
+ * - minScore 只在显式传入时过滤（search 默认保留全部命中）。
+ * 返回按最终分降序。
  */
 export function search(query: string, docs: Doc[], opts: SearchOptions = {}): RankedHit[] {
   const k = opts.k ?? 5
   const now = opts.now === undefined ? Date.now() : opts.now
+  const useImportance = opts.importanceWeight !== false
+  const useHitBoost = opts.hitBoost !== false
   const q = tokenize(query)
   if (q.length === 0 || docs.length === 0) return []
 
@@ -286,14 +315,18 @@ export function search(query: string, docs: Doc[], opts: SearchOptions = {}): Ra
     return s
   })
 
-  const maxRaw = Math.max(...raw)
   const hits: RankedHit[] = []
   for (let di = 0; di < docs.length; di++) {
     if (raw[di] <= 0) continue
-    let w = 1
-    if (now !== null && docs[di].importance < 3 && !(raw[di] >= 0.85 * maxRaw)) {
-      w = recencyWeight(now - docs[di].updated_at) // 艾宾浩斯按记忆时间戳（最后更新时间）
-    }
+    // 遗忘权重按条目自己的 importance 计算（importance≥3 只保 0.85 下限，不再整体豁免）；
+    // now=null 是手动检索/测试的"关闭衰减"开关。
+    const w = now === null
+      ? 1
+      : recencyWeight(now - docs[di].updated_at, { halfLifeDays: opts.halfLifeDays, importance: docs[di].importance })
+    const impW = useImportance ? 0.85 + 0.05 * docs[di].importance : 1
+    const hitW = useHitBoost ? hitBoostWeight(docs[di].hit_count) : 1
+    const score = raw[di] * w * impW * hitW
+    if (opts.minScore !== undefined && score < opts.minScore) continue
     hits.push({
       id: docs[di].id,
       level: docs[di].level,
@@ -301,9 +334,18 @@ export function search(query: string, docs: Doc[], opts: SearchOptions = {}): Ra
       content: docs[di].content,
       importance: docs[di].importance,
       updated_at: docs[di].updated_at,
-      score: raw[di] * w,
+      score,
       ...(opts.explain === true
-        ? { explain: { bm25: Math.round(raw[di] * 1000) / 1000, importance: docs[di].importance, recencyWeight: Math.round(w * 1000) / 1000, score: Math.round(raw[di] * w * 1000) / 1000 } }
+        ? {
+            explain: {
+              bm25: round3(raw[di]),
+              importance: docs[di].importance,
+              recencyWeight: round3(w),
+              ...(useImportance ? { importanceWeight: round3(impW) } : {}),
+              ...(useHitBoost ? { hitBoost: round3(hitW) } : {}),
+              score: round3(score),
+            },
+          }
         : {}),
     })
   }
@@ -312,18 +354,27 @@ export function search(query: string, docs: Doc[], opts: SearchOptions = {}): Ra
 }
 
 /**
- * 关键词命中打分（每消息命中链路专用）：
- *   score = 交集分 × 覆盖率 × 艾宾浩斯(updated_at) × importance 权重 × title 加成
+ * 关键词命中打分（每消息命中链路专用，v0.32 契约）：
+ *   score = 本轮归一化原始分 × 查询覆盖率 × 遗忘权重 × importance 权重 × title 加成 × hit_count 加成
  * - 匹配面 = 调用方准备的 docs.content（记忆 keywords 串，或旧条目回退的内容片段）+ title；
  *   query = 用户消息全文 bigram；
- * - 交集分 = Σ(命中的词条 × query 词频 × idf)——稀有词命中含金量高；
- * - 覆盖率 = 命中词条数 / 该记忆匹配面词条总数——防"一个词碰瓷上榜"；
- * - 艾宾浩斯按记忆时间戳（updated_at）衰减，importance≥3 或超级匹配（≥0.85×本轮最高交集分）豁免；
- * - importance 权重 = 1 + (importance-1)×0.25（3 星 ×1.5）；title 被命中 ×1.2。
+ * - 原始分 = Σ(命中的 query 词条 × query 词频 × idf)——稀有词命中含金量高；再除以本轮最高
+ *   原始分（0..1），让 minScore 成为跨库/跨查询可比的阈值（排序不变）；
+ * - 查询覆盖率 = 命中 query 去重词条数 / query 去重词条数——**不再除以记忆匹配面词数**：
+ *   8–13 个关键词的条目不再因词多被稀释（与提示词写作规范一致，审计 §2.2 的 P0）；
+ *   计分用 `0.6 + 0.4×覆盖率`（命中 ≥1 个 query 词即保底 0.6）：短中文消息常只命中
+ *   1/4 词条，线性覆盖率会把 0.35 门槛变成"短消息永不注入"——保底项保住召回，
+ *   覆盖率仍在排序里奖励多词命中；
+ * - 遗忘权重 = 指数半衰期（默认 30 天，importance≥3 有 0.85 下限）；
+ * - importance 权重（importanceWeight 默认开）= 0.85 + 0.05×importance（3 星 ×1.0，4 星 ×1.05）；
+ * - hit_count 加成（hitBoost 默认开）= min(2, 1 + 0.15·ln(1+hit_count))；
+ * - title 被命中 ×1.2；minScore（调用方契约默认 0.35）过滤低质量命中，不传不过滤。
  */
 export function keywordHitScore(query: string, docs: Doc[], opts: SearchOptions = {}): RankedHit[] {
   const k = opts.k ?? 2
   const now = opts.now === undefined ? Date.now() : opts.now
+  const useImportance = opts.importanceWeight !== false
+  const useHitBoost = opts.hitBoost !== false
   const q = tokenize(query)
   if (q.length === 0 || docs.length === 0) return []
   const qTf = new Map<string, number>()
@@ -356,19 +407,26 @@ export function keywordHitScore(query: string, docs: Doc[], opts: SearchOptions 
     return s
   })
   const maxRaw = Math.max(...raw)
+  // 查询覆盖率的分子/分母都用 query 去重词条（与记忆匹配面长度无关）。
+  const queryTokens = qTf.size
   const out: RankedHit[] = []
   for (let di = 0; di < docs.length; di++) {
     if (raw[di] <= 0) continue
-    const len = docToks[di].length
     let overlap = 0
     for (const t of qTf.keys()) if (tf[di].has(t)) overlap++
-    const coverage = len > 0 ? overlap / len : 0
-    let w = 1
-    if (now !== null && docs[di].importance < 3 && !(raw[di] >= 0.85 * maxRaw)) {
-      w = recencyWeight(now - docs[di].updated_at)
-    }
-    const impW = 1 + (docs[di].importance - 1) * 0.25
+    const coverage = queryTokens > 0 ? overlap / queryTokens : 0
+    const w = now === null
+      ? 1
+      : recencyWeight(now - docs[di].updated_at, { halfLifeDays: opts.halfLifeDays, importance: docs[di].importance })
+    const impW = useImportance ? 0.85 + 0.05 * docs[di].importance : 1
+    const hitW = useHitBoost ? hitBoostWeight(docs[di].hit_count) : 1
     const titleHit = tokenize(docs[di].title ?? '').some((t) => qTf.has(t))
+    // 相关性分（不含遗忘权重）：minScore 只过滤"相关度不够"，不因条目旧而拒召回。
+    // 0.32 review：若门槛乘上遗忘权重，importance≤2 的条目约 45 天后即使完整命中也会
+    // 被静默丢弃（"自动召回截断"）；旧条目该降的是排序，不是能否被想起。
+    const relevance = (maxRaw > 0 ? raw[di] / maxRaw : 0) * (0.6 + 0.4 * coverage) * impW * (titleHit ? 1.2 : 1) * hitW
+    if (opts.minScore !== undefined && relevance < opts.minScore) continue
+    const score = relevance * w
     out.push({
       id: docs[di].id,
       level: docs[di].level,
@@ -376,7 +434,7 @@ export function keywordHitScore(query: string, docs: Doc[], opts: SearchOptions 
       content: docs[di].content,
       importance: docs[di].importance,
       updated_at: docs[di].updated_at,
-      score: raw[di] * coverage * w * impW * (titleHit ? 1.2 : 1),
+      score,
     })
   }
   out.sort((a, b) => b.score - a.score)

@@ -1,8 +1,8 @@
-# Tool reference
+# Tool reference (0.32 fork)
 
-The seven memory tools meow-memory registers, with every parameter and return value. Tools fall into three permission bands: **read** (search / read / find_similar / project), **write** (remember / update / dream), **directory** (home).
+meow-memory registers **10** memory tools. Three bands: **read** (search / read / find_similar / project / list), **write** (remember / update / forget / dream), **directory** (home).
 
-> Tool descriptions and returned copy follow the `promptLang` language pack, so under the English or Portuguese pack the descriptions in these tables appear in that language.
+> Tool descriptions and returned copy follow the `promptLang` language pack. Parameter schemas do not change with language.
 
 ---
 
@@ -11,165 +11,197 @@ The seven memory tools meow-memory registers, with every parameter and return va
 | Tool | Band | Purpose |
 |---|---|---|
 | `memory_remember` | write | Write one memory: content / project / keywords / importance required |
-| `memory_search` | read | Keyword search (BM25 × recency weight) |
+| `memory_search` | read | BM25 × recency search (with optional `explain`) |
 | `memory_project` | read | Fetch a project's whole-project injection paragraph |
-| `memory_find_similar` | read | Duplicate and conflict detection |
+| `memory_find_similar` | read | Duplicate & conflict detection |
 | `memory_read` | read | Read one entry's complete metadata by id |
-| `memory_update` | write | Correct status / importance / goal / keywords / content by id |
-| `memory_dream` | write | Manually trigger this window's consolidation (same semantics as `/dream`) |
-| `memory_home` | directory | Inspect / switch the global data directory |
+| `memory_update` | write | Fix status / importance / goal / keywords / content |
+| `memory_list` | read | **new in 0.32**: list entry metadata (no text) to take stock and find ids |
+| `memory_forget` | write | **new in 0.32**: archive / restore / hard-delete one entry by id |
+| `memory_dream` | write | Manually trigger this window's consolidation (same as `/dream`) |
+| `memory_home` | directory | Inspect the global data directory; **query-only by default since 0.32** |
 
-> There is also the `/dream` user command (typed straight into the composer) — same semantics as the `memory_dream` tool, immune to peak-hour suppression.
+There is also the `/dream` command: type it in the composer to consolidate this window right away, immune to peak-hour suppression.
 
 ---
 
 ## `memory_remember` — write
 
-`content` / `project` / `keywords` / `importance` are required; **a missing one raises its own error and asks you to fill it in**. Writes deduplicate and merge automatically and return a read-back confirmation (keywords, project).
+`content` / `project` / `keywords` / `importance` are required; missing ones produce explicit errors. There is **no automatic keyword extraction** fallback.
 
-| Parameter | Type | Default | Notes |
+| Parameter | Type | Default | Meaning |
 |---|---|---|---|
-| `content` | string | — | Required. The memory body |
-| `project` | string | — | Required. Project name; global information uses the global marker |
-| `keywords` | string[] | — | Required. Retrieval keywords (hits are keyword-based, not full-text) |
-| `importance` | integer | `1` | Required. Weight, participates in hit scoring |
-| `level` | enum | `fact` | One of `soul` / `user` / `project` / `fact` / `lesson` / `topic` / `rules` |
-| `subcategory` | enum | — | Only honoured when `level=project`: `overview` / `structure` / `decisions` / `quotes` / `ops` / `todo` |
-| `goal` | string | — | Goal sentence (used by the `topic` layer) |
+| `content` | string | — | Required. Memory body |
+| `project` | string | — | Required. Project name; global marker for global info; comma-separated for multiple projects |
+| `keywords` | string[] | — | Required. 8–13 search keywords (hits match keywords, not full text) |
+| `importance` | integer | `1` | Required. Participates in ranking |
+| `level` | enum | `fact` | `soul` / `user` / `project` / `fact` / `lesson` / `topic` / `rules` |
+| `subcategory` | enum | — | `level=project` only: `overview` / `structure` / `decisions` / `quotes` / `ops` / `todo` |
+| `goal` | string | — | Goal sentence (`topic`) |
 | `corrected` | boolean | `false` | Whether this is a correction-type memory |
 
-**Returns**: `ok` / `id` / `level` / `merged` (whether it merged into an existing entry) / `keywords` / `project`.
+**Returns**: `ok` / `id` / `level` / `merged` / `keywords` / `project`.
 
-> A missing `keywords` and a `keywords` that yields nothing after parsing return **different error messages** (issue #24).
+**Dedupe reality**: only **same level**, bigram **Jaccard ≥ 0.8** (near-identical wording) merges. Paraphrases and cross-level duplicates do **not** merge. Merging overwrites keywords with the new list and takes `max(importance)`.
 
 ---
 
 ## `memory_search` — search
 
-BM25 × recency weight. Default `k=10`, selected as **the top 5 by relevance (seen entries and entries created in this session are *not* excluded) + 5 more filled from further down the ranking while skipping already-seen entries**, ordered by memory timestamp.
+**BM25 × recency weight** (the per-message keyword hit uses a different scorer, below). Default `k=10`: the first 5 by relevance (seen entries not excluded), then 5 more from the remaining ranking skipping seen entries, re-sorted old → new by memory timestamp.
 
-| Parameter | Type | Default | Notes |
+| Parameter | Type | Default | Meaning |
 |---|---|---|---|
-| `query` | string | — | Required. Query terms |
-| `level` | string | — | Filter by layer |
-| `project` | string | — | Filter by project; **comma-separated multi-select (OR semantics)** |
-| `status` | string | — | Filter by status; **comma-separated multi-select (OR semantics)** |
-| `days` | integer 1–3650 | — | Search only the last N days |
-| `k` | integer 1–50 | `10` | Maximum hits |
-| `content_max` | integer 0–5000 | `300` | Per-entry truncation length |
+| `query` | string | — | Required |
+| `level` | string | — | Level filter, comma-separated |
+| `project` | string | — | Project filter, comma-separated (OR) |
+| `status` | string | — | Status filter, comma-separated (OR): `active` / `archived` / `stale` / `all` |
+| `days` | integer 1–3650 | — | Only entries created within the last N days |
+| `k` | integer 1–50 | `10` | Max hits |
+| `content_max` | integer 0–5000 | `300` | Truncation per hit; `0` = full text |
+| `explain` | boolean | `false` | Attach a score breakdown per hit (bm25 raw / importance / recencyWeight / status); does not change the order |
 
-**Returns**: `note` + `hits[]`. Each hit is a **metadata view** — origin + full id + relative time + keyword list, and **not the entry text**.
-
-> To browse a project's whole picture use `memory_project`, not a hand-assembled search.
+**Returns**: `note` + `hits[]` (project, full id, relative time, keywords, truncated content). Use `memory_project` for the project panorama, and `memory_list` for a metadata-only inventory.
 
 ---
 
 ## `memory_project` — project panorama
 
-Fetch one project's complete injection paragraph.
+Fetches a project's complete injection paragraph. `project` is **required**.
 
-| Parameter | Type | Required | Notes |
-|---|---|---|---|
-| `project` | string | **Yes** | Which project do you want to see? |
+- non-`todo` subcategories: all `active` entries (the automatic-injection path is budget-bound; this tool returns per call, but the whole output has its own cap — see below);
+- `todo`: active entries under "To do list:" plus the 5 most recently completed (`stale`) under "Done:";
+- entries inside a group run old → new by memory timestamp.
 
-**Output rules**:
+**Output cap**: the whole text is limited to `max(2000, budget.reinjectMaxChars)` chars (default **8000**), truncated with `…` (it shares the paragraph builder with post-compaction re-injection, but this cap applies only to the tool output).
 
-- Non-`todo` subcategories: every `active` entry
-- `todo` subcategory: all `active` entries as the to-do list, plus the latest 5 `stale` (done) entries by `updated_at` as the completed list
-- Within a group, ordered oldest → newest by memory timestamp; only `content` plain text is concatenated
-
-**Side effect** (important): passing a non-global, non-multi-project value **anchors the current session's project** — subsequent keyword hits follow that project immediately; the project is also recorded in this session's "consulted" list so the panorama can be re-injected after session compaction.
+**Side effect**: a non-global, single-project call **anchors the session's current project** and records it for post-compaction re-injection. If the workspace store is **untrusted**, the call is **refused** with an untrusted-store error.
 
 ---
 
-## `memory_find_similar` — duplicate check
+## `memory_find_similar` — duplicates
 
-| Parameter | Type | Default | Notes |
+| Parameter | Type | Default | Meaning |
 |---|---|---|---|
-| `id` | string | — | Required. Reference memory id |
-| `k` | integer 1–20 | `5` | Number of similar entries to return |
-| `content_max` | integer 0–5000 | `200` | Truncation length |
+| `id` | string | — | Required. Base memory id |
+| `k` | integer 1–20 | `5` | Number of similar entries |
+| `content_max` | integer 0–5000 | `200` | Truncation per entry |
+
+Ranks by bigram cosine similarity; entries already seen in this session are excluded.
 
 ---
 
-## `memory_read` — read one entry
+## `memory_read` — read one
 
-| Parameter | Type | Required | Notes |
+| Parameter | Type | Required | Meaning |
 |---|---|---|---|
-| `id` | string | Yes | Memory id |
+| `id` | string | yes | Full id or first 12 characters |
 
-Returns that entry's complete metadata (keywords / status / importance / goal / timestamps and so on).
-
-> Only a single `memory_read` records the "consulted" trace; a full `memory_project` panorama does not (the third dream round re-checks projects specifically).
+Returns the complete metadata (keywords / status / importance / goal / timestamps).
 
 ---
 
 ## `memory_update` — correct
 
-| Parameter | Type | Notes |
+| Parameter | Type | Meaning |
 |---|---|---|
 | `id` | string | Required |
 | `content` | string | Rewrite the body |
-| `status` | enum | `active` / `archived` / `stale` |
+| `status` | enum | `active` / `archived` / `stale` (`stale` = finished, `archived` = void/superseded) |
 | `importance` | integer | Weight |
 | `goal` | string | Goal sentence |
-| `project` | string | Project attribution |
-| `keywords` | string[] | Manually correct keywords |
+| `project` | string | Project; empty string clears it |
+| `keywords` | string[] | Fix keywords (absent/empty = no change) |
 
-> `updated_at` (the memory timestamp) is refreshed by `memory_update` or by dream stamping; every displayed timestamp is `updated_at`.
+> Ambiguous short ids on the write path now error out and list candidates instead of silently editing the wrong entry. `updated_at` is refreshed on update or dream stamping; the displayed timestamp is always `updated_at`.
+
+---
+
+## `memory_list` — list entries (new in 0.32)
+
+A low-token inventory view: **metadata only, no body text** (the key difference from `memory_search` / `memory_read`). Use it to answer "what do I actually have stored" and to find ids to clean up.
+
+| Parameter | Type | Default | Meaning |
+|---|---|---|---|
+| `level` | string | `all` | Levels, comma-separated: `soul`/`user`/`project`/`fact`/`lesson`/`topic`/`rules`; `all` = every level |
+| `project` | string | — | Project names, comma-separated (OR); global/unmarked entries are included |
+| `status` | enum | `active` | `active` / `stale` / `archived` / `all` |
+| `limit` | integer 1–100 | `20` | Max entries |
+| `offset` | integer ≥0 | `0` | Paging offset |
+
+**Returns**: `{ note, total, items[] }`; `item = { id, level, title, keywords, importance, status, project, updated_at }`.
+
+> `title` is a display title truncated from the content, not a separate field. Use `memory_read` for the full text.
+
+---
+
+## `memory_forget` — archive / restore / delete (new in 0.32)
+
+Handles **one** entry by id. Archiving is the default and is recoverable; hard deletion needs explicit confirmation.
+
+| Parameter | Type | Default | Meaning |
+|---|---|---|---|
+| `id` | string | — | Required. Full id or first 12 characters |
+| `mode` | enum | `archive` | `archive` (recoverable) / `restore` (back to `active`) / `delete` (permanent) |
+| `confirm` | boolean | — | Must be `true` for `mode=delete`, otherwise refused; ignored for other modes |
+
+**Returns**: `{ note, id }`.
+
+**Side effects**:
+
+- `archive`: `status=archived`; no longer injected/hit; still on disk and restorable;
+- `restore`: `archived` → `active`;
+- `delete`: physically removed — **irreversible** (no recycle bin; a `backup.enabled` `.bak` is your only fallback).
+
+> For bulk cleanup, get ids with `memory_list` and call `memory_forget` repeatedly. There is deliberately no "delete by filter" to prevent a model from wiping the store in one call.
 
 ---
 
 ## `memory_dream` — manual consolidation
 
-No parameters (the scope is fixed to this window). Same semantics as the `/dream` command and **immune to peak-hour suppression**.
-
-> A consolidation already in progress is reported clearly instead of being started twice.
+No parameters (scope is this window). Same semantics as `/dream`: **manual = explicit intent, so it bypasses the automatic cost gates** — no peak-hour, daily-frequency or context-size gate applies (manual invocation already requires a live window), and it runs up to 3 rounds over the **full session context** (atomic / topic / project summary). If the context is large, run `/compact` first.
 
 ---
 
-## `memory_home` — global data directory
+## `memory_home` — global data directory (query-only by default in 0.32)
 
-Inspect or switch the instance-level global data directory (logs / window-index / prompts overrides / migrate state).
-
-| Parameter | Type | Notes |
+| Parameter | Type | Meaning |
 |---|---|---|
-| `target` | string | Omit to only inspect the current directory and the preset locations; pass a preset marker or an absolute path to switch |
+| `target` | string | Omit to inspect the current directory, the three presets and switch state; pass a preset marker or absolute path to switch |
 
-**Three preset markers**:
+**Default (`security.allowHomeSwitch: false`)**: query-only. Passing `target` is **refused** with an explanation ("moving the directory changes where instance data lives; the model should not be able to move it") and how to enable it. That is the #64-2 fix.
+
+With `security.allowHomeSwitch: true`:
 
 | Marker | Location |
 |---|---|
-| `default` | The platform user home directory |
+| `default` | Platform user home |
 | `dsh-storage` | `<DSH home>/storages/meow-memory` |
 | `plugin-root` | `<plugin root>/storage` |
 
-**Switch behaviour**: same-volume move / cross-volume copy; **the old directory is never deleted automatically**; if the target already holds content it is enabled as-is without overwriting; an invalid `target` never switches by mistake (it reports clearly and keeps the current directory). A failed switch leaves data untouched and can be retried later.
-
-> If several dsh instances on this machine share the old directory, update their settings too after switching.
+Switching moves (same disk) or copies (cross disk); the old directory is **never deleted automatically**; an existing target is used without overwriting. The result is persisted in `<DSH_HOME>/storages/meow-memory-home.json`.
 
 ---
 
-## Layers and subcategories
+## Automatic injection vs. manual tools
 
-| Layer | Meaning |
-|---|---|
-| `soul` | The AI itself |
-| `user` | User basics and preferences |
-| `project` | Project information (with `subcategory`) |
-| `fact` | Atomic facts |
-| `lesson` | Mistakes and corrections |
-| `topic` | Ongoing discussion arcs (with a `goal` sentence) |
-| `rules` | Design principles and behavioral rules |
+- **Injection** (first-turn snapshot, per-message hits, post-compaction re-injection) is bounded by `budget.*` and **skips untrusted stores**;
+- **Manual tools** (search / project / read / list, etc.) return on demand and are not subject to the injection budget, but on an untrusted store they are **refused** (explicit error, not empty results); dream and reflection are refused too.
+- `memory_list` is the only low-cost "whole store without bodies" view; `memory_forget` is the only delete/archive entry point (equivalent to `memory_update status=archived` for archiving).
 
+---
+
+## Levels and subcategories
+
+`soul` (the AI) / `user` / `project` (with `subcategory`) / `fact` / `lesson` / `topic` (with `goal`) / `rules`.  
 `project` subcategories: `overview` / `structure` / `decisions` / `quotes` / `ops` / `todo`.
 
-**Global marker**: the `project.global` value of the active language pack's `labels.md` (the Chinese pack uses 「全局」, the English pack uses `"global"`). It follows `promptLang` — otherwise a `"global"` written by the model under the English pack would be treated as a project literally named global: global rules would stop being injected and a phantom project would appear in the project list.
+**Global marker**: the `project.global` value of the current `labels.md` (`"全局"` in zh, `global` in en/pt-br). It follows `promptLang`.
 
 ---
 
-## See also
+## Related docs
 
-- [Configuration reference](configuration-reference.md) — every configuration field
+- [Configuration reference](configuration-reference.md) — every field (including security gates and budgets)
 - [Design notes](design-notes.md) — why it is designed this way
-- [Troubleshooting](troubleshooting.md) — install failures, poor search results, reading errors
+- [Troubleshooting](troubleshooting.md) — install failures, poor recall, how to read errors

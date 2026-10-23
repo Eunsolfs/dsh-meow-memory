@@ -1,170 +1,339 @@
-# meow-memory 🐱📝
+# meow-memory 🐱📝 · fork endurecido
 
 | [中文](README.md) | [English](README.en.md) | [Português (BR)](README.pt-br.md) | [MIT License](LICENSE) |
 | :---: | :---: | :---: | :---: |
 
-Memória entre sessões para o [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
+> **O que é isto**: um fork pessoal de endurecimento do `Phant0Meow/dsh-meow-memory` **v0.31.1** (este repositório, versão **0.32.0**, branch `hardening`).
+> O upstream é MIT: <https://github.com/Phant0Meow/dsh-meow-memory>. Este fork **não tem vínculo com o upstream**, não publica em nome dele e não representa suas posições. Todas as mudanças e problemas restantes estão no [CHANGELOG.md](CHANGELOG.md).
 
-Versão **0.31.0** ｜ Histórico: [CHANGELOG.md](CHANGELOG.md) ｜ Suporta **dsh 0.1.5**
+Memória entre sessões para o [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): memória em sete níveis no SQLite, injeção de snapshot na primeira rodada, acertos por palavra-chave a cada mensagem e consolidação automática **com limites de orçamento**.
 
-## ✨ Recursos
+Versão **0.32.0** ｜ Histórico: [CHANGELOG.md](CHANGELOG.md) ｜ Host verificado: **DSH Desktop 0.2.1-rc.2** (veja [Compatibilidade](#compatibilidade))
 
-- **Memória em sete níveis**: `soul` (a própria IA) / `user` (fatos e preferências do usuário) / `project` (informação de projeto, com `subcategory`) / `fact` (fato atômico) / `lesson` (o que se aprendeu e correções) / `topic` (assunto em andamento com frase-objetivo) / `rules` (princípios de design e diretrizes de comportamento). Uma tabela SQLite por nível, UUID com prefixo de tempo, a ordem dos ids é a ordem de criação.
-- **Injeção da primeira rodada (bloco de memória de longo prazo)**: antes da primeira mensagem do usuário, injeta soul / user / princípios de design / guia de memória. A memória entra como uma mensagem plugin snapshot independente antes da mensagem real do usuário e **nunca reescreve o prompt dele**; **a primeira rodada não roda acertos por palavra-chave** (eles começam na segunda).
-- **Acerto por palavra-chave a cada mensagem**: a partir da segunda mensagem do usuário, cada mensagem real busca fact/lesson/rules/topic (global + ancorado no projeto atual) e injeta os top-2 acertos. O acerto usa as **palavras-chave da entrada**, não o texto inteiro.
-- **Ancoragem no projeto atual**: passar o parâmetro `project` ancora o projeto atual daquela sessão; sem ancoragem os acertos buscam só o global (conversa fiada do usuário não atrapalha).
-- **Projetado para cache**: a section estática `meow-memory:guide` é registrada uma vez no system prompt — texto constante, então não quebra o cache KV do provider.
-- **Reinjeção após compactação**: depois que a sessão é compactada, a rodada seguinte reinjeta automaticamente o snapshot de longo prazo + o panorama dos projetos consultados nesta sessão com `memory_project` + o texto das memórias que esta sessão escreveu/atualizou — a IA não perde a lembrança de repente.
-- **Três coisas além dos níveis**: a escrita deduplica e faz merge automaticamente; o timestamp exibido é sempre o `updated_at`; informação global usa a marca global (distinto de deixar o campo vazio).
-- **Dream por janela**: com a janela ociosa por ≥3 horas ela fica elegível, e o próprio agente principal dela consolida em rodadas (memórias atômicas / topic / resumo de projeto); a **supressão em horário de pico** (09:00–12:00 e 14:00–18:00 no `timeZone` configurado, padrão Asia/Shanghai — os picos de tarifa da API) impede o disparo. Digitar `/dream` consolida na hora, sob demanda.
-- **Reflexão**: depois de ≥7 passos de ferramenta seguidos dentro de uma mesma tarefa, o plugin pergunta ao modelo se há algo que valha memorizar desde a última consolidação. Se a última ferramenta for `memory_*`, considera que já houve memorização ativa e não reflete de novo.
-- **UI do cliente**: o texto injetado é recolhido em uma barra, as rodadas de reflexão/dream em um card expansível, e a lista de sessões mostra ícones de estado do dream (🌙 consolidado / lua em respiração em andamento / lua cinza com barra pulado).
-- **Zero dependências de runtime**: `node:sqlite` + artefato esbuild autocontido (`lib/index.js`). **Nenhum módulo nativo.**
+**Nota de honestidade**: este README só afirma comportamentos que existem no código. A 0.32 removeu várias alegações infladas do upstream ("deduplicação/merge automáticos", "curva de esquecimento de Ebbinghaus", "BM25" nos acertos por mensagem, "compatível com dsh 0.1.5") e declara o limite real em cada ponto.
 
-## 📦 Instalação
+---
 
-### Instalação em um comando (recomendada)
+## Leia antes: ele gasta tokens automaticamente
 
-```sh
-dsh plugin --profile web add github:Phant0Meow/dsh-meow-memory
-```
+Este é o custo mais subestimado do plugin. **Com a configuração padrão ele faz requisições de LLM sem um comando explícito do usuário**; a 0.32 limitou cada tipo, mas não desligou nenhum (o comportamento padrão do upstream foi mantido, só deixou de ser ilimitado).
 
-Um comando instala e já vale: a instalação compila automaticamente (o pacote traz o script `prepare`), monta sozinho, e depois de reiniciar o `dsh web` novas sessões carregam o plugin automaticamente.
+| Gasto | Quando | Limite 0.32 |
+|---|---|---|
+| **Taxa estática**: manual de memória + descrição/schema de todas as ferramentas no system prompt | **Toda** requisição, mesmo sessão que nunca usa memória | ≈**6,7k tokens/requisição** (medido, pacote chinês; ≈6,3k em inglês; varia com o pacote de idioma e o tamanho das descrições). Não dá para desligar por requisição; para não pagar nada, defina `enabled: false` (ou remova o plugin) |
+| **Snapshot da primeira rodada**: soul / user / regras globais / guia de memória | Uma vez, antes da primeira mensagem real de cada sessão | `budget.snapshotMaxChars` padrão **6000 caracteres** (≈2,7k tokens zh) |
+| **Acertos por palavra-chave** | Da segunda mensagem em diante, quando há acerto | `hitTopK` padrão 2 × `budget.hitMaxChars` padrão **1500 caracteres/entrada** (≈1,4k tokens/mensagem no pior caso) |
+| **Reinjeção pós-compactação** | A rodada seguinte a uma compactação | `budget.reinjectMaxChars` padrão **8000 caracteres** (≈3,6k tokens) |
+| **Dream automático** | Janela ociosa ≥ `dream.idleMinutes` (padrão 180), fora do pico, **com live agent**, contexto estimado ≤ `budget.dreamMaxContextTokens` (padrão 40000) | Até **3 rodadas de contexto completo**; `budget.dreamMaxPerWindowPerDay` padrão **1 por janela/dia**. Uma sessão de 30k tokens custa ≈90k input tokens por dream; o histórico ganha ≈8–15k tokens duráveis |
+| **Reflexão** | Depois de uma tarefa com ≥ `reflectTurns` (padrão 7) passos de ferramenta seguidos | **1 requisição de contexto completo**; `budget.reflectMaxPerDay` padrão 6/dia/janela (sessão), `budget.reflectMinIntervalMinutes` padrão 20; pulada quando o contexto excede `dreamMaxContextTokens` |
 
-> O pnpm ≥10 bloqueia por padrão scripts de build na instalação: o primeiro `add` pode falhar pedindo `allowBuilds`; siga a instrução, adicione as chaves mostradas no `pnpm-workspace.yaml` do profile e rode de novo.
-
-#### Fork em PT-BR
-
-```sh
-dsh plugin --profile web add github:coutogilson/dsh-meow-memory
-```
-
-### Desinstalação
-
-```sh
-dsh plugin --profile web remove meow-memory
-```
-
-### Instalação manual (desenvolvedores, qualquer instalação do DSH, sem npm)
-
-1. Copie (ou crie um link simbólico de) este pacote para o `node_modules` do profile:
-
-   ```sh
-   mkdir -p ~/.dsh/profiles/web/node_modules
-   ln -s /path/to/meow-memory ~/.dsh/profiles/web/node_modules/meow-memory
-   ```
-
-   (Windows: `New-Item -ItemType Junction ...` — junction NTFS, sem precisar de administrador.)
-
-2. Adicione `meow-memory` ao `dsh.profile.bundles` do `package.json` do profile (como acima).
-
-3. Reinicie o `dsh web`. Novas sessões carregam o plugin automaticamente.
-
-## 🔌 Compatibilidade
-
-Suporta **dsh 0.1.5** (incluindo o `0.1.5-rc.1` mais recente) e também versões antigas — atualizar o dsh não exige mudar este plugin nem nenhuma configuração.
-
-O plugin não fixa número de versão: ele detecta as capacidades do host em runtime, então cada versão segue o ramo correto. Duas gerações já foram testadas de verdade: no `0.1.5-rc.1` a primeira injeção, as chamadas das ferramentas de memória e a renderização no cliente funcionam; no `0.1.1-rc.2` o comportamento é idêntico ao das versões anteriores.
-
-## ⚙️ Configuração
-
-Todos os campos são opcionais (patch do profile ou `cordis.patch.yml`). **Também dá para não editar arquivo nenhum**: a página de configurações do DSH tem a aba "Meow memory" deste plugin (no mesmo nível de "Geral" e "Modelos"), onde todos os itens abaixo são editáveis na interface, com gravação por campo e restauração individual do padrão (restaurar padrão = voltar ao padrão de fábrica do plugin, sem sofrer a base do patch); depois de salvar, vale após recarregar a quente/reiniciar o plugin meow-memory.
+**Como parar o gasto automático** (as ferramentas manuais continuam funcionando):
 
 ```yaml
 - id: meow-memory
   name: 'meow-memory'
   config:
-    enabled: true          # chave geral
-    projectDir: '.dsh-meow' # diretório de memória (relativo ao workspace)
-    promptLang: 'pt-br'    # ⚠️ configure explicitamente no primeiro uso (ver abaixo)
-    hitTopK: 2             # máximo de entradas por acerto de palavra-chave a cada mensagem
+    reflect: false            # sem reflexão automática
     dream:
-      enabled: true
-      idleMinutes: 180      # janela ociosa por ≥180 minutos (3 horas) permite o dream
+      enabled: false          # sem dream automático (/dream e memory_dream continuam)
 ```
 
-**Todos os campos, tipos e padrões estão em [docs/configuration-reference.md](docs/configuration-reference.md)**, incluindo `titleMax` / `autoMigrate` / `homeDir` / `disabledWorkspaces` / `backup` / `delegate`.
+Ou por janela: menu "…" da linha da sessão → **Participação da memória** → desligar "injeção automática"/"consolidação automática". Para não pagar a taxa estática de ≈6,7k, só desativando o plugin.
 
-> ⚠️ **Configure o `promptLang` explicitamente no primeiro uso.** Ele decide o idioma do texto de injeção/reflexão/dream e das descrições das ferramentas, e também influencia o idioma em que o modelo escreve as entradas de memória — as palavras-chave são extraídas no idioma da entrada. O valor **é** o nome do subdiretório em `src/prompts/` e é casado **literalmente**: um nome que não existe (por exemplo `pt`) não gera erro nenhum — ele cai no pacote chinês, em silêncio. Veja [docs/configuration-reference.md](docs/configuration-reference.md).
+> **`/dream` / `memory_dream` manuais não passam pelos portões de custo automáticos** (vontade explícita): não há portão de pico/frequência/contexto (a invocação manual já exige uma janela viva), e rodam até **3 rodadas** sobre o **contexto completo da sessão** (atômicas / topic / resumo de projeto). Se o contexto estiver grande, rode `/compact` antes — é a única forma de reduzir de verdade o custo de um dream manual.
+
+> São **limites**, não promessas. O gasto real depende de número e tamanho das entradas e do tamanho da sessão; o pior caso diário continua limitado em ordem de grandeza (≤1 dream + ≤6 reflexões de contexto completo). Os "tokens estimados" usados pelos portões de contexto são **aproximados**: CJK ≈1,7 caracteres/token, não-CJK ≈4 caracteres/token (superestimado de propósito), não é cobrança exata.
+
+---
+
+## Modelo de segurança
+
+### Onde ficam os dados
+
+| Dado | Local |
+|---|---|
+| Banco de memória (SQLite em texto puro) | `<workspace>/<projectDir>/memory.db`, `projectDir` padrão `.dsh-meow` |
+| Registro por sessão (vistos / consultados) | `<workspace>/.dsh-meow/sessions/<id>.json` |
+| Marcador de confiança do banco | `<workspace>/.dsh-meow/.owner.json` |
+| `.gitignore` auto-ignorante | `<workspace>/.dsh-meow/.gitignore` (conteúdo `*` — o diretório se ignora, então `git add .` nunca commita memórias) |
+| Diretório global de instância (logs / window index / estado de migração) | padrão `~/.dsh-meow` (**fora do `DSH_HOME`**); mude com `homeDir` ou `MEOW_MEMORY_HOME` |
+| Overrides de prompt por instância | `$DSH_HOME/storages/meow-memory/prompts/<lang>/<slot>.md` (caminho fixo; `$DSH_HOME` padrão `~/.dsh`; **não segue** trocas de `homeDir`/`memory_home`) |
+
+O `.gitignore` é escrito automaticamente (`security.autoGitignore: true`): `*` se o diretório não tiver nenhum, e **uma linha `*` é acrescentada se um `.gitignore` pré-existente não a tiver** (evita que regras `!*` de re-inclusão commit sem `memory.db`). O banco **não é criptografado**: o texto das memórias é puro e pode conter dados privados. Não guarde segredos em memórias; o `.gitignore` só barra o git, não backups, pastas sincronizadas ou outros processos locais.
+
+### Bancos não vazios que o plugin não criou são não confiáveis (correção #64-1)
+
+Workspaces costumam ser repositórios `git clone` — alguém pode colocar um `.dsh-meow/memory.db` ou `PROJECT.md` no repositório e fazer a IA injetar regras soul/user/globais escritas pelo atacante como se fossem memória de longo prazo do usuário.
+
+Regras da 0.32:
+
+- o plugin confia só em bancos **que ele criou**, ou que têm um marcador `.owner.json` válido. O marcador precisa satisfazer tudo: `schema=1`; `installId` igual ao **id de instalação aleatório** desta máquina (persistido em `$DSH_HOME/storages/meow-memory/install-id`, não é fingerprint de máquina); e `workspace` registrado igual ao workspace atual. Marcadores forjados, de outra máquina ou movidos para outro caminho de workspace são rejeitados; se o install-id não puder ser persistido, a verificação é **fail-closed**;
+- **só quando o arquivo `memory.db` não existe mesmo** ele é criado e confiado. **Qualquer `memory.db` pré-existente — mesmo schema-only / sem linhas — é não confiável por padrão** (fecha o caminho de envenenamento "banco vazio pré-instalado + triggers do SQLite");
+- um banco não confiável **nunca é aberto por rodadas normais de chat**: sem upgrade de schema, sem criação de índices, sem migração, sem leitura — apenas uma sonda readonly toca o arquivo. Seu conteúdo não é injetado, e **todas as ferramentas de memória (leitura e escrita), dream e reflexão são recusados**; um aviso único explica como confiar (`security.trustWorkspaceMemory: true`);
+- até você confiar explicitamente ou apagar/renomear o banco. Só ative a confiança para um banco que você sabe que é seu;
+- `autoMigrate` **agora tem padrão `false`**: o `PROJECT.md` do workspace não é mais importado automaticamente.
+
+### `memory_home` é somente consulta por padrão (correção #64-2)
+
+`memory_home` é uma ferramenta que o modelo pode chamar diretamente. O upstream deixava mover todo o diretório global (onde ficam logs / window index / estado de migração) — um efeito colateral de filesystem que o modelo não deveria ter.
+
+Desde a 0.32:
+
+- `security.allowHomeSwitch: false` por padrão; `memory_home` só **consulta**, e pedidos de troca são recusados explicitamente;
+- ative `security.allowHomeSwitch: true` só se quiser que o modelo possa trocar de diretório;
+- o diretório de override de prompts resolve de `$DSH_HOME/storages/meow-memory/prompts/` **fixo**, **não** de `homeDir` / `memory_home` / `MEOW_MEMORY_HOME`, e o local antigo não é mais lido (sem fallback) — trocar de diretório nunca muda as instruções injetadas.
+
+### Rede e autenticação
+
+- O plugin **não faz requisições de rede de saída** (sem telemetria). As requisições de modelo do dream/reflexão passam pelas rodadas de agent existentes do host, não pelo plugin.
+- As 3 rotas locais do cliente (`/meow-memory/dreamed-sessions` etc.) passam pelo portão de autenticação `connection.requestRejection` desde 0.31.1: requisições cross-site recebem 401/403; 503 quando o serviço de auth falta.
+- `security.debugLogs` padrão `false`: `perf.log` e dumps de diagnóstico de settings/configEditor não são gravados por padrão (ative `security.debugLogs: true` ou `MEOW_MEMORY_DEBUG=1` ao investigar). `dream-debug.log` **continua sendo gravado por padrão**, mas só com info mínima (ids de sessão / contagens / motivos de skip, sem texto de memória), com limpeza de 48h e rotação em 5MB na inicialização; `apply-error.log` / `settings-register-error.log` são error-only. **Não leia isto como "zero logs por padrão".**
+
+### Desinstalar deixa dados (limpe manualmente)
+
+Desinstalar não apaga memórias. Quando não precisar mais:
+
+```
+<workspace>/.dsh-meow/                      # memory.db, sessions/, .owner.json, .gitignore
+~/.dsh-meow/                                # ou seu homeDir: logs, window-index, migrate-state
+$DSH_HOME/storages/meow-memory/prompts/     # overrides de prompt (se você adicionou)
+~/.dsh/storages/meow-memory-home.json       # ponteiro de troca do memory_home (pode não existir)
+```
+
+---
+
+## Recursos
+
+- **Sete níveis de memória**: `soul` (a própria IA) / `user` / `project` (com `subcategory`) / `fact` / `lesson` / `topic` (com frase-objetivo) / `rules`. Uma tabela SQLite por nível, ids com prefixo de tempo.
+- **Injeção da primeira rodada**: soul / user / regras globais / guia de memória são injetados antes da primeira mensagem como snapshot de plugin, **sem reescrever o prompt do usuário**; **sem acertos na primeira rodada** (começam na segunda).
+- **Acertos por palavra-chave a cada mensagem**: a partir da segunda mensagem, fact/lesson/rules/topic são casados pelas **palavras-chave da entrada** (não pelo texto inteiro), no escopo global + ancoragem no projeto atual, injetando até `hitTopK`. A 0.32 acrescenta `minScore` (padrão 0.35) e reforço por `hit_count`; **continua sendo casamento por palavra-chave — sem busca vetorial/semântica**, entradas com palavras-chave ruins ficam silenciosamente inalcançáveis.
+- **Ancoragem no projeto atual**: passar `project` ancora o projeto atual da sessão; sem ancoragem os acertos buscam só o global.
+- **Amigável a cache**: a section estática `meow-memory:guide` é registrada uma vez no system prompt, texto constante, não quebra o cache de prefixo do provider.
+- **Reinjeção pós-compactação**: a rodada seguinte reinjeta o snapshot, os panoramas consultados nesta sessão e as entradas escritas nesta sessão (limitado por `reinjectMaxChars`).
+- **Realidade da deduplicação**: só entradas do **mesmo nível** com Jaccard de bigramas ≥ 0.8 (quase idênticas) se fundem automaticamente. **Paráfrases não se fundem** e contradições entre níveis não são detectadas — use `memory_find_similar` + `memory_update`/`memory_forget`.
+- **Dream por janela**: com a janela ociosa ≥ `idleMinutes` (padrão 3 h), fora do pico e com live agent, o agente principal dela consolida em três rodadas (atômicas / topic / resumo de projeto). Desde a 0.32 o dream automático **não chama mais `agents.resume()`** para ressuscitar agent bare (#49), tem limites de contexto e frequência, exclui entradas arquivadas e limita as listas. `/dream` ou `memory_dream` consolidam sob demanda.
+- **Reflexão**: depois de ≥ `reflectTurns` passos de ferramenta seguidos na mesma tarefa, pergunta ao modelo se há algo a memorizar; se a última ferramenta foi `memory_*`, suprime. A 0.32 adiciona limite diário e intervalo mínimo.
+- **UI do cliente**: o texto injetado dobra numa barra, rodadas de reflexão/dream dobram num cartão, a lista de sessões mostra ícones de dream. Depende de internals do host 0.2.x e é "melhor esforço" — um patch do host pode desativar silenciosamente (só estética).
+- **Zero dependências de runtime**: `node:sqlite` + bundle esbuild autocontido, sem módulos nativos.
+
+### O que ele não faz (não se engane)
+
+- **Memória "global" é global só dentro de um workspace**: o banco é por workspace (cwd). Trocar de workspace = banco vazio; abrir de um subdiretório ou symlink cria outro.
+- **Sem busca semântica**, só palavra-chave. `hit_count` agora afeta o ranking mas nunca reescreve palavras-chave sozinho.
+- **O esquecimento é uma meia-vida exponencial, não uma curva de revisão de Ebbinghaus**: `retrieval.halfLifeDays` padrão 30 dias, `exp(-ln2 × dias/30)` com piso 0.85 para importance≥3. O dream carimba `updated_at` na consolidação, então a entrada da decaída é afetada pela própria consolidação.
+- **O dream ainda deixa suas instruções/respostas/chamadas no histórico da sessão principal**: dobrar é só visual, os tokens persistem.
+- **A troca do `memory_home` está desligada por padrão**; quando ligada, continua sendo uma ferramenta chamável pelo modelo — avalie o risco.
+
+---
+
+## Instalação
+
+**Este fork não foi publicado no registry npm.** Três caminhos; `npm install meow-memory` instala o **upstream 0.31.1**, não este repositório.
+
+### Caminho A: diretório local / tarball (recomendado, sem GitHub)
+
+1. Compile uma vez no repositório (este repo não commita `lib/`):
+
+   ```sh
+   npm install
+   npm run build        # → lib/index.js, lib/client.js, lib/prompts/
+   ```
+
+2. Escolha:
+   - **diretório local**: GUI **Plugins → Add plugin**, informe o **caminho absoluto** deste repositório;
+   - **tarball**: `npm pack` gera `meow-memory-0.32.0.tgz`; informe o caminho absoluto do `.tgz`.
+3. Reinicie `dsh web` (ou recarregue o plugin). Novas sessões carregam automaticamente.
+
+> Instalações locais `file:`/`link:` não rodam `prepare`, então **compile primeiro**; um tarball já contém `lib/`.
+
+### Caminho B: instalação manual no profile
+
+1. Copie (ou symlink/junction) para `~/.dsh/profiles/<profile>/node_modules/meow-memory`:
+
+   ```sh
+   mkdir -p ~/.dsh/profiles/<profile>/node_modules
+   ln -s /caminho/absoluto/meow-memory ~/.dsh/profiles/<profile>/node_modules/meow-memory
+   ```
+
+   Windows: `New-Item -ItemType Junction ...` (junction NTFS, sem admin).
+
+2. Adicione `meow-memory` ao `dsh.profile.bundles` do `package.json` do profile.
+3. Reinicie `dsh web`.
+
+### Caminho C: one-liner `github:` (**não recomendado**)
+
+```sh
+dsh plugin --profile <profile> add github:<url-do-seu-fork>
+```
+
+⚠️ Dependência `github:`/git instala **devDependencies e roda `prepare` (build esbuild)**. Precisa de GitHub acessível, aprovação de scripts de build no pnpm (≥10 bloqueia; adicione `allowBuilds`) e devDeps `@deepseek-ai/dsh-*` resolvíveis. Qualquer falha faz rollback. Use o caminho A, a menos que esteja validando a cadeia de build.
+
+### ⚠️ Atualizando do upstream 0.31: o banco antigo é não confiável por padrão
+
+Um `memory.db` criado pelo upstream 0.31 não tem o marcador `.owner.json`, então na primeira execução este fork o classifica como **foreign / não confiável**: seu conteúdo não é injetado, as ferramentas de memória (leitura/escrita), dream e reflexão são recusados e um aviso único de "banco de memória do workspace não confiável" aparece. **Mesmo um banco upstream vazio conta como pré-existente e é não confiável por padrão.**
+
+Para manter as memórias antigas, faça uma das opções:
+
+- defina explicitamente `security.trustWorkspaceMemory: true` na configuração do profile e recarregue o plugin (só depois de confirmar que o banco é seu);
+- ou apague/renomeie o `memory.db` antigo e comece do zero (faça backup antes — a exclusão é irreversível).
+
+### Remover
+
+```sh
+dsh plugin --profile <profile> remove meow-memory
+```
+
+**Os dados de memória não são apagados**; veja [modelo de segurança](#modelo-de-segurança) para os caminhos.
+
+---
+
+## Compatibilidade
+
+O ambiente em que este fork foi realmente verificado (não é uma promessa de "compatível com tudo"):
+
+| Item | Valor |
+|---|---|
+| Host | **DSH Desktop 0.2.1-rc.2** (Windows 11) |
+| Runtime | Electron 44.7.0 / Node **24.21.0**, `node:sqlite` disponível |
+| Verificado | Instância isolada carrega; 3 rotas `/meow-memory/*` retornam 200 com auth / 401 sem; namespace de settings aparece; sem erro de apply. **Rodadas reais de LLM/chamadas de ferramenta não foram exercitadas na instância isolada** (sem credenciais) |
+| Não verificado | **Hosts 0.1.x** (este fork não testou; a alegação "suporta dsh 0.1.5" foi removida); outros patch releases 0.2.x |
+
+Riscos de compatibilidade conhecidos (achados do upstream, inalterados por este fork):
+
+- **Caminho de salvamento de settings**: após a reformulação do serviço de settings no 0.2.x o plugin usa um caminho degradado. A página renderiza, mas "editar → salvar → recarregar → aplicado" não foi verificado neste fork; no pior caso os valores aparecem mas não chegam ao apply. Rode a [verificação pós-instalação](#verificação-pós-instalação).
+- **UI do cliente** (barras de dobra / ícones de lua / painel de menu) depende de internals `ChatSnapshot` do 0.2.x e observação de DOM; um patch do host pode desativar silenciosamente (só estética).
+- `node:sqlite` exige **Node ≥ 22.13** (22.5–22.12 precisa de `--experimental-sqlite`).
+
+---
+
+## Configuração
+
+Todos os campos são opcionais. **Os novos grupos `security` / `budget` / `retrieval` da 0.32 só funcionam via arquivo de configuração** (profile patch ou `cordis.patch.yml`); a página de settings continua cobrindo os campos da 0.31 (o código da página está fora desta rodada de endurecimento).
+
+```yaml
+- id: meow-memory
+  name: 'meow-memory'
+  config:
+    enabled: true
+    projectDir: '.dsh-meow'
+    promptLang: 'zh'          # defina explicitamente no primeiro uso
+    hitTopK: 2
+    autoMigrate: false        # mudou na 0.32: sem importação automática de PROJECT.md
+    security:
+      trustWorkspaceMemory: false   # confiar num memory.db pré-existente (inclusive vazio/schema-only)
+      allowHomeSwitch: false        # permitir memory_home trocar o diretório global (padrão: só consulta)
+      autoGitignore: true           # escrever/completar .dsh-meow/.gitignore (auto-ignorante)
+      debugLogs: false              # diagnóstico perf/settings desligado (dream-debug ainda grava mínimo)
+    budget:
+      snapshotMaxChars: 6000        # limite do snapshot da primeira rodada (caracteres)
+      hitMaxChars: 1500             # limite por entrada de acerto (caracteres)
+      reinjectMaxChars: 8000        # limite da reinjeção pós-compactação (caracteres)
+      dreamMaxContextTokens: 40000  # pular dream/reflexão automáticos acima deste contexto estimado
+      dreamMaxPerWindowPerDay: 1    # frequência máxima de dream automático
+      reflectMaxPerDay: 6           # limite diário de reflexões
+      reflectMinIntervalMinutes: 20 # intervalo mínimo entre reflexões
+    retrieval:
+      halfLifeDays: 30              # meia-vida exponencial (dias)
+      minScore: 0.35                # limiar de injeção de acertos
+      hitBoost: true                # reforço por contagem de acertos
+      importanceWeight: true        # importance participa do ranking
+    dream:
+      enabled: true
+      idleMinutes: 180
+```
+
+**Todos os campos, tipos, padrões e efeitos estão em [docs/configuration-reference.md](docs/configuration-reference.md)** (inclui `titleMax` / `homeDir` / `disabledWorkspaces` / `backup` / `delegate`).
+
+> ⚠️ **Defina `promptLang` explicitamente no primeiro uso.** Ele decide o idioma dos prompts injetados/reflexão/dream e das descrições das ferramentas, e molda o idioma em que o modelo escreve entradas — as palavras-chave são extraídas no idioma da entrada. Idiomas embutidos: `zh` / `en` / `pt-br`. O valor *é* o nome do subdiretório e casa **literalmente**: um valor inexistente (ex.: `pt`) não gera erro e cai silenciosamente no chinês.
 
 ### Idioma da interface
 
-O texto da interface do plugin segue o "Configurações → Geral → Idioma" do DSH (embutidos: 中文 / English / Português (Brasil)) e é uma camada separada do `promptLang`; as duas não interferem. Veja [docs/configuration-reference.md](docs/configuration-reference.md).
+O texto de UI segue Configurações → Geral → Idioma do DSH (中文 / English / Português (Brasil)) — uma camada separada do `promptLang`.
 
-## 🧠 Como funciona
+---
+
+## Como funciona
 
 ```
-Primeira mensagem ............ injeta o bloco de memória de longo prazo
-(prefixo = snapshot       .... Sobre você (soul) / Sobre o usuário (user) /
- plugin, prompt do              Princípios de design (rules) / Guia de memória
- usuário intocado)              (a 1ª rodada NÃO faz acertos por palavra-chave)
-
-Da 2ª mensagem em diante ..... "Memórias possivelmente relevantes, apenas para
-                                referência:" + top-2 acertos por palavra-chave
-                                (global + ancorado no projeto atual)
-                                ids já vistos registrados por sessão
-                                (sessions/<id>.json); sinal de compactação
-                                libera os vistos
-
-Janela ociosa ≥3h ............ dream por janela: 3 rodadas (a 3ª é o resumo de
-e fora do pico                  projeto) sobre as memórias criadas + extraídas
-                                nesta janela, congelando por updated_at no
-                                timestamp da última conversa
+Primeira mensagem (rodada 1)     Cada mensagem a partir da 2ª            ocioso ≥3h + fora do pico + live agent
+┌────────────────────┐          ┌────────────────────┐                   ┌──────────────────────┐
+│ ===== longo prazo ====│          │ possivelmente relev.  │                   │ dream por janela:    │
+│ [sobre você] (soul)  │          │ para referência:     │                   │ três rodadas (inclui │
+│ [sobre user]         │          │ acertos por palavra- │                   │ resumo de projeto)   │
+│ [princípios] (rules) │          │ chave top-K+minScore │                   │ limites de contexto/ │
+│ [guia de memória]    │          │ (global + projeto)   │                   │ frequência           │
+└────────────────────┘          └────────────────────┘                   └──────────────────────┘
+snapshot independente           vistos por sessão                        rodadas de consolidação ficam
+↓ prompt do usuário intacto     sessions/<id>.json                       no histórico principal
+uma vez por sessão,             compactação → libera vistos + reinjeta   (dobrar ≠ não gastar tokens)
+sem acertos na rodada 1
 ```
 
-Os rótulos acima são os do pacote de prompts em português; com `promptLang: 'zh'` eles aparecem em chinês e com `'en'` em inglês (por exemplo `===== LONG-TERM MEMORY =====`, `Possibly relevant memories, for reference only:`).
+### Ferramentas (10 na 0.32)
 
-### Ferramentas
+| Ferramenta | Faixa | Uso |
+|---|---|---|
+| `memory_remember` | escrita | Grava uma memória (content/project/keywords/importance obrigatórios; duplicatas quase idênticas fundem) |
+| `memory_search` | leitura | Busca BM25 × recência exponencial, com `explain` e filtros level/project/status/days |
+| `memory_project` | leitura | Recupera o parágrafo de injeção completo de um projeto (`project` obrigatório) |
+| `memory_find_similar` | leitura | Detecção de duplicatas e conflitos |
+| `memory_read` | leitura | Lê os metadados completos de uma entrada por id |
+| `memory_update` | escrita | Corrige status / importance / goal / keywords / content |
+| `memory_list` | leitura | **nova na 0.32**: lista ids/títulos/palavras-chave/status/timestamps, sem corpos; level/project/status/limit/offset |
+| `memory_forget` | escrita | **nova na 0.32**: arquivar/restaurar/apagar por id. Arquivar é o padrão; `mode:'delete'` apaga de vez e exige `confirm:true` |
+| `memory_dream` | escrita | Dispara manualmente a consolidação desta janela (igual a `/dream`) |
+| `memory_home` | diretório | Consulta o diretório global; **só consulta por padrão desde a 0.32**, exige `security.allowHomeSwitch: true` para trocar |
 
-| Ferramenta | Para que serve |
-|---|---|
-| `memory_remember` | Escreve uma memória (content/project/keywords/importance obrigatórios; deduplica e faz merge) |
-| `memory_search` | Busca por palavra-chave (BM25 × peso de recência; filtros level/project/status/days) |
-| `memory_project` | Devolve o parágrafo de panorama de um projeto (**parâmetro `project` obrigatório**) |
-| `memory_find_similar` | Checagem de duplicatas e conflitos |
-| `memory_read` | Lê os metadados completos de uma entrada pelo id |
-| `memory_update` | Corrige status / importance / goal / keywords |
-| `memory_dream` | Dispara manualmente a consolidação desta janela |
-| `memory_home` | Consulta / troca o diretório global de dados |
+**Parâmetros, retornos e efeitos colaterais: [docs/tool-reference.md](docs/tool-reference.md)**.
 
-Há também o comando `/dream`: digite `/dream` no input para consolidar esta janela na hora, sem sofrer a supressão de pico.
+---
 
-**Parâmetros, retornos e efeitos colaterais estão em [docs/tool-reference.md](docs/tool-reference.md)** (incluindo o efeito de ancoragem do `memory_project` e os três marcadores de diretório do `memory_home`).
-
-## 🛠 Desenvolvimento
+## Desenvolvimento e testes
 
 ```sh
 npm install
-npm run build          # empacota com esbuild → lib/index.js (autocontido)
-npm run test           # 228 testes de lógica: db / bm25 / migrate / inject / reflect / dream / tools / apply
+npm run build          # bundle esbuild → lib/index.js / lib/client.js (autocontido)
+npm run test           # build + checagem dos pacotes de idioma + asserções (host + cliente)
+node scripts/check-lang.mjs en       # checa um pacote de prompt
 ```
 
-Os pacotes `@deepseek-ai/*` ficam no pnpm workspace do dsh-meow, não no `node_modules` deste pacote.
-No Windows, `npm run link-workspace` (ou `scripts/link-workspace.ps1`) cria os junctions espelhando os
-pacotes do workspace para o esbuild resolvê-los; o `build.mjs` os referencia via `nodePaths`.
-Esses links só são necessários em tempo de build.
+Asserções de teste: `npm test` **1028 todas verdes** (host 668 + cliente 360), 0 falhas; mais 29 em `node smoke.mjs`; `scripts/check-lang.mjs` valida os pacotes en/pt-br (11 slots alinhados).
 
-## 📚 Documentação
+Os pacotes `@deepseek-ai/*` ficam no workspace pnpm dsh-meow, não no `node_modules` deste pacote. No Windows, `npm run link-workspace` cria junctions para o esbuild resolver (só em tempo de build).
+
+### Verificação pós-instalação
+
+1. Uma rodada normal de conversa: a primeira rodada mostra a barra de memória de longo prazo? (Não → o plugin não está rodando.)
+2. Mude uma configuração → salve → recarregue o plugin → o valor foi aplicado? (Checa o drift de settings do 0.2.x.)
+3. Depois de `/dream`, continue conversando: o número de ferramentas está normal? (Guarda #66.)
+4. Depois de uma rodada de reflexão, veja o seletor de modelo: continua o modelo principal? (#71 só dispara com `delegate.model` definido.)
+5. Abra uma sessão num repositório clonado e não confiável: não deve aparecer memória de longo prazo que você não escreveu (banco não confiável + sem auto-migração).
+
+---
+
+## Documentação
 
 | Para saber sobre | Leia |
 | --- | --- |
-| As sete ferramentas: parâmetros, retornos e efeitos colaterais | [docs/tool-reference.md](docs/tool-reference.md) |
+| Parâmetros, retornos e efeitos das 10 ferramentas | [docs/tool-reference.md](docs/tool-reference.md) |
 | Todos os campos de configuração, tipos e padrões | [docs/configuration-reference.md](docs/configuration-reference.md) |
-| Por que foi projetado assim (cache, acertos, dream, armadilhas) | [docs/design-notes.md](docs/design-notes.md) |
-| Falha ao instalar, busca imprecisa, como ler os erros | [docs/troubleshooting.md](docs/troubleshooting.md) |
-| Histórico de versões | [CHANGELOG.md](CHANGELOG.md) |
-| Adicionar um idioma de interface | [src/i18n/README.md](src/i18n/README.md) |
-| Adicionar um pacote de prompts | [src/prompts/README.md](src/prompts/README.md) |
+| Por que é projetado assim (custo e trade-offs) | [docs/design-notes.md](docs/design-notes.md) |
+| Falhas de instalação, recall ruim, como ler erros | [docs/troubleshooting.md](docs/troubleshooting.md) |
+| Histórico de versões e problemas conhecidos não corrigidos | [CHANGELOG.md](CHANGELOG.md) |
+| Adicionar idioma de UI | [src/i18n/README.md](src/i18n/README.md) |
+| Adicionar pacote de prompt | [src/prompts/README.md](src/prompts/README.md) |
 
-## 🙏 Agradecimentos
+## Agradecimentos
 
-Obrigado a cada contribuidor que faz o meow-memory melhorar:
+A maior parte do código vem do upstream e destes contribuidores (atribuição original mantida):
 
-- **[daveycodez](https://github.com/daveycodez)** — pacote de prompts em inglês e tokenização do inglês ([PR #6](https://github.com/Phant0Meow/dsh-meow-memory/pull/6), lançado na v0.22.0)
-- **[chenmzh](https://github.com/chenmzh)** — injeção de memória como mensagem plugin snapshot independente, resolvendo a poluição do título da sessão ([PR #10](https://github.com/Phant0Meow/dsh-meow-memory/pull/10))
-- **[cuddly-guacamole](https://github.com/cuddly-guacamole)** — compatibilidade de Session events entre as duas versões do dsh 0.1.2-alpha.4 ([PR #11](https://github.com/Phant0Meow/dsh-meow-memory/pull/11))
-- **[coutogilson](https://github.com/coutogilson)** — pacote de prompts em português do Brasil (`src/prompts/pt-br/`) e a camada de texto de UI que segue o locale do DSH
+- **[daveycodez](https://github.com/daveycodez)** — pacote de idioma inglês e tokenizador ([PR #6](https://github.com/Phant0Meow/dsh-meow-memory/pull/6), v0.22.0)
+- **[chenmzh](https://github.com/chenmzh)** — injeções de memória como mensagens plugin snapshot independentes, corrigindo a poluição do título da sessão ([PR #10](https://github.com/Phant0Meow/dsh-meow-memory/pull/10))
+- **[cuddly-guacamole](https://github.com/cuddly-guacamole)** — compatibilidade de Session events para dsh 0.1.2-alpha.4 ([PR #11](https://github.com/Phant0Meow/dsh-meow-memory/pull/11))
+- **[coutogilson](https://github.com/coutogilson)** — pacote de prompt em português (BR) e a camada de texto de UI
 
-## 📄 License
+As mudanças de endurecimento da 0.32 (portões de confiança, limites de orçamento, frequência de dream/reflexão, fórmula de recuperação, ferramentas de gestão, reescrita da documentação) estão no [CHANGELOG.md](CHANGELOG.md).
 
-MIT —— ver [LICENSE](LICENSE).
+## Licença
+
+MIT — veja [LICENSE](LICENSE). O copyright do upstream pertence ao autor de `Phant0Meow/dsh-meow-memory`; este fork mantém a LICENSE e a atribuição originais.

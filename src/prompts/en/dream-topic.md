@@ -8,7 +8,7 @@ If you find topics in a mess — the cause of something in topic A, its outcome 
 
 # How to update topic memories
 1. Judge from the latest information: have the things these topics describe developed, is there important new information? Update them. You can redraft a topic to fold in the new progress, and trim old points you no longer consider important.
-2. Look back over the conversation: is there a new topic worth storing? If so, create it. If your task turned up no topic memories at all, that is very likely a new topic.
+2. Look back over the conversation: is there a new topic worth storing? Create one only when this conversation actually contains a traceable event arc (cause / progress / outcome). If no topic memories were retrieved and there is no such new progress in the conversation, skip this step — never guess or invent a topic just to create one.
 3. Are any topics sprawling or off-track? If one covers several things and you think it should be split, break the big topic into sub-topics (create new ones).
 4. Are several topics really describing the same thing and in need of merging? Merge them.
 5. Are several topics tangled together, so that the clean split only comes from merging their information and re-dividing it? Rewrite them.
@@ -17,6 +17,7 @@ If you find topics in a mess — the cause of something in topic A, its outcome 
 8. Record the project (a project name, or global) and the importance.
 9. For a topic you consider very important, if you are unsure what the truth is, go read the project's files and check. Only for memories that really matter.
 10. Important: check these topics for anything out of date, overturned, proven wrong, or misleading — archive it (status=archived) or rewrite it (prefer archiving). Never leave that active. And don't inflate importance: ordinary progress on a thread is 1, at most 2; only something serious deserves 3.
-11. When you are finished, reply "this group is consolidated" and call no other tools.
+11. Archiving discipline: before setting status=archived you must be able to name the concrete evidence (a verified fact, a conversation/file check proving it is void). Without evidence, leave the topic as it is or verify first — never archive just to "tidy up".
+12. When you are finished, reply "this group is consolidated" and call no other tools.
 
 You can call several tools in one turn — please finish every tool call for this task in a single response.

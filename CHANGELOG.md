@@ -1,5 +1,104 @@
 # Changelog
 
+本文件从上游 `Phant0Meow/dsh-meow-memory` v0.31.1 接续。**0.32.0 起为本仓库（hardened fork）的版本**，与上游无隶属关系；上游变更历史见 <https://github.com/Phant0Meow/dsh-meow-memory/blob/main/CHANGELOG.md>。
+
+## v0.32.0 (2026-10-23) — 加固 fork
+
+安全、成本、稳定性、检索、文档五组改动。**没有重写核心机制**：注入传输、BM25、dream 调度器都保留；改的是默认边界、安全闸与诚实文档。完整设计约定见 `docs/HARDENING-PLAN.md`。
+
+### 安全：工作区记忆库信任闸（#64-1）
+
+- 新增 `security.trustWorkspaceMemory`（默认 **false**）：**任何已存在的 `memory.db`——包括空表/schema-only——判为 untrusted**（只有库文件根本不存在才自动创建并信任；关闭"预置空库 + SQLite trigger"投毒路径）。untrusted 库**不被正常聊天轮打开**（不升级 schema、不建索引、不迁移、不读；只有一次只读探针），内容不注入。
+- **untrusted 库的记忆工具（读/写）、dream 与反思全部拒绝**，并在会话里提示一次如何信任。
+- `.owner.json` 信任标记只写在记忆目录内（不写工作区根），且必须同时满足：`schema=1`、`installId` 等于本机**随机**安装 id（持久化于 `$DSH_HOME/storages/meow-memory/install-id`，**不是确定性机器指纹**）、`workspace` 与当前路径一致。伪造/他机/挪位标记一律拒绝；install-id 无法落盘时校验 **fail-closed**（外部审计后的信任闸 P1 修复）。
+- 新增一次性提示槽位 `src/prompts/<lang>/untrusted-store.md`（zh/en/pt-br），说明库路径、为何不注入、如何显式信任或删除重建。
+- `autoMigrate` 默认 **true → false**：工作区自带的 `PROJECT.md` 不再零交互导入。
+- 创建记忆目录时自动写 `.gitignore`（内容 `*`，目录自忽略；`security.autoGitignore` 默认 true）；**已存在但缺 `*` 行时追加一行**，防 `!*` 规则重新包含导致 `memory.db` 被提交。
+
+### 安全：`memory_home` 默认只读（#64-2）
+
+- 新增 `security.allowHomeSwitch`（默认 **false**）：`memory_home` 变为**查询工具**，无参数时返回当前目录、三个预设与切换开关；带 `target` 时明确拒绝并说明如何打开。
+- prompt 覆盖层目录改为**固定** `$DSH_HOME/storages/meow-memory/prompts/<lang>/`（`$DSH_HOME` 缺省 `~/.dsh`），不跟随 `homeDir` / `memory_home` / `MEOW_MEMORY_HOME`；旧位置（可切换全局目录下的 `prompts/`）**不再读取、无 fallback**——切断"切目录 = 换注入文案"。
+- `security.debugLogs` 默认 false：`perf.log` 与 settings/configEditor 诊断 dump 默认不写（`MEOW_MEMORY_DEBUG=1` 亦可开）。**不是零日志**：`dream-debug.log` 默认仍写最小信息（会话 id/计数/跳过原因，无记忆正文），启动时清理 48h 前日志、超 5MB 轮转；`apply-error.log` / `settings-register-error.log` 只在出错时写。
+
+### 成本：给自动花费加硬上限
+
+新增 `budget` 组（默认值见 `src/defaults.ts`）：
+
+- `snapshotMaxChars: 6000`（首轮快照）、`hitMaxChars: 1500`（单条命中）、`reinjectMaxChars: 8000`（压缩后重注入）——注入路径首次有字符上限。
+- `dreamMaxContextTokens: 40000`：估算会话上下文超限时跳过自动 dream 与反思（不再对大窗口发起全上下文整理）。
+- 上下文估算改为 **CJK 感知**：CJK ≈1.7 字符/token、非 CJK ≈4 字符/token（旧的 chars/3.5 对中文会话低估近 2 倍，40k 闸实际≈70–90k）；估算仍是近似值。
+- `dreamMaxPerWindowPerDay: 1`：自动 dream 频次上限（此前只靠 6h 冷却 + 24h cutoff，无每日硬上限）。
+- `reflectMaxPerDay: 6` + `reflectMinIntervalMinutes: 20`：反思首次有每窗口每日/最小间隔上限（此前任何 ≥7 工具步任务都追加一轮全上下文请求，无任何节流）。
+- 手动 `/dream` / `memory_dream` 是显式意愿，**不吃自动成本闸**（峰时/频次/上下文都不挡；手动调用本身就在活窗口里）：按完整会话上下文连跑最多 3 轮（atomic/topic/项目总结）。上下文很大时建议先 `/compact` 再 dream。
+
+### 稳定性：dream/反思不再触发已知陷阱
+
+- `dream.requireLiveAgent` 默认 **true**：自动 dream 只处理有 live agent 的窗口，**不再调用 `agents.resume()`**（#49：复活裸 agent 丢 26 个宿主内置工具）。
+- dream 轮次清单排除 `status='archived'`，每轮最多 60 条（旧版把归档条目永久喂给 dream，prompt 单调增长）。
+- 反思跳过原因、dream 跳过原因写入日志，可通过 `security.debugLogs` 打开详细诊断。
+- `dream-debug.log` 改写到全局目录，不再落每个工作区。
+- #66 缓解：自动 dream 不再走裸 agent 后台轮次路径，降低触发宿主"工具集锁死 9 个"的概率；**手动 dream 仍可能触发**（宿主侧问题，见"已知限制"）。
+- #71 文档化：只有配置 `delegate.model` 才可能触发"反思轮后后续请求继续跑在 delegate 模型上"；默认空值不触发。
+
+### 检索：按真实公式修召回
+
+- 近期权重改为**真指数半衰**：`0.05 + 0.95·exp(-ln2·ageDays/halfLifeDays)`，`retrieval.halfLifeDays` 默认 30 天；importance≥3 只保留 0.85 下限（旧版是 9 档年龄分桶，且被宣传成"艾宾浩斯遗忘曲线"）。
+- **查询覆盖率修复**：改为 `命中查询 token / 查询 token 总数`（旧版分母是条目关键词 token 数，关键词写得越多分越低，反向惩罚 prompt 要求的 8–13 个关键词）。
+- `retrieval.minScore`（默认 0.35）：无最低分门槛的问题修复；**它只过滤相关性、不乘遗忘权重**（`relevance` 在乘 recency 之前判定）——旧口径下 importance≤2 的条目约 45 天后即使完整命中也会被静默丢弃，现在衰减只影响排序，老但相关的条目仍能被召回。
+- `retrieval.hitBoost`（默认 true）：`hit_count` 首次参与排序（旧版只写不读）。
+- `retrieval.importanceWeight`（默认 true）：importance 进入排序（旧版 explain 里返回却不参与打分）。
+- 新增数据库索引（T1）：`list` / `findById` 热路径不再纯全表扫描。
+
+### 新增：管理工具 `memory_list` / `memory_forget`（#76）
+
+- `memory_list`：按 level/project/status 过滤、limit/offset 分页，返回 `{note,total,items:[{id,level,title,keywords,importance,status,project,updated_at}]}`——**只返回元数据，不返回正文**，用于低 token 盘点与找 id。
+- `memory_forget`：按 id 处理单条。`mode='archive'`（默认，可恢复）/ `'restore'` / `'delete'`（硬删除，必须 `confirm:true`）。没有按条件批量删除，避免模型一次清空记忆库。
+- 工具总数 8 → **10**；三语 `tools.md` 同步新增对应键，并把 `memory_home.description` 改为"默认只读"语义。
+- `memory_project` 输出封顶 `max(2000, budget.reinjectMaxChars)`（默认 **8000 字符**，超出截断补 `…`）；与压缩重注入共用段落构造，但该上限只作用于工具输出。
+
+### 兼容：0.2.1-rc.2 实机验证与适配
+
+- 实测宿主：DSH Desktop **0.2.1-rc.2**（Electron 44.7.0 / Node 24.21.0，`node:sqlite` 可用）。隔离实例加载成功、3 条 `/meow-memory/*` 路由带鉴权 200 / 不带 401、设置命名空间出现、无 apply 错误。
+- `connection` 服务改为**每个请求重新读取** `ctx.get('connection')`，不再 apply 时捕获一次（#57 鉴权闸在热重载/连接重建后仍生效）。
+- `presentCall.kind`: `write → edit`（0.2.1 的 `ToolCallKind` 无 `write`）。
+- 移除"兼容 dsh 0.1.5"的陈旧声明：本 fork **没有测 0.1.x**，不再声称向下兼容。
+- #57（webServer 路由鉴权闸）为上游 v0.31.1 已修项，本 fork 保留并在 0.2.1-rc.2 上验证。
+
+### 文档与 prompt（诚实化）
+
+- README.md / README.en.md / README.pt-br.md 重写：fork 身份与 MIT 归属、0.2.1-rc.2 兼容声明、**成本与上限章节**、**安全模型章节**、安装路线（本地目录 / tarball / 手动 profile；明确警告 `github:` 触发构建；说明本 fork 未发布到 npm）、10 个工具、已知限制。
+- `docs/配置参考.md` / `configuration-reference.md`：新增 `security` / `budget` / `retrieval` 全字段、`autoMigrate` 默认 false、`dream.requireLiveAgent`；明确新字段只走配置文件（设置页未接入）。
+- `docs/工具参考.md` / `tool-reference.md`：10 个工具；修正"写入自动去重合并"（仅同层近逐字）、"每消息命中 BM25"（实为关键词打分）、"艾宾浩斯"（实为指数半衰）等夸大表述；`memory_remember.keywords` 改为必填、无自动提取回退。
+- `docs/设计说明.md` / `design-notes.md` / `docs/常见问题.md` / `troubleshooting.md` 同步更新，新增信任模型、成本模型与"已知设计债"小节。
+- prompt 修复（Design audit §5.4）：
+  - `dream-atomic.md` 第 11 项删除"总结抽象、可添加新记忆"的幻觉诱导，改为**必须有清单内条目/可核实事实支撑**才允许新增或改写；
+  - `dream-topic.md` 删除"没检索到 topic 很可能就是新 topic"的指令，改为**只有对话里存在可追溯事件链才创建，否则跳过**；
+  - 三语 dream 文案新增**归档纪律**：设 `status=archived` 必须能指出具体依据，禁止无证据归档；
+  - `tools.md` 三语键集同步（新增 `memory_list.*` / `memory_forget.*`，更新 `memory_home`）；`node scripts/check-lang.mjs en` 与 `pt-br` 均通过。
+- `src/prompts/README.md`：槽位 9 → 10（新增 `untrusted-store`），注明新增槽位需同步 `src/prompt-loader.ts` 的 `SLOTS` / `SLOT_PARAMS`。
+- 独立审计后第二轮修正（1028 断言时点）：删除"手动 dream 仍受上下文检查"的错误表述（手动不吃自动成本闸）；静态税按实测改为 ≈6.7k（zh）/ ≈6.3k（en）；补 `memory_project` 输出上限；补上游 0.31 升级的信任陷阱（旧库无 `.owner.json` → 默认 untrusted，需 `security.trustWorkspaceMemory: true` 或删库重建）；`minScore` 澄清为只过滤相关性。
+- **外部审计后的收尾安全加固（1028 断言时点）文档同步**：信任模型按新行为重写（仅缺失库自动创建、已存在空库也 untrusted、installId 随机 UUID + workspace 绑定、untrusted 库不打开且 dream/反思拒绝、`.gitignore` 追加 `*`）；诊断日志口径改为"perf/settings 受闸 + dream-debug 默认最小日志并轮转 + error-only 日志"；上下文估算补充 CJK 感知；升级陷阱补充"空旧库也算已存在"。
+
+### 测试
+
+- 全量 `npm test` 通过：**1028 条断言全绿**（host 668 + client 360），0 失败；其中新增 `tests/hardening.mjs` 92 条。`node smoke.mjs` 另行 29 条通过；`scripts/check-lang.mjs` 校验 en/pt-br 两个语言包（11 槽位对齐）通过。
+- 既有测试按新不变量重写/收紧（T5）：自动 dream **不得** `agents.resume()`（no-resume）、上下文/频次上限、archived 排除、注入字符预算、untrusted 库读写拒绝、`memory_home` 默认只读、`memory_list` / `memory_forget` 语义、覆盖率/半衰/阈值口径；CHANGELOG 旧断言不再代表 0.32 行为。
+- 新增 `tests/hardening.mjs`（T5）：信任闸、预算上限、指数半衰/覆盖率/阈值、`memory_list` / `memory_forget`、`memory_home` 只读闸、无 live agent 不 dream、反思频次上限。
+
+### 已知限制 / 未修
+
+- **#66（未修）**：手动 dream 后宿主侧会话工具集仍可能锁在 9 个精简工具，需重启 dsh；插件侧没有设置工具过滤，无法根治。
+- **#71（未修）**：配置了 `delegate.model` 时，反思轮后宿主 `request/header` 投影可能被污染，后续请求继续跑在 delegate 模型上。默认空值不触发。
+- **关键词召回天花板**：没有向量/语义检索，关键词写得不好仍会静默召回不到；`hit_count` 反馈只能缓慢改善排序。
+- **记忆库按工作区隔离**："全局"只在单个 cwd 内全局；换工作区 = 空库，子目录/软链打开会新建库。
+- **设置页 0.2.x 保存链路**：沿用上游降级适配，未在本 fork 实测"保存 → apply"。
+- **pt-br 检索弱**：无葡语词干/停用词归一化。
+- **dream 历史持久占 token**：折叠只是视觉收纳。
+- **明文 PII**：记忆库不加密；`.gitignore` 只挡 git，不挡备份/同步盘。
+- 0.2.x 客户端 UI（折叠条/图标/菜单）依赖宿主内部结构，属"尽力而为"。
+
+
 ## v0.31.1 (2026-10-22)
 
 ### 修复：0.2.x 上旧格式轮次的折叠/注入横条全缺（#53/#58/#72）

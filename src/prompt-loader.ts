@@ -22,17 +22,17 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { activeHomeDir } from './home-dir.js'
+import { dshHomeDir } from './home-dir.js'
 
 /** 内置语言包根目录（<包>/lib/prompts）。 */
 const PROMPTS_DIR = join(dirname(fileURLToPath(import.meta.url)), 'prompts')
 
-/** 实例覆盖层根目录（<全局目录>/prompts/<lang>/<slot>.md）。prompt 语言与
- *  自定义文案是实例级偏好（记忆库才是 per-workspace），与 perf.log 等实例级文件
- *  同目录惯例；逐槽位可选——只放想改的文件，缺失自动落回内置语言包。
- *  动态取 activeHomeDir()：设置页切换全局目录后覆盖层跟着走（热切换，无需重启）。 */
-function overrideDir(): string {
-  return join(activeHomeDir(), 'prompts')
+/** 固定实例覆盖根目录（HARDENING-PLAN §3）：$DSH_HOME/storages/meow-memory/prompts
+ *  （$DSH_HOME 缺省 = ~/.dsh）。**刻意不走 activeHomeDir()**：全局目录会被设置页/
+ *  memory_home 热切换，覆盖层若跟着走，一次 memory_home 切换就能改写注入给模型的
+ *  全部指令文案（#64-2）。DSH home 的 storages/ 是宿主稳定位置，进程内不变。 */
+export function overrideRoot(): string {
+  return join(dshHomeDir(), 'storages', 'meow-memory', 'prompts')
 }
 
 /** 默认语言（最终兜底语言包目录名）。 */
@@ -62,6 +62,8 @@ export const SLOTS = [
   'dream-topic',
   'dream-project-summary',
   'welcome-guide',
+  'first-create-notice',
+  'untrusted-store',
   'labels',
   'tools',
 ] as const
@@ -75,10 +77,15 @@ export const SLOT_PARAMS: Partial<Record<SlotName, readonly string[]>> = {
   'dream-topic': ['list'],
   'dream-project-summary': ['projects'],
   'welcome-guide': ['homePath'],
+  'first-create-notice': ['dbPath', 'homePath'],
+  // 不可信工作区库（#64-1）的一次性提示：index.ts 在 foreign 时注入。
+  'untrusted-store': ['projectDir', 'homePath'],
 }
 
-/** 读槽位原始文本，逐槽位 fallback：①实例覆盖层（homedir/.dsh-meow/prompts/<lang>/，
- *  用户自定义、可只覆盖部分槽位）→ ②内置语言包 <lang> → ③内置 zh 兜底。
+/** 读槽位原始文本，逐槽位 fallback：①固定实例覆盖层（$DSH_HOME/storages/meow-memory/
+ *  prompts/<lang>/，用户自定义、可只覆盖部分槽位）→ ②内置语言包 <lang> → ③内置 zh 兜底。
+ *  旧位置（可切换全局目录的 prompts/）**不再读取**：它会被 memory_home 切换搬走，
+ *  读它等于允许一次切换改写注入文案（#64-2）。
  *  文件在③仍缺失直接 throw（部署完整性由 build.mjs 拷贝保证）。
  *  末尾空白剥离：md 文件惯例以换行结尾，而原代码常量末尾无换行——剥离后与外置前逐字节等价。 */
 function readSlotFile(slot: SlotName, lang: string): string {
@@ -87,7 +94,7 @@ function readSlotFile(slot: SlotName, lang: string): string {
       .replace(/\s+$/, '')
       // markdown 转义反转义：md 源里写 memory\_project 防渲染器吃下划线，模型该看到的是裸工具名
       .replace(/\\_/g, '_')
-  const override = join(overrideDir(), lang, `${slot}.md`)
+  const override = join(overrideRoot(), lang, `${slot}.md`)
   if (existsSync(override)) return read(override)
   if (lang !== DEFAULT_LANG) {
     const primary = join(PROMPTS_DIR, lang, `${slot}.md`)

@@ -14,9 +14,10 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, renameSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { dshHomeDir } from './home-dir.js'
 import { fillTemplate, getPromptLang, keyedValue } from './prompt-loader.js'
 
 export type Level = 'soul' | 'user' | 'project' | 'fact' | 'lesson' | 'topic' | 'rules'
@@ -201,6 +202,189 @@ export function memoryDbPath(workspace: string, dir = '.dsh-meow'): string {
   return join(workspace, dir, 'memory.db')
 }
 
+// ── 工作区库归属标记 / 信任判定（#64-1 工作区记忆库投毒） ──────────────────────
+// 记忆库默认落在 `<工作区>/<projectDir>/memory.db`，而工作区常是 clone 来的仓库：
+// 仓库作者只要带上一个 memory.db，受害者开第一个会话就会把作者写的 soul/user/rules
+// 零交互注入首轮快照（持久 prompt injection）。加固：本插件自建的库在旁边落
+// `.owner.json` 归属标记；没有标记的非空库默认**不信任**（不注入、不迁移），
+// 除非用户显式配置 trustWorkspaceMemory。同时落一个 `*` 自忽略的 .gitignore，
+// 让目录里的任何文件（含 memory.db 与标记本身）都不可能被 git 提交。
+
+/** 库归属标记文件名（与 memory.db 同目录，绝不在工作区根）。 */
+export const OWNER_MARKER_FILE = '.owner.json'
+/** 自忽略 .gitignore 文件名（内容 `*`）。 */
+export const STORE_GITIGNORE_FILE = '.gitignore'
+/** 标记 schema 版本（当前唯一版本）。 */
+const OWNER_SCHEMA = 1
+
+/** 工作区记忆库信任状态（HARDENING-PLAN §3）：inject/index 据此决定是否注入。 */
+export interface StoreTrust {
+  trusted: boolean
+  reason: 'created' | 'marker' | 'config-trusted' | 'foreign'
+}
+
+/** ensureMemoryStore 的配置入参（由 index.ts 从 security.* 透传，本模块不读 config）。 */
+export interface EnsureStoreOptions {
+  /** 缺失时写自忽略 .gitignore（默认 true）。 */
+  autoGitignore: boolean
+  /** 用户显式信任一个非本插件创建的库（默认 false）。 */
+  trustWorkspaceMemory: boolean
+}
+
+/** installId 的固定落点：$DSH_HOME/storages/meow-memory/install-id。
+ *  **不用** activeHomeDir()：工作区库随工作区走，而全局目录会被设置页/memory_home
+ *  热切换——installId 若跟着全局目录走，切一次目录所有既有工作区库就会认不出自己
+ *  的标记、全部退化成 foreign（静默丢记忆）。storages/ 是宿主稳定位置（home 指针
+ *  同在此处），不随 meow 全局目录搬移。 */
+function installIdPath(): string {
+  return join(dshHomeDir(), 'storages', 'meow-memory', 'install-id')
+}
+
+let installIdState: { id: string; persisted: boolean } | null = null
+
+/** 本机安装 id：**随机**生成并持久化（全局稳定位置），进程内缓存。随机性是信任标记
+ *  的根基——确定性 id（如 hostname+homedir 的 hash）可被定向攻击者推算出来伪造标记，
+ *  0.32 review 已把它改回随机。落盘失败时本次仍用随机 id，但 persisted=false → 标记
+ *  校验 fail-closed（重启后既有库判 foreign，由用户显式 trustWorkspaceMemory 恢复）。 */
+function installId(): { id: string; persisted: boolean } {
+  if (installIdState !== null) return installIdState
+  try {
+    const existing = readFileSync(installIdPath(), 'utf8').trim()
+    if (existing.length > 0) {
+      installIdState = { id: existing, persisted: true }
+      return installIdState
+    }
+  } catch {
+    /* 尚未生成过：走生成分支 */
+  }
+  const id = randomUUID()
+  let persisted = false
+  try {
+    const p = installIdPath()
+    mkdirSync(dirname(p), { recursive: true })
+    writeFileSync(p, id + '\n', { encoding: 'utf8', mode: 0o600 })
+    persisted = true
+  } catch {
+    /* 全局目录不可写：随机 id 仅本进程有效，标记校验 fail-closed */
+  }
+  installIdState = { id, persisted }
+  return installIdState
+}
+
+interface OwnerMarker {
+  schema: number
+  installId?: string
+  workspace?: string
+  createdAt?: number
+}
+
+/** 读 `.owner.json`；缺失/损坏/schema 不是 1 → null（按「无标记」处理）。绝不抛出。 */
+function readOwnerMarker(projectDir: string): OwnerMarker | null {
+  try {
+    const parsed = JSON.parse(readFileSync(join(projectDir, OWNER_MARKER_FILE), 'utf8')) as Record<string, unknown> | null
+    if (parsed === null || typeof parsed !== 'object') return null
+    if (parsed.schema !== OWNER_SCHEMA) return null
+    return {
+      schema: OWNER_SCHEMA,
+      installId: typeof parsed.installId === 'string' ? parsed.installId : undefined,
+      workspace: typeof parsed.workspace === 'string' ? parsed.workspace : undefined,
+      createdAt: typeof parsed.createdAt === 'number' ? parsed.createdAt : undefined,
+    }
+  } catch {
+    return null
+  }
+}
+
+/** 标记是否可信：schema=1 **且 installId 等于本机随机安装 id**；install-id 未落盘
+ *  （persisted=false）时无法跨进程校验 → fail-closed。另校验 workspace 归属：把别的
+ *  路径的标记连库一起搬过来（或仓库自带他机标记）都会被拒。 */
+function markerTrusts(marker: OwnerMarker, workspace: string): boolean {
+  if (typeof marker.installId !== 'string' || marker.installId.length === 0) return false
+  const me = installId()
+  if (!me.persisted || marker.installId !== me.id) return false
+  if (typeof marker.workspace === 'string' && marker.workspace.length > 0) {
+    const norm = (p: string): string => p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+    if (norm(marker.workspace) !== norm(workspace)) return false
+  }
+  return true
+}
+
+/** 落归属标记（尽力而为）：失败返回 false，由调用方按 best-known 状态处理，绝不抛出。 */
+function writeOwnerMarker(projectDir: string, workspace: string): boolean {
+  try {
+    const me = installId()
+    mkdirSync(projectDir, { recursive: true })
+    const payload = { schema: OWNER_SCHEMA, installId: me.id, workspace, createdAt: Date.now() }
+    writeFileSync(join(projectDir, OWNER_MARKER_FILE), JSON.stringify(payload, null, 1) + '\n', {
+      encoding: 'utf8',
+      mode: 0o600,
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 自忽略 .gitignore：缺失时写 `*\n`；已存在但内容不含 `*` 行时追加一行 `*`
+ *  （只改我们自己的记忆目录；防止用户/仓库预置的 `!*` 之类让 memory.db 被提交）。
+ *  写失败不阻断（隐私兜底是加分项）。 */
+function writeStoreGitignore(projectDir: string, enabled: boolean): void {
+  if (!enabled) return
+  try {
+    mkdirSync(projectDir, { recursive: true })
+    const p = join(projectDir, STORE_GITIGNORE_FILE)
+    if (!existsSync(p)) {
+      writeFileSync(p, '*\n', 'utf8')
+      return
+    }
+    const cur = readFileSync(p, 'utf8')
+    if (!cur.split(/\r?\n/).some((line) => line.trim() === '*')) {
+      writeFileSync(p, `${cur}${cur.endsWith('\n') || cur.length === 0 ? '' : '\n'}*\n`, 'utf8')
+    }
+  } catch {
+    /* 失败不影响信任判定 */
+  }
+}
+
+/** 只读探针：库「不存在 / 空 / 有记忆行 / 读不了」。用 readOnly 连接，绝不在陌生库里
+ *  跑迁移或写任何数据；level 表都没有行（含全新空 schema）算空。 */
+function probeMemoryStore(dbPath: string): 'absent' | 'empty' | 'nonempty' | 'unreadable' {
+  if (!existsSync(dbPath)) return 'absent'
+  let probe: DatabaseSync | null = null
+  try {
+    probe = new DatabaseSync(dbPath, { readOnly: true })
+    probe.exec('PRAGMA busy_timeout = 2000')
+    const tables = new Set(
+      (probe.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((r) =>
+        String(r.name),
+      ),
+    )
+    for (const level of LEVELS) {
+      if (!tables.has(level)) continue
+      const row = probe.prepare(`SELECT COUNT(*) AS n FROM ${level}`).get() as { n: number }
+      if (Number(row.n) > 0) return 'nonempty'
+    }
+    return 'empty'
+  } catch {
+    return 'unreadable'
+  } finally {
+    try {
+      probe?.close()
+    } catch {
+      /* already closed */
+    }
+  }
+}
+
+/** 工作区级信任缓存：键 = 精确 (workspace, dir)，进程生命周期内有效。
+ *  ensureMemoryStore 是同步函数（Node 单线程），两个并发 pre-step 实际串行执行，
+ *  第一个返回前已写入缓存，第二个直接命中——无需额外 in-flight 锁。 */
+const storeTrustCache = new Map<string, StoreTrust>()
+
+function storeKey(workspace: string, dir: string): string {
+  return `${workspace}\u0000${dir}`
+}
+
 export class MemoryDb {
   private readonly db: DatabaseSync
 
@@ -216,6 +400,7 @@ export class MemoryDb {
     this.db.exec(`CREATE TABLE IF NOT EXISTS dream_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       run_at INTEGER NOT NULL,
+      session_id TEXT,
       summary TEXT,
       changes TEXT,
       note TEXT
@@ -243,6 +428,7 @@ export class MemoryDb {
       skip_write INTEGER NOT NULL DEFAULT 0
     )`)
     this.upgrade()
+    this.createIndexes()
   }
 
   /** 幂等升级：缺列补列；旧 UUID id 按 created_at 重排为时间前缀 id；
@@ -301,6 +487,26 @@ export class MemoryDb {
     ] as const) {
       if (!sCols.has(col)) this.db.exec(`ALTER TABLE dream_skip ADD COLUMN ${col} ${ddl}`)
     }
+    // dream_log 表：v0.32.0 起记 session_id（按会话查整理历史 / 索引）。
+    // 老库补列（可空列，ALTER 兼容）；新库 DDL 已含该列。
+    const dCols = new Set(
+      (this.db.prepare('PRAGMA table_info(dream_log)').all() as Array<{ name: string }>).map((c) => c.name),
+    )
+    if (!dCols.has('session_id')) this.db.exec('ALTER TABLE dream_log ADD COLUMN session_id TEXT')
+  }
+
+  /** 建索引（#设计质量：无索引 → 每轮命中多次全表扫描）：status+updated_at 复用于
+   *  active 列表与时间戳排序；project 用于项目全貌/过滤；dream_log/windows 按会话查。
+   *  全部 IF NOT EXISTS，老库打开即自动补齐；列不存在的情况由 upgrade() 先补列，
+   *  故此处建索引时列一定在（LEVELS 由本模块枚举，不拼外部输入）。 */
+  private createIndexes(): void {
+    const projectLevels = new Set<Level>(['project', 'fact', 'lesson', 'topic', 'rules'])
+    for (const level of LEVELS) {
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_${level}_status_updated ON ${level} (status, updated_at)`)
+      if (projectLevels.has(level)) this.db.exec(`CREATE INDEX IF NOT EXISTS idx_${level}_project ON ${level} (project)`)
+    }
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_dream_log_session ON dream_log (session_id)')
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_windows_session ON windows (session_id)')
   }
 
   /** 新库（memories 全空）判定：迁移只在库刚创建时执行一次。 */
@@ -434,6 +640,32 @@ export class MemoryDb {
     return res.changes > 0
   }
 
+  /** 硬删除一行（memory_forget 的 delete 档）：返回是否真的删掉。
+   *  短 id 走与 update 相同的「前缀唯一才解析」口径：歧义/未知一律 false，绝不抛出。 */
+  deleteRow(level: Level, id: string): boolean {
+    if (!(LEVELS as readonly string[]).includes(level)) return false
+    if (typeof id !== 'string' || id.length === 0) return false
+    let targetId = id
+    if (id.length < 36) {
+      let matches: Array<{ id: string }>
+      try {
+        matches = this.db.prepare(`SELECT id FROM ${level} WHERE id LIKE ?`).all(`${id}%`) as Array<{ id: string }>
+      } catch {
+        return false
+      }
+      if (matches.length !== 1) {
+        if (matches.length > 1) console.warn(`[meow-memory] delete 拒绝歧义短 id：${level} 前缀 "${id}" 命中 ${matches.length} 行，请用完整 id`)
+        return false
+      }
+      targetId = matches[0].id
+    }
+    try {
+      return this.db.prepare(`DELETE FROM ${level} WHERE id = ?`).run(targetId).changes > 0
+    } catch {
+      return false
+    }
+  }
+
   list(level: Level, opts: { status?: Status; project?: string } = {}): MemoryRow[] {
     const where: string[] = []
     const args: unknown[] = []
@@ -491,10 +723,10 @@ export class MemoryDb {
     return [...names].sort((a, b) => a.localeCompare(b))
   }
 
-  logDream(summary: string, changes: unknown, note = ''): void {
+  logDream(summary: string, changes: unknown, note = '', sessionId: string | null = null): void {
     this.db
-      .prepare('INSERT INTO dream_log (run_at, summary, changes, note) VALUES (?, ?, ?, ?)')
-      .run(Date.now(), summary, JSON.stringify(changes), note)
+      .prepare('INSERT INTO dream_log (run_at, session_id, summary, changes, note) VALUES (?, ?, ?, ?, ?)')
+      .run(Date.now(), sessionId, summary, JSON.stringify(changes), note)
   }
 
   recentDream(hours: number): boolean {
@@ -814,6 +1046,75 @@ export function getDb(workspace: string, dir = '.dsh-meow'): MemoryDb {
 export function closeAllDbs(): void {
   for (const db of dbCache.values()) db.close()
   dbCache.clear()
+}
+
+// ── 工作区库信任入口（HARDENING-PLAN §3 contract；index/inject 消费） ────────
+
+/** 首次打开/创建某工作区记忆库：建目录、落 `.gitignore` 与 `.owner.json`，返回信任状态。
+ *  每个精确 (workspace, dir) 只做一次（进程级缓存；Config 变更按设计需重载插件才生效）。
+ *  契约：
+ *   - 标记有效 → trusted:'marker'；
+ *   - memory.db 不存在 / 可读但空 → 建 schema+索引+标记 → trusted:'created'；
+ *   - 已有数据但无有效标记 → trusted:trustWorkspaceMemory ? 'config-trusted' : 'foreign'；
+ *     不信任时**不注入、不迁移、不写任何文件**（投毒库连碰都不碰）；
+ *   - 任何写标记/gitignore 失败都不抛出：能建出库就是 created，其余按 foreign fail-closed。 */
+export function ensureMemoryStore(
+  workspace: string,
+  dir: string,
+  opts: EnsureStoreOptions = { autoGitignore: true, trustWorkspaceMemory: false },
+): StoreTrust {
+  const key = storeKey(workspace, dir)
+  const cached = storeTrustCache.get(key)
+  if (cached !== undefined) return cached
+
+  const projectDir = join(workspace, dir)
+  const dbPath = memoryDbPath(workspace, dir)
+  const marker = readOwnerMarker(projectDir)
+  let trust: StoreTrust
+
+  if (marker !== null && markerTrusts(marker, workspace)) {
+    writeStoreGitignore(projectDir, opts.autoGitignore)
+    trust = { trusted: true, reason: 'marker' }
+  } else {
+    const state = probeMemoryStore(dbPath)
+    if (state === 'absent') {
+      // 只有「库文件根本不存在」才允许本机创建并信任。已存在的空库也可能是攻击者
+      // 预置的 schema+trigger（0.32 review 实证：row-empty + AFTER INSERT trigger
+      // 会绕过 row 计数）；已存在一律按 foreign 处理，除非用户显式信任。
+      try {
+        getDb(workspace, dir)
+      } catch (e) {
+        console.warn(`[meow-memory] 记忆库创建失败（按不可信处理）：${e instanceof Error ? e.message : String(e)}`)
+        const failed: StoreTrust = { trusted: false, reason: 'foreign' }
+        storeTrustCache.set(key, failed)
+        return failed
+      }
+      writeStoreGitignore(projectDir, opts.autoGitignore)
+      writeOwnerMarker(projectDir, workspace) // 失败也仍是本进程刚建的空库
+      trust = { trusted: true, reason: 'created' }
+    } else if (!opts.trustWorkspaceMemory) {
+      console.warn(`[meow-memory] 检测到非本插件创建的记忆库（${dbPath}）：默认不注入、不迁移；如确认可信请在配置中开启 security.trustWorkspaceMemory`)
+      trust = { trusted: false, reason: 'foreign' }
+    } else {
+      // 用户显式信任：照常使用；不写标记（库不是我们建的，写标记会混淆归属）。
+      writeStoreGitignore(projectDir, opts.autoGitignore)
+      trust = { trusted: true, reason: 'config-trusted' }
+    }
+  }
+
+  storeTrustCache.set(key, trust)
+  return trust
+}
+
+/** 取某工作区的信任状态（ensureMemoryStore 跑过之前返回 undefined）。
+ *  注入链路据此决定是否注入；未跑过 = 调用方尚未完成首次信任判定。 */
+export function storeTrustOf(workspace: string, dir = '.dsh-meow'): StoreTrust | undefined {
+  return storeTrustCache.get(storeKey(workspace, dir))
+}
+
+/** 清空进程级信任缓存（测试/热重载显式重置用；正常 dispose 不需要）。 */
+export function resetStoreTrustCache(): void {
+  storeTrustCache.clear()
 }
 
 /** 记忆库备份（issue #37 增量②）：memory.db → memory.db.bak 单文件轮转。

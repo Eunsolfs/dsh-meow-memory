@@ -13,17 +13,52 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { Doc } from './bm25.js'
 import { keywordHitScore, search, tokenize } from './bm25.js'
-import { isGlobalProject, isGlobalScope, memoryDbPath, projectCovers, projectLabel, projectList, relativeTime, PROJECT_SUBCATEGORIES, type MemoryDb, type MemoryRow, type ProjectSubcategory } from './db.js'
+import { isGlobalProject, isGlobalScope, memoryDbPath, projectCovers, projectLabel, projectList, relativeTime, PROJECT_SUBCATEGORIES, type Level, type MemoryDb, type MemoryRow, type ProjectSubcategory } from './db.js'
 import { fillTemplate, keyedValue } from './prompt-loader.js'
+
+/** 信任门（v0.32，index.ts 从 db.storeTrustOf() 传入）：trusted === false = 记忆库不是本插件
+ *  创建的（外来 memory.db），不注入库内内容；未传视为 trusted（旧调用方/测试行为不变）。 */
+export interface InjectionTrust {
+  trusted: boolean
+}
 
 export interface InjectOptions {
   /** 关键词命中条数上限（fact/lesson 短条目）。 */
   hitTopK: number
   /** 导引里 project/topic 标题超长截断长度。 */
   titleMax: number
+  /** 信任门：false 时三条注入链路都不输出 soul/user/rules/project 等库内内容。 */
+  trust?: InjectionTrust
+  /** 首轮长期记忆快照字符上限（config budget.snapshotMaxChars，默认 6000；<=0 不截断）。 */
+  snapshotMaxChars?: number
+  /** 单条命中正文长度上限（config budget.hitMaxChars，默认 1500；超出补 …）。 */
+  hitMaxChars?: number
+  /** 压缩重注入整体字符上限（config budget.reinjectMaxChars，默认 8000；超预算整块丢弃）。 */
+  reinjectMaxChars?: number
+  /** 检索：遗忘半衰期（天，config retrieval.halfLifeDays，默认 30）。 */
+  halfLifeDays?: number
+  /** 检索：注入阈值（config retrieval.minScore，默认 0.35：低于它的命中不注入）。 */
+  minScore?: number
+  /** 检索：hit_count 加成（config retrieval.hitBoost，默认开）。 */
+  hitBoost?: boolean
+  /** 检索：importance 参与排名（config retrieval.importanceWeight，默认开）。 */
+  importanceWeight?: boolean
+  /** 命中记账回调（index.ts 传 (level,id)=>bumpHitCount(level,id)）：每条实际注入的命中调用一次。 */
+  onHit?: (level: Level, id: string) => void
 }
 
-const DEFAULT_OPTS: InjectOptions = { hitTopK: 2, titleMax: 40 }
+/** 预算契约默认值（与 src/defaults.ts 的 budget.* 一致；index.ts 显式传入时以传入为准）。 */
+const BUDGET_DEFAULTS = { snapshotMaxChars: 6000, hitMaxChars: 1500, reinjectMaxChars: 8000 }
+/** 检索契约默认值（与 src/defaults.ts 的 retrieval.* 一致）。 */
+const RETRIEVAL_DEFAULTS = { halfLifeDays: 30, minScore: 0.35, hitBoost: true, importanceWeight: true }
+
+const DEFAULT_OPTS: InjectOptions = { hitTopK: 2, titleMax: 40, ...BUDGET_DEFAULTS, ...RETRIEVAL_DEFAULTS }
+
+/** 文本上限保护：超长截断并补 …（max <=0 视为不截断）。 */
+function capText(text: string, max: number | undefined): string {
+  if (max === undefined || max <= 0 || text.length <= max) return text
+  return text.slice(0, max - 1) + '…'
+}
 
 export function sessionsFile(workspace: string, sessionId: string, dir = '.dsh-meow'): string {
   // 会话 id 可能含 Windows 文件名非法字符（#56：飞书桥 lark-link:dm:…:0 的冒号）——
@@ -227,6 +262,7 @@ function toDocs(rows: MemoryRow[]): Doc[] {
     content: r.content,
     keywords: r.keywords,
     importance: r.importance,
+    hit_count: r.hit_count,
     created_at: r.created_at,
     updated_at: r.updated_at,
   }))
@@ -245,28 +281,71 @@ void shortTitle
  * 构造长期记忆快照正文（buildInjection / buildReinjection 共用）：
  *   顶格「===== 长期记忆 =====」→ 【关于你】(soul) / 【关于user】/ 【设计原则】/ 【记忆导引】(两行)。
  * 不含结束标记与「本轮用户prompt：」尾巴（两链路各自拼装），也不做已见记账（调用方负责）。
+ * v0.32 加固：
+ * - trust.trusted === false（外来/未信任记忆库）→ 只输出静态「记忆导引」提示，soul/user/rules/
+ *   项目清单等库内内容一律不读不注入（未信任提示由 index.ts 另行注入）；
+ * - capChars > 0 → 按字符预算组装（budget.snapshotMaxChars），装不下的条目直接不注入，
+ *   末尾补 …；injectedIds 只含真正写进正文的条目（超预算的不会被误记已见）。
  * @returns null = 只有标题头，无任何可注入内容。
  */
 function buildInjectionBody(
   db: MemoryDb,
   o: InjectOptions,
+  capChars: number,
 ): { body: string; injectedIds: string[] } | null {
   // 框架词外置（v0.19.0）：labels.md 的 inject.* 键；记忆条目正文本身是数据不是文案，不外置。
   const lbl = (key: string, params?: Record<string, string>): string => fillTemplate(keyedValue('labels', key), params)
-  const soul = db.list('soul', { status: 'active' })
-  const user = db.list('user', { status: 'active' })
+  const trusted = o.trust?.trusted !== false
+  const soul = trusted ? db.list('soul', { status: 'active' }) : []
+  const user = trusted ? db.list('user', { status: 'active' }) : []
 
   const lines: string[] = [lbl('inject.title'), '']
   const injected: string[] = []
+  let used = lines.join('\n').length
+  let truncated = false
+  let hasContent = false
+  /** 按字符预算判断一行是否还装得下（used 是 join 长度近似值，偏保守）。 */
+  const fits = (line: string): boolean => capChars <= 0 || used + 1 + line.length <= capChars
+  const push = (line: string): void => {
+    lines.push(line)
+    used += 1 + line.length
+  }
+  const pushBlock = (block: string[]): boolean => {
+    if (block.length === 0 || truncated) return false
+    if (!fits(block[0])) {
+      truncated = true
+      return false
+    }
+    for (const line of block) {
+      if (!fits(line)) {
+        truncated = true
+        break
+      }
+      push(line)
+    }
+    return true
+  }
 
   const pushEntries = (label: string, rows: MemoryRow[]) => {
-    if (rows.length === 0) return
-    lines.push(lbl('inject.sectionFormat', { label }))
-    for (const r of rows) {
-      lines.push(`- ${r.content}`)
-      injected.push(r.id) // 正文已注入 → 记入已见（命中链路不再重复注入）
+    if (rows.length === 0 || truncated) return
+    const head = lbl('inject.sectionFormat', { label })
+    // 段标题 + 首条都装不下 → 整段放弃（不留空标题）。
+    if (!fits(head) || !fits(`- ${rows[0].content}`)) {
+      truncated = true
+      return
     }
-    lines.push('')
+    push(head)
+    for (const r of rows) {
+      const line = `- ${r.content}`
+      if (!fits(line)) {
+        truncated = true
+        break
+      }
+      push(line)
+      injected.push(r.id) // 正文已注入 → 记入已见（命中链路不再重复注入）
+      hasContent = true
+    }
+    if (!truncated) push('')
   }
 
   pushEntries(lbl('inject.aboutYou'), soul)
@@ -276,25 +355,36 @@ function buildInjectionBody(
   // 且 importance≥2」的——少而精的命令式准则。
   // 2026-09-19 口径修复（用户拍板）：此前只认 project === null，而文档（tools.md /
   // system-guide.md / dream-atomic.md）教模型写"全局"——按文档写的准则反而永不注入。
-  const globalRules = db.list('rules', { status: 'active' }).filter((r) => isGlobalScope(r.project) && r.importance >= 2)
+  // 未信任库不读 rules（含全局规则）：rules 是命令式文本，注入优先级等同用户指令，风险最高。
+  const globalRules = trusted ? db.list('rules', { status: 'active' }).filter((r) => isGlobalScope(r.project) && r.importance >= 2) : []
   pushEntries(lbl('inject.rules'), globalRules)
 
   // 记忆导引：说明 + 项目列表（正文/标题一律自取，不列）。
   // titleMax 落地（2026-09-10）：schema/设置页一直承诺「导引里项目名的截断长度」，
   // 此前是死配置（shortTitle 被 void）。这里按承诺截断项目名——只影响导引一行展示，
   // 记忆条目正文/标题依旧不截断（v0.19.0 拍板不变）。
-  const projectNames = db.listProjectNames()
-  if (projectNames.length > 0) {
-    const max = o.titleMax
-    const shown = projectNames.map((n) => (n.length > max ? n.slice(0, max) + '…' : n))
-    lines.push(lbl('inject.sectionFormat', { label: lbl('inject.guide') }))
-    lines.push(lbl('inject.guideSearchLine'))
-    lines.push(lbl('inject.guideProjectLine'))
-    lines.push(lbl('inject.guideProjects', { list: shown.join(' / ') }))
-    lines.push('')
+  const projectNames = trusted ? db.listProjectNames() : []
+  // 导引的提示行是静态文案（不是库内容），未信任库也保留（告诉模型记忆工具怎么用）；
+  // 项目清单来自库内数据，未信任时不列出（项目全景链路也被 trust 门挡掉）。
+  if (!trusted || projectNames.length > 0) {
+    const block: string[] = [
+      lbl('inject.sectionFormat', { label: lbl('inject.guide') }),
+      lbl('inject.guideSearchLine'),
+      lbl('inject.guideProjectLine'),
+    ]
+    if (projectNames.length > 0) {
+      const max = o.titleMax
+      const shown = projectNames.map((n) => (n.length > max ? n.slice(0, max) + '…' : n))
+      block.push(lbl('inject.guideProjects', { list: shown.join(' / ') }))
+    }
+    if (pushBlock(block)) {
+      hasContent = true
+      if (!truncated) push('')
+    }
   }
 
-  if (lines.length <= 2) return null // 只有标题头，无任何内容
+  if (truncated && fits('…')) push('…')
+  if (!hasContent) return null // 只有标题头 / 预算连第一行内容都放不下，无任何可注入内容
   return { body: lines.join('\n').trimEnd(), injectedIds: injected }
 }
 
@@ -305,6 +395,8 @@ function buildInjectionBody(
  *   用户 prompt 保持原样（防会话标题污染；旧格式历史会话由前端折叠兼容）。
  * 首轮只注入长期记忆，不做关键词命中（命中链路从第二轮起，见 buildHitInjection）；
  * 正文注入的 id 记入已见（命中链路不再重复注入它们）。
+ * v0.32：opts.trust.trusted === false 时只回记忆导引提示（库内内容不注入）；
+ * 快照正文按 opts.snapshotMaxChars（契约默认 6000）截断预算，超预算条目会被丢弃并补 …。
  * @returns { text, injectedIds }；无任何可注入内容返回 null。
  */
 export function buildInjection(
@@ -316,7 +408,7 @@ export function buildInjection(
   dir = '.dsh-meow',
 ): { text: string; injectedIds: string[] } | null {
   const o = { ...DEFAULT_OPTS, ...opts }
-  const built = buildInjectionBody(db, o)
+  const built = buildInjectionBody(db, o, o.snapshotMaxChars ?? BUDGET_DEFAULTS.snapshotMaxChars)
   if (built === null) return null
   const text = built.body
   if (built.injectedIds.length > 0) markInjected(workspace, sessionId, built.injectedIds, dir)
@@ -347,8 +439,10 @@ function fmtProjectRow(r: MemoryRow): string {
  * 非 todo 子标签只取 active；条目正文本身是数据，不做文案外置。
  * @returns null = 项目无任何可注入段落（active 条目与已完成 todo 皆空）。
  */
-/** 内部构造：段落文本 + 段内出现过的全部条目 id（压缩重注入第三块按此去重，防同块重复展示）。 */
-function buildProjectSection(db: MemoryDb, workspace: string, project: string, dir: string): { text: string; ids: string[] } | null {
+/** 内部构造：段落文本 + 段内出现过的全部条目 id（压缩重注入第三块按此去重，防同块重复展示）。
+ *  trust.trusted === false（外来/未信任记忆库）→ 直接返回 null（不输出任何库内条目行）。 */
+function buildProjectSection(db: MemoryDb, workspace: string, project: string, dir: string, trust?: InjectionTrust): { text: string; ids: string[] } | null {
+  if (trust?.trusted === false) return null
   // 项目视图按名单语义匹配（#61）：project 字段写多项目名（'dsh,femo'）的条目，
   // 在任一名单项目的视图都该可见——SQL 精确等值会把两边都漏掉。全局标记/未标记
   // projectList 为空、不命中任何具体项目名，保持「全局内容走快照层」的原语义。
@@ -423,9 +517,16 @@ function buildProjectSection(db: MemoryDb, workspace: string, project: string, d
   return { text, ids }
 }
 
-/** 段落文本视图（memory_project 工具用）：只要文本。 */
-export function buildProjectSectionText(db: MemoryDb, workspace: string, project: string, dir = '.dsh-meow'): string | null {
-  return buildProjectSection(db, workspace, project, dir)?.text ?? null
+/** 段落文本视图（memory_project 工具用）：只要文本。
+ *  trust.trusted === false（未信任库）→ null（调用方应改抛"记忆库未受信任"提示）。 */
+export function buildProjectSectionText(
+  db: MemoryDb,
+  workspace: string,
+  project: string,
+  dir = '.dsh-meow',
+  opts: { trust?: InjectionTrust } = {},
+): string | null {
+  return buildProjectSection(db, workspace, project, dir, opts.trust)?.text ?? null
 }
 
 /**
@@ -477,6 +578,10 @@ function buildWrittenSection(
  * 用户 prompt 保持原样。
  * 快照条目 id 与回放的 written id 重新记入 injected——压缩后内容重新进入上下文，
  * 去重语义随之恢复（合并更新过的他窗条目不再被关键词命中重复注入）。
+ * v0.32 加固：
+ * - trust.trusted === false → 只保留静态记忆导引快照，项目全景/写入回放一律不输出；
+ * - 整体字符预算 opts.reinjectMaxChars（契约默认 8000）：超预算时按 快照 > 写入回放 >
+ *   项目全景 的优先级整块保留，装不下的块整块丢弃（不是切半行），末尾补 …。
  * @returns null = 无任何可注入内容（库无快照正文、项目全空且无写入条目）；调用方仍应
  *          清除 reinjectPending，避免每个用户消息轮空转重查。
  */
@@ -489,41 +594,71 @@ export function buildReinjection(
   dir = '.dsh-meow',
 ): { text: string; injectedIds: string[] } | null {
   const o = { ...DEFAULT_OPTS, ...opts }
-  const snapshot = buildInjectionBody(db, o)
+  const trusted = o.trust?.trusted !== false
+  const capChars = o.reinjectMaxChars ?? BUDGET_DEFAULTS.reinjectMaxChars
+  const snapshot = buildInjectionBody(db, o, o.snapshotMaxChars ?? BUDGET_DEFAULTS.snapshotMaxChars)
   const projectTexts: string[] = []
   const projectIds = new Set<string>()
-  for (const project of projects) {
-    const built = buildProjectSection(db, workspace, project, dir)
-    if (built !== null) {
-      projectTexts.push(built.text)
-      for (const id of built.ids) projectIds.add(id)
+  if (trusted) {
+    for (const project of projects) {
+      const built = buildProjectSection(db, workspace, project, dir, o.trust)
+      if (built !== null) {
+        projectTexts.push(built.text)
+        for (const id of built.ids) projectIds.add(id)
+      }
     }
   }
   // 第三块：本会话写过的记忆（排除快照与项目全景已展示的 id，防同块重复）。
-  const written = buildWrittenSection(db, workspace, sessionId, dir, new Set([...(snapshot?.injectedIds ?? []), ...projectIds]))
+  // 未信任库不回放（内容仍来自库内行，可能被外来行污染）。
+  const written = trusted
+    ? buildWrittenSection(db, workspace, sessionId, dir, new Set([...(snapshot?.injectedIds ?? []), ...projectIds]))
+    : null
   if (snapshot === null && projectTexts.length === 0 && written === null) return null
-  const lines: string[] = []
-  if (snapshot !== null) {
-    lines.push(snapshot.body)
-    lines.push('')
-  }
-  if (projectTexts.length > 0 || written !== null) {
-    lines.push(lbl('inject.sectionFormat', { label: lbl('inject.reinjectSection') }))
-    lines.push(lbl('inject.reinjectIntro'))
-    lines.push('')
-    if (projectTexts.length > 0) {
-      lines.push(projectTexts.join('\n\n'))
+
+  /** 按原格式组装三块（withProjects/withWritten 用于预算裁剪时整块取舍）。 */
+  const assemble = (withProjects: boolean, withWritten: boolean): { text: string; ids: string[] } => {
+    const lines: string[] = []
+    if (snapshot !== null) {
+      lines.push(snapshot.body)
       lines.push('')
     }
+    const includeProjects = withProjects && projectTexts.length > 0
+    const includeWritten = withWritten && written !== null
+    if (includeProjects || includeWritten) {
+      lines.push(lbl('inject.sectionFormat', { label: lbl('inject.reinjectSection') }))
+      lines.push(lbl('inject.reinjectIntro'))
+      lines.push('')
+      if (includeProjects) {
+        lines.push(projectTexts.join('\n\n'))
+        lines.push('')
+      }
+    }
+    if (includeWritten) {
+      lines.push(written?.text ?? '')
+      lines.push('')
+    }
+    return {
+      text: lines.join('\n').trimEnd(),
+      ids: [...(snapshot?.injectedIds ?? []), ...(includeWritten ? (written?.ids ?? []) : [])],
+    }
   }
-  if (written !== null) {
-    lines.push(written.text)
-    lines.push('')
+  // 预算内优先级：快照（长期记忆）> 写入回放（本会话刚写的）> 项目全景（体积最大、可再查）。
+  const candidates: Array<[boolean, boolean]> = [
+    [true, true],
+    [false, true],
+    [true, false],
+    [false, false],
+  ]
+  let picked: [boolean, boolean] = [false, false]
+  for (const c of candidates) {
+    picked = c
+    if (capChars <= 0 || assemble(c[0], c[1]).text.length <= capChars) break
   }
-  const text = lines.join('\n').trimEnd()
-  const replayedIds = [...(snapshot?.injectedIds ?? []), ...(written?.ids ?? [])]
-  if (replayedIds.length > 0) markInjected(workspace, sessionId, replayedIds, dir)
-  return { text, injectedIds: replayedIds }
+  const result = assemble(picked[0], picked[1])
+  // 兜底：极端配置（如 snapshotMaxChars > reinjectMaxChars）下再截断一次。
+  const text = capText(result.text, capChars)
+  if (result.ids.length > 0) markInjected(workspace, sessionId, result.ids, dir)
+  return { text, injectedIds: result.ids }
 }
 
 /** 关键词命中查询（首轮与每条消息链路共用）：active 的 fact/lesson/rules/topic，
@@ -539,6 +674,8 @@ function hitQuery(
   o: InjectOptions,
   dir: string,
 ): Array<{ id: string; level: string; content: string; updated_at: number | null }> {
+  // 未信任记忆库：命中链路整条短路（返回 [] → buildHitInjection 返回 null），不读库内匹配面。
+  if (o.trust?.trusted === false) return []
   const seenState = readSeenFile(workspace, sessionId, dir)
   const currentProject = seenState.currentProject
   const hitRows = [
@@ -558,8 +695,15 @@ function hitQuery(
     // 匹配面 = 条目关键词（LLM 提取或自动 bigram；无关键词的旧条目回退内容前 100 字）。
     content: d.keywords.length > 0 ? d.keywords.join(' ') : d.content.slice(0, 100),
   }))
-  // 命中专用打分：交集×覆盖率×艾宾浩斯(updated_at)×importance×title 加成（艾宾浩斯开着）。
-  const hits = keywordHitScore(query, docs, { k: o.hitTopK })
+  // 命中专用打分：查询覆盖率 × 遗忘权重 × importance × title 加成 × hit_count 加成（v0.32），
+  // 检索参数全部由 index.ts 从 config 传入（不在此 import 配置）。minScore 过滤低质量命中。
+  const hits = keywordHitScore(query, docs, {
+    k: o.hitTopK,
+    halfLifeDays: o.halfLifeDays,
+    minScore: o.minScore,
+    hitBoost: o.hitBoost,
+    importanceWeight: o.importanceWeight,
+  })
   const byId = new Map(hitRows.map((r) => [r.id, r]))
   // 展示/注入用原文 content（docs 的 content 只是 keywords 匹配面，不能当正文）。
   // 已注入的进入本函数前就排掉了（#67），这里不再二次过滤。
@@ -576,6 +720,9 @@ function hitQuery(
  * 命中 id 记入本会话已见（之后不再命中；压缩释放 seen 后恢复）。
  * 格式：顶格「可能相关的记忆，仅供参考：」→ 条目（- [id] 换行接内容、
  * 条目间空行）。返回文本作为独立 plugin snapshot 消息的正文。
+ * v0.32 加固：trust.trusted === false → 直接返回 null（不注入库内条目）；
+ * 单条正文按 opts.hitMaxChars（契约默认 1500）截断补 …；每条实际注入的命中调用
+ * opts.onHit(level,id) 供 index.ts 记账 bumpHitCount（hitBoost 的反馈来源）。
  * @returns 命中注入块；无命中返回 null。
  */
 export function buildHitInjection(
@@ -587,8 +734,10 @@ export function buildHitInjection(
   dir = '.dsh-meow',
 ): { text: string; injectedIds: string[] } | null {
   const o = { ...DEFAULT_OPTS, ...opts }
+  if (o.trust?.trusted === false) return null
   const fresh = hitQuery(db, workspace, sessionId, userText, o, dir)
   if (fresh.length === 0) return null
+  const hitMaxChars = o.hitMaxChars ?? BUDGET_DEFAULTS.hitMaxChars
   const lines = [keyedValue('labels', 'inject.hitHeader')]
   for (const h of fresh) {
     // 原文视图：归属 + 完整 id + 绝对/相对时间戳（记忆时间戳=updated_at 最后更新时间；无时间戳不显示），第二行完整内容。
@@ -597,12 +746,21 @@ export function buildHitInjection(
       ? ` ${new Date(h.updated_at).toISOString().slice(0, 16).replace('T', ' ')} [${relativeTime(h.updated_at)}]`
       : ''
     lines.push(`[${proj} : ${h.level}] [${h.id}]${time}`)
-    lines.push(h.content)
+    lines.push(capText(h.content, hitMaxChars)) // 单条命中正文上限（budget.hitMaxChars）
     lines.push('')
   }
   const text = lines.join('\n').trimEnd()
   const ids = fresh.map((h) => h.id)
   markInjected(workspace, sessionId, ids, dir)
+  // 命中记账：每条实际注入的命中回调一次（index.ts 传 (level,id)=>bumpHitCount(level,id)）。
+  // 回调异常不阻塞注入（fail-open，记账失败只影响下一次 hitBoost）。
+  if (o.onHit !== undefined) {
+    for (const h of fresh) {
+      try {
+        o.onHit(h.level as Level, h.id)
+      } catch { /* 记账失败不阻塞注入 */ }
+    }
+  }
   return { text, injectedIds: ids }
 }
 

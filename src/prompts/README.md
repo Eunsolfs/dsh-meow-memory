@@ -18,7 +18,7 @@ src/prompts/
 
 **`promptLang` matches the directory name verbatim** (no variant normalization): `pt` does not resolve to `pt-br`. A value with no matching directory — neither in the instance override nor in the built-in pack — falls back to `zh` **silently**; if the prompts show up in Chinese, that is why.
 
-## Slots / 槽位（9 个）
+## Slots / 槽位（11 个）
 
 | file | kind | placeholders |
 |---|---|---|
@@ -29,8 +29,12 @@ src/prompts/
 | `dream-topic.md` | whole text | `{list}` |
 | `dream-project-summary.md` | whole text | `{projects}` |
 | `welcome-guide.md` | whole text | `{homePath}` |
+| `first-create-notice.md` | whole text | `{dbPath}` `{homePath}`（首次建库的一次性通知） |
+| `untrusted-store.md` | whole text | `{projectDir}` `{homePath}`（0.32 新增：工作区里非本插件创建的非空库不注入时的一次性提示） |
 | `labels.md` | key-value lines | per key（e.g. `{label}` `{name}` `{list}` `{n}`） |
 | `tools.md` | key-value lines | — |
+
+> 新增槽位 = 三处同步：①`src/prompts/zh/`（真源）＋ en / pt-br 同名文件；②`src/prompts/README.md` 本表；③`src/prompt-loader.ts` 的 `SLOTS` / `SLOT_PARAMS`（代码侧，缺了会 load 不到）。
 
 - **`zh/` is the key-set source of truth**: every slot & key in `zh` must exist in your language — no missing, no extras.
 - **Whole-text slots**: translate freely; keep `{placeholders}` and place them where your grammar needs them.
@@ -40,9 +44,11 @@ src/prompts/
 
 ## Resolution order / 读取顺序（per slot, 逐槽位）
 
-1. Instance overrides: `<home>/.dsh-meow/prompts/<lang>/<slot>.md` — users may override just the slots they care about
+1. Instance overrides: `$DSH_HOME/storages/meow-memory/prompts/<lang>/<slot>.md`（`$DSH_HOME` 缺省 `~/.dsh`）— users may override just the slots they care about
 2. Built-in pack: `lib/prompts/<lang>/<slot>.md`
 3. Fallback: built-in `zh/`（最终兜底）
+
+> 覆盖层根目录是**固定**的 `$DSH_HOME/storages/meow-memory/prompts/`，**不跟随** `homeDir` / `memory_home` / `MEOW_MEMORY_HOME` 切换。旧位置（可切换全局目录下的 `prompts/`）**不再读取、也没有 fallback**——否则一次目录切换就能改写注入给模型的全部指令（#64-2）。
 
 ## How to contribute a language / 贡献一门语言
 

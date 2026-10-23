@@ -114,7 +114,7 @@ const inj2 = buildInjection(db2, ws2, 'test-session-1', '3081 又怎么了？', 
 check('dedup across sessions file', inj2 === null || !inj2.text.includes('3081 端口是喵版 dsh'))
 // 命中链路（独立于首轮注入）：新 session 命中
 setCurrentProject(ws2, 'test-session-2', 'dsh', '.dsh-meow')
-const inj3 = buildHitInjection(db2, ws2, 'test-session-2', '3081 又怎么了？', { hitTopK: 3 }, '.dsh-meow')
+const inj3 = buildHitInjection(db2, ws2, 'test-session-2', '3081 又怎么了？', { hitTopK: 3, minScore: 0 }, '.dsh-meow')
 check('new session gets hits', inj3 !== null && inj3.text.includes('3081 端口是喵版 dsh'))
 
 // ── reflect 消息 ───────────────────────────────────────────────────────────
