@@ -3,12 +3,12 @@
 | [中文](README.md) | [English](README.en.md) | [Português (BR)](README.pt-br.md) | [MIT License](LICENSE) |
 | :---: | :---: | :---: | :---: |
 
-> **这是什么**：`Phant0Meow/dsh-meow-memory` **v0.31.1** 的个人加固 fork（本仓库，版本 **0.34.0**，分支 `hardening`）。
+> **这是什么**：`Phant0Meow/dsh-meow-memory` **v0.31.1** 的个人加固 fork（本仓库，版本 **0.34.1**，分支 `hardening`）。
 > 上游是 MIT 授权，上游仓库：<https://github.com/Phant0Meow/dsh-meow-memory>。本 fork **与上游无隶属关系**，不代上游发布、也不代表上游立场；所有改动与剩余问题见 [CHANGELOG.md](CHANGELOG.md)。
 
 为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）打造的跨会话记忆插件：七层 SQLite 记忆、首轮快照注入、每消息关键词命中，以及**有预算上限**的自动整理。
 
-当前版本 **0.34.0** ｜ 变更见 [CHANGELOG.md](CHANGELOG.md) ｜ 已实测宿主 **DSH Desktop 0.2.1-rc.2**（见[兼容性](#兼容性)）
+当前版本 **0.34.1** ｜ 变更见 [CHANGELOG.md](CHANGELOG.md) ｜ 已实测宿主 **DSH Desktop 0.2.1-rc.2**（见[兼容性](#兼容性)）
 
 **诚实声明**：本 README 只写代码里确实存在的行为。0.32 删掉了上游 README 里若干夸大表述（"自动去重合并"、"艾宾浩斯遗忘曲线"、每消息命中"BM25"、"兼容 dsh 0.1.5"），并在每处注明真实边界。
 
@@ -45,7 +45,7 @@
 
 > 这些是**上限**，不是承诺。实际花费取决于条目数、内容长度和会话长度；最坏情况下一天的自动花费仍有量级上限（≤1 次 dream + ≤6 次反思的全上下文轮）。上下文闸里的"估算 token"是**近似值**：CJK ≈1.7 字符/token、非 CJK ≈4 字符/token（宁可估高），不是精确计费。
 
-> **0.34 的隔离 dream（`dream.isolated: true`，默认关）**：自动 dream 改在 **spawn 空上下文子会话**执行，主会话日志里没有 model-visible 的 dream 轮（只有 log-only catalog 事实），因此**主会话上下文 0 增长**；子会话仍消耗 token。子会话拿到的是「dream 三个 prompt 槽 + 最近 user/assistant 文本与工具名 digest + 条目清单」（不含工具结果/插件通知），所以**整理质量低于主上下文路径**（已知取舍）。手动 `/dream` / `memory_dream` 永远走主 agent 路径（可看可中止）；**隔离 dream 无法从 UI 中止**。subagents/spawn 不可用时自动回退主 agent dream。
+> **0.34 的隔离 dream（`dream.isolated: true`，默认关；0.34.1 起在 0.2.1 上可用）**：自动 dream 改在 **spawn 空上下文子会话**执行，主会话日志里没有 model-visible 的 dream 轮（只有 log-only catalog 事实），因此**主会话上下文 0 增长**；子会话仍消耗 token。子会话拿到的是「dream 三个 prompt 槽 + 最近 user/assistant 文本与工具名 digest + 条目清单」（不含工具结果/插件通知），所以**整理质量低于主上下文路径**（已知取舍）。子会话**继承父会话的 agent preset**，`memory_*` 工具可见性取决于该 preset 的工具集（残余风险；不可用则回退主窗口 dream）。手动 `/dream` / `memory_dream` 永远走主 agent 路径（可看可中止）；**隔离 dream 无法从 UI 中止**。subagents/spawn 不可用时自动回退主 agent dream；**子会话启动被拒（同步/异步，如深度/容量/鉴权）也会在同一轮扫描里回退主窗口 dream**（日志 `isolated-dream rejection -> main-dream fallback`）。0.34.0 曾因向 spawn 传 `maxDepth: 0` 被 0.2.1 判成"子会话自身深度超限"而完全不整理——0.34.1 不再传 `maxDepth`（宿主默认 1）。
 
 > **0.33 的分层存储不增加每消息 token**：只是多一个本地 SQLite 库（用户级全局库），注入条数仍受 `budget.*` 上限约束；fuzzy 补分是纯 CPU 计算、不花 token；dream/反思频次与上下文闸不变。
 
@@ -154,7 +154,7 @@ $DSH_HOME/storages/meow-memory*           # install-id、prompt 覆盖层、切�
 - **项目级记忆仍按工作区隔离**：`project` / `fact` / `lesson` / `topic` / 项目 rules 跟着 cwd 走（换工作区 = 新的项目记忆）。跨工作区共享的只有 `soul` / `user` / 全局 rules（0.33 用户级全局库）。
 - **没有语义检索**：0.33 的 fuzzy 只是字符 n-gram 词法兜底（同义变体/词形/词边界），不是 embedding、不懂同义改写。`hit_count` 参与排序但不会自动改写关键词。
 - **全局库不参与 dream**：dream 三轮仍只整理工作区库；全局条目靠工具/反思维护。
-- **隔离 dream 的取舍**：`dream.isolated: true` 时主会话上下文 0 增长，但子会话只拿到「dream prompt + 最近对话 digest + 条目清单」（不含工具结果），**整理质量低于主上下文路径**；且**隔离 dream 无法从 UI 中止**；subagents/spawn 不可用时自动退回主 agent dream。
+- **隔离 dream 的取舍**：`dream.isolated: true` 时主会话上下文 0 增长，但子会话只拿到「dream prompt + 最近对话 digest + 条目清单」（不含工具结果），**整理质量低于主上下文路径**；**隔离 dream 无法从 UI 中止**；子会话**继承父会话 agent preset**，`memory_*` 工具可见性取决于该 preset（残余风险）；`isolatedArchiveChild` 会在子会话 settle 后归档它（**成功/失败都会归档**，留下一份明文子会话副本）；subagents/spawn 不可用或启动被拒时自动退回主 agent dream。
 - **dream 仍会把整理指令/回复/工具调用留在主会话历史里（主 agent 路径）**：UI 折叠只是视觉收纳，token 仍持久存在；隔离路径只留 log-only catalog 事实、无 model-visible dream 轮。
 - **迁移会归档工作区副本**：升级到 0.33 后原工作区的 soul/user/全局 rules 行变为 archived（内容保留）；全局库若丢失不会自动回灌，需恢复全局目录或逐条 `memory_forget mode=restore`。
 - **遗忘是"指数半衰"而不是"艾宾浩斯复习曲线"**：`retrieval.halfLifeDays` 默认 30 天，`exp(-ln2 × 天数/30)`，并保留 importance≥3 的 0.85 下限。dream 会把 `updated_at` 按整理时间封存，所以衰减输入本身会被整理行为影响——这不是记忆科学意义上的复习调度。
@@ -178,7 +178,7 @@ $DSH_HOME/storages/meow-memory*           # install-id、prompt 覆盖层、切�
 
 2. 任选其一：
    - **本地目录**：GUI 左侧 **Plugins → Add plugin**，填**本仓库的绝对路径**（插件管理器接受绝对本地路径）；
-   - **tarball**：`npm pack` 生成 `meow-memory-0.34.0.tgz`，Plugins → Add plugin 填该 `.tgz` 的绝对路径。
+   - **tarball**：`npm pack` 生成 `meow-memory-0.34.1.tgz`，Plugins → Add plugin 填该 `.tgz` 的绝对路径。
 3. 重启 `dsh web`（或热重载插件）。新会话自动加载。
 
 > 本地 `file:`/`link:` 安装不会执行 `prepare`，所以**必须先构建**；tarball 里已含 `lib/`，装上即可用。
@@ -232,7 +232,7 @@ dsh plugin --profile <profile> remove meow-memory
 |---|---|
 | 宿主 | **DSH Desktop 0.2.1-rc.2**（Windows 11） |
 | 运行时 | Electron 44.7.0 / Node **24.21.0**，`node:sqlite` 可用 |
-| 验证范围 | 隔离实例加载成功；3 条 `/meow-memory/*` 路由带鉴权 200 / 不带 401；设置命名空间出现；无 apply 错误。0.34 另做了一次带 `dream.isolated: true` 的隔离 live load：加载成功、无 apply 错误。**真实模型/子会话 dream 未在隔离实例中跑通**（无账号凭据；隔离 dream 由单元测试的 fake subagents 覆盖） |
+| 验证范围 | 隔离实例加载成功；3 条 `/meow-memory/*` 路由带鉴权 200 / 不带 401；设置命名空间出现；无 apply 错误。0.34 另做了一次带 `dream.isolated: true` 的隔离 live load：**加载成功、无 apply 错误**（当时只验证加载，未真正启动子会话）；0.34.0 的子会话启动 bug（`maxDepth: 0`）由独立复审发现，0.34.1 已修复并用回归测试（fake provider 强制真实深度语义 + 拒绝→回退路径）覆盖。**真实模型/子会话 dream 未在隔离实例中跑通**（无账号凭据） |
 | 未验证 | **0.1.x 宿主**（本 fork 没有测过，不再宣称"兼容 dsh 0.1.5"）；其他 0.2.x 补丁版本 |
 
 已知兼容性风险（沿用上游结论，本 fork 未改）：
@@ -283,7 +283,7 @@ dsh plugin --profile <profile> remove meow-memory
       isolatedProvider: 'spawn'   # 子会话 provider（需 inheritsParentContext=false）
       isolatedTimeoutMinutes: 20  # 超时后 dispose 子会话、释放租约重试
       isolatedMaxPromptChars: 20000 # 子会话单条 prompt 字符上限
-      isolatedArchiveChild: true  # 成功后归档子会话（best-effort）
+      isolatedArchiveChild: true  # 子会话 settle 后归档（成功/失败都会归档；best-effort）
 ```
 
 **完整字段、类型、默认值与效果见 [docs/配置参考.md](docs/配置参考.md)**（含 `titleMax` / `homeDir` / `disabledWorkspaces` / `backup` / `delegate` 等）。
@@ -342,7 +342,7 @@ npm run test           # build + 语言包自查 + 全量断言（host + client 
 node scripts/check-lang.mjs en       # 只查某个 prompt 语言包
 ```
 
-测试断言数：`npm test` **1148 条全绿**（host 788 + client 360），0 失败；另 `node smoke.mjs` 29 条；`scripts/check-lang.mjs` 校验 en/pt-br 两个语言包（11 槽位对齐）。
+测试断言数：`npm test` **1151 条全绿**（host 791 + client 360），0 失败；另 `node smoke.mjs` 29 条；`scripts/check-lang.mjs` 校验 en/pt-br 两个语言包（11 槽位对齐）。
 
 `@deepseek-ai/*` 包位于 dsh-meow pnpm workspace，不在本包 `node_modules` 里。Windows 上 `npm run link-workspace` 创建 workspace 包的 junction 镜像供 esbuild 解析；仅构建期需要。
 
@@ -354,7 +354,7 @@ node scripts/check-lang.mjs en       # 只查某个 prompt 语言包
 4. 反思轮后检查模型选择栏是否仍为主模型（防 #71，仅配置 `delegate.model` 时可能触发）；
 5. 在克隆来的陌生仓库里开新会话：不应出现你没写过的长期记忆内容（不信任库/默认不迁移）；
 6. 换一个工作区开新会话：`soul` / `user` / 全局 rules 应该还在（来自用户级全局库），`project` / `fact` 是新工作区的（验证两层存储）；
-7. 若开了 `dream.isolated: true`：自动 dream 后主会话不应出现 dream 轮（只有 log-only catalog 事实），子会话应被归档；`/dream` 手动仍应出现主 agent dream 轮。
+7. 若开了 `dream.isolated: true`：自动 dream 后主会话不应出现 dream 轮（只有 log-only catalog 事实），子会话应被归档（成功/失败都会归档）；`/dream` 手动仍应出现主 agent dream 轮。若子会话启动被拒，应看到主窗口 dream 继续跑（日志 `isolated-dream rejection -> main-dream fallback`；0.34.0 的 `maxDepth` bug 在 0.34.1 已修复）。
 
 ---
 

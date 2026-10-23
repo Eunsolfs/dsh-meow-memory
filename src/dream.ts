@@ -1508,7 +1508,8 @@ export function startIsolatedDream(
         parent: agent,
         prompt: [{ type: 'text', text: prompt.text }],
         ...(cfg.isolatedModelSpec !== undefined ? { agentOptions: cfg.isolatedModelSpec } : {}),
-        ...(provider.capabilities?.depthLimit === true ? { maxDepth: 0 } : {}),
+        // 不传 maxDepth：宿主把 maxDepth 读成"子会话自身允许的深度"，0 会拒绝子会话本身
+        // （0.2.1 实测 SubagentDepthError: depth 1 exceeds maxDepth 0）。默认 1 即可。
       },
     })
     if (startPromise === undefined || startPromise === null || typeof (startPromise as { then?: unknown }).then !== 'function') {
@@ -1524,7 +1525,8 @@ export function startIsolatedDream(
     }
     dreamLog(`isolated-dream start-failed sid=${sid} provider=${providerName} err=${e instanceof Error ? e.message : String(e)}`)
     onDreamState?.(sessionId, 'active')
-    return 'rejected'
+    // 启动同步失败 → 同轮退回主 agent dream（绝不静默放弃整理）。
+    return 'unavailable'
   }
   void Promise.resolve(startPromise).then(
     (activation) => {
@@ -1564,6 +1566,14 @@ export function startIsolatedDream(
       }
       dreamLog(`isolated-dream start-rejected sid=${sid} provider=${providerName} err=${error instanceof Error ? error.message : String(error)}`)
       onDreamState?.(sessionId, 'active')
+      // 异步启动被拒（容量/鉴权/深度限制等）不能静默吞掉：同轮退回主 agent dream。
+      // 租约已释放，主路径可重新 claim；失败时留日志由下个 sweep 重试。
+      try {
+        const fellBack = startWindowDream(ctx, agent as never, workspace, dir, onDreamState, cfg.rulesReviewDays)
+        dreamLog(`isolated-dream rejection -> main-dream fallback sid=${sid} started=${fellBack}`)
+      } catch (fallbackError) {
+        dreamLog(`isolated-dream fallback failed sid=${sid} err=${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`)
+      }
     },
   )
   return 'started'

@@ -96,7 +96,11 @@ Type `/dream` in the composer (same as the `memory_dream` tool; **not** subject 
 
 ### With `dream.isolated` enabled, why is there no dream turn in the main session?
 
-That is 0.34's isolated dream (off by default): automatic dream runs in a **spawned empty-context child session**, so the main session gets no model-visible dream turn (only log-only catalog facts) → **zero main-context growth**; child tokens are still billed and child-written entries are adopted into the parent then sealed. Trade-offs: the child only receives the dream prompts + a recent-conversation digest + entry lists (no tool results/plugin notices), so **consolidation quality is lower than the main-context path**; **isolated dream cannot be aborted from the UI** (it ends on completion/timeout/failure). If `subagents`/`spawn` is unavailable the plugin falls back to the main-agent dream.
+That is 0.34's isolated dream (off by default): automatic dream runs in a **spawned empty-context child session**, so the main session gets no model-visible dream turn (only log-only catalog facts) → **zero main-context growth**; child tokens are still billed and child-written entries are adopted into the parent then sealed. Trade-offs: the child only receives the dream prompts + a recent-conversation digest + entry lists (no tool results/plugin notices), so **consolidation quality is lower than the main-context path**; **isolated dream cannot be aborted from the UI** (it ends on completion/timeout/failure). The child inherits the parent's agent preset, so `memory_*` visibility depends on it; `isolatedArchiveChild` archives the child after settle (success or failure, leaving a plaintext copy). If `subagents`/`spawn` is unavailable the plugin falls back to the main-agent dream.
+
+### `dream.isolated` is on but nothing gets consolidated
+
+**0.34.0 has a maxDepth compat bug**: it sent `maxDepth: 0` to spawn; DSH 0.2.1 reads `maxDepth` as the child's own allowed depth and rejected the start (`SubagentDepthError: subagent depth 1 exceeds maxDepth 0`), so isolated dream never ran — upgrade to **0.34.1** (no `maxDepth` is sent). If the child start is still rejected (depth/capacity/auth), 0.34.1 falls back to the main-agent dream in the same sweep (log `isolated-dream rejection -> main-dream fallback`); if nothing consolidates at all, enable `security.debugLogs` and inspect `isolated-dream` log lines.
 
 ---
 
@@ -170,7 +174,7 @@ Since 0.33 storage is two-layer:
 
 ### Which DSH versions are supported?
 
-This fork was **verified on DSH Desktop 0.2.1-rc.2** (Electron 44.7.0 / Node 24.21.0, Windows 11): isolated load succeeded, the 3 routes returned 200/401 under auth, the settings namespace appeared, no apply error; 0.34 additionally ran an isolated live load with a `dream.isolated: true` patch (loaded, no apply error). **0.1.x was not tested**; the "supports dsh 0.1.5" claim is gone.
+This fork was **verified on DSH Desktop 0.2.1-rc.2** (Electron 44.7.0 / Node 24.21.0, Windows 11): isolated load succeeded, the 3 routes returned 200/401 under auth, the settings namespace appeared, no apply error; 0.34 additionally ran an isolated live load with a `dream.isolated: true` patch (load only, no apply error; the 0.34.0 child-start bug was found later by re-audit and fixed in 0.34.1 with regression tests). **0.1.x was not tested**; the "supports dsh 0.1.5" claim is gone.
 
 ### Settings page saves but nothing changes
 

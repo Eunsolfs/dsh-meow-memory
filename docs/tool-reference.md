@@ -187,7 +187,7 @@ Handles **one** entry by id. Archiving is the default and is recoverable; hard d
 
 No parameters (scope is this window). Same semantics as `/dream`: **manual = explicit intent, so it bypasses the automatic cost gates** — no peak-hour, daily-frequency or context-size gate applies (manual invocation already requires a live window), and it runs up to 3 rounds over the **full session context** (atomic / topic / project summary). If the context is large, run `/compact` first.
 
-0.34's isolated mode (`dream.isolated: true`) applies to **automatic dream only**: automatic dream runs in a spawned child (zero main-context growth, no model-visible dream turn in the main session); **manual `/dream` / `memory_dream` always use the main-agent path** (visible/abortable). Isolated dream itself **cannot be aborted from the UI**, and its digest yields lower consolidation quality than the main-context path.
+0.34's isolated mode (`dream.isolated: true`, **usable on 0.2.1 since 0.34.1**; 0.34.0 sent `maxDepth: 0` and was rejected by the host) applies to **automatic dream only**: automatic dream runs in a spawned child (zero main-context growth, no model-visible dream turn in the main session); **manual `/dream` / `memory_dream` always use the main-agent path** (visible/abortable). The child inherits the parent's agent preset (so `memory_*` visibility depends on it); a rejected start falls back to the main-agent dream in the same sweep; `isolatedArchiveChild` archives the child after settle (success and failure). Isolated dream itself **cannot be aborted from the UI**, and its digest yields lower consolidation quality than the main-context path.
 
 > Dream only consolidates the workspace store (global entries are maintained via tools/reflection).
 

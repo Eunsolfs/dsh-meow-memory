@@ -1,6 +1,26 @@
 # Changelog
 
-本文件从上游 `Phant0Meow/dsh-meow-memory` v0.31.1 接续。**0.32.0 起为本仓库（hardened fork）的版本，当前 0.34.0**，与上游无隶属关系；上游变更历史见 <https://github.com/Phant0Meow/dsh-meow-memory/blob/main/CHANGELOG.md>。
+本文件从上游 `Phant0Meow/dsh-meow-memory` v0.31.1 接续。**0.32.0 起为本仓库（hardened fork）的版本，当前 0.34.1**，与上游无隶属关系；上游变更历史见 <https://github.com/Phant0Meow/dsh-meow-memory/blob/main/CHANGELOG.md>。
+
+## v0.34.1 (2026-10-23) — 隔离 dream 兼容修复
+
+0.34.0 的隔离 dream 有一个只在真实宿主上暴露的启动 bug（独立复审发现）。本版只修兼容性与回退路径，不改 0.34.0 的其它行为；0.34.0 段落里的测试计数是当时的，本版计数见下方测试段。
+
+### 修复
+
+- **不再向 spawn 传 `maxDepth: 0`**：0.34.0 的 `startActivation` 请求带了 `request.maxDepth: 0`；DSH 0.2.1 把 `maxDepth` 读成**子会话自身允许的深度**，于是以 `SubagentDepthError: subagent depth 1 exceeds maxDepth 0` 拒绝启动——`dream.isolated: true` 时自动整理实际**完全不跑**（只剩日志）。0.34.1 **不传 `maxDepth`**（宿主默认 1）即可正常启动。0.34.0 宣称的"隔离 live load 通过"当时只验证了**加载**、没有真正启动子会话，因此没暴露此 bug。
+- **启动被拒 → 同一轮回退主 agent dream**：同步启动失败时 `startIsolatedDream` 返回 `'unavailable'`，扫描循环在同一轮直接走主 agent dream；异步拒绝（容量/鉴权/深度等）会释放租约并在同一轮启动主 agent dream，日志 `isolated-dream rejection -> main-dream fallback`；不再"静默释放、等下一轮"。
+- **归档语义纠正**：`isolatedArchiveChild` 在子会话 settle 后的 `finally` 里归档——**成功/失败都会归档**（此前文档写成"仅成功后归档"），因此会留下一份**明文的子会话副本**。
+- **子会话 preset 继承（残余风险）**：子会话继承父会话的 agent preset，`memory_*` 工具可见性取决于该 preset 的工具集；若不可用则隔离路径无有效整理，仍会回退主窗口 dream（行为已由回归测试覆盖）。
+
+### 测试
+
+- 回归测试的 fake provider 现在**强制真实深度语义**（不传 `maxDepth`/宿主默认 1 才能启动），并覆盖"启动拒绝 → 主路径回退"分支；`tests/hardening.mjs` **212 → 215** 条。
+- 全量 `npm test` 通过：**1151 条断言全绿**（host 791 + client 360），0 失败；`node smoke.mjs` 29 条；`check-lang` en/pt-br 两个语言包（11 槽位）通过。
+
+### 已知限制（不变）
+
+- 隔离 dream **无法从 UI 中止**；digest 不含工具结果/插件通知，**整理质量低于主上下文路径**；`isolatedArchiveChild` 归档后留下明文子会话副本；设置页仍未暴露 `dream.isolated*` 等字段；dream 仍不整理全局库；无语义 embedding。
 
 ## v0.34.0 (2026-10-23) — 隔离 dream（主会话 0 增长）+ 全局库备份
 

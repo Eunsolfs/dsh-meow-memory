@@ -887,6 +887,12 @@ const giOf = (ws, dir = '.dsh-meow') => join(ws, dir, '.gitignore')
       getProvider: () => (noProvider ? undefined : provider),
       startActivation: (spec) => {
         specs.push(spec)
+        // 0.2.1 实测语义：宿主把 request.maxDepth 读成"子会话自身允许的深度"，
+        // maxDepth:0 会拒绝子会话本身（SubagentDepthError）。fake provider 必须复刻，
+        // 否则单测会放过真实就会失败的 spec（0.34.0 实际踩过）。
+        if (spec?.request?.maxDepth === 0) {
+          return Promise.reject(new Error('SubagentDepthError: subagent depth 1 exceeds maxDepth 0'))
+        }
         return Promise.resolve({ childId, result: result.promise, dispose: () => { disposed.push(childId) } })
       },
     }
@@ -937,8 +943,8 @@ const giOf = (ws, dir = '.dsh-meow') => join(ws, dir, '.gitignore')
       sub.specs.length === 1 && sub.specs[0].delivery === 'caller' && sub.specs[0].provider === 'spawn' &&
       sub.specs[0].request.cwd === ws && sub.specs[0].request.parent === agent, JSON.stringify(sub.specs[0] && { d: sub.specs[0].delivery, p: sub.specs[0].provider }))
     const promptText = sub.specs[0]?.request?.prompt?.[0]?.text ?? ''
-    check('isolated: maxDepth=0 (depthLimit capability) and single-text prompt',
-      sub.specs[0]?.request?.maxDepth === 0 && Array.isArray(sub.specs[0]?.request?.prompt) && sub.specs[0].request.prompt.length === 1)
+    check('isolated: no maxDepth is sent (host reads 0 as child-depth limit) and single-text prompt',
+      sub.specs[0]?.request?.maxDepth === undefined && Array.isArray(sub.specs[0]?.request?.prompt) && sub.specs[0].request.prompt.length === 1)
     check('isolated: prompt respects isolatedMaxPromptChars and carries memory id/keywords',
       promptText.length <= 20000 && promptText.includes('隔离') && /[0-9a-z]{9}-/.test(promptText), `len=${promptText.length}`)
     check('isolated: no agentOptions when isolatedModelSpec unset', sub.specs[0]?.request?.agentOptions === undefined)
@@ -997,6 +1003,25 @@ const giOf = (ws, dir = '.dsh-meow') => join(ws, dir, '.gitignore')
     check(`isolated failure (${mode}): callback ends active`, states.length > 0 && states[states.length - 1] === 'active', JSON.stringify(states))
     check(`isolated failure (${mode}): dreamiso meta cleared`, db.getDreamMeta(ISOLATED_DREAM_META_PREFIX + sid) === undefined)
     check(`isolated failure (${mode}): child disposed`, sub.disposed.length >= 1)
+    closeAllDbs(); clean(ws)
+  }
+
+  // ③d 启动被拒（0.2.1 实测 SubagentDepthError 类）→ 同轮回退主 agent dream，不静默放弃
+  {
+    const sid = 'win-iso-startreject'
+    const { ws, db } = rig(sid)
+    const agent = mkAgent(sid, ws)
+    const svc = {
+      getProvider: () => ({ name: 'spawn', inheritsParentContext: false, capabilities: { depthLimit: true } }),
+      startActivation: () => Promise.reject(new Error('SubagentDepthError: subagent depth 1 exceeds maxDepth 0')),
+    }
+    const states = []
+    const ret = startIsolatedDream(ctxWith({ agent, svc }), agent, db, sid, ws, '.dsh-meow', isoCfg(), collectDreamRounds(db, sid, ws, '.dsh-meow'), T, (s, st) => states.push(st))
+    check('isolated start rejection: returns started (async rejection path)', ret === 'started')
+    await flush(40)
+    check('isolated start rejection: main-agent dream fallback ran', agent.steered.length + agent.followed.length >= 1, JSON.stringify({ s: agent.steered.length, f: agent.followed.length }))
+    check('isolated start rejection: lease taken by main fallback', db.getDreamLease(sid) !== null)
+    abortDream(agent, '.dsh-meow')
     closeAllDbs(); clean(ws)
   }
 

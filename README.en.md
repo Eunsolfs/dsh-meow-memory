@@ -3,12 +3,12 @@
 | [中文](README.md) | [English](README.en.md) | [Português (BR)](README.pt-br.md) | [MIT License](LICENSE) |
 | :---: | :---: | :---: | :---: |
 
-> **What this is**: a personal hardening fork of `Phant0Meow/dsh-meow-memory` **v0.31.1** (this repository, version **0.34.0**, branch `hardening`).
+> **What this is**: a personal hardening fork of `Phant0Meow/dsh-meow-memory` **v0.31.1** (this repository, version **0.34.1**, branch `hardening`).
 > Upstream is MIT-licensed: <https://github.com/Phant0Meow/dsh-meow-memory>. This fork is **not affiliated with upstream**, does not publish on upstream's behalf, and does not represent upstream's views. All changes and remaining issues are in [CHANGELOG.md](CHANGELOG.md).
 
 Cross-session memory for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): seven-layer SQLite memory, first-turn snapshot injection, per-message keyword hits, and automatic consolidation **with budget caps**.
 
-Version **0.34.0** ｜ Changelog: [CHANGELOG.md](CHANGELOG.md) ｜ Verified host: **DSH Desktop 0.2.1-rc.2** (see [Compatibility](#compatibility))
+Version **0.34.1** ｜ Changelog: [CHANGELOG.md](CHANGELOG.md) ｜ Verified host: **DSH Desktop 0.2.1-rc.2** (see [Compatibility](#compatibility))
 
 **Honesty note**: this README only claims behaviour that exists in the code. 0.32 removed several inflated upstream claims ("automatic dedupe/merge", "Ebbinghaus forgetting curve", per-message "BM25", "supports dsh 0.1.5") and states the real boundary at each point.
 
@@ -47,7 +47,7 @@ Or per window: session row "…" menu → **Memory participation** → turn off 
 
 > **The 0.33 layered store adds no per-message tokens**: it is just one more local SQLite database (the user-scope global store); injections stay bounded by `budget.*`. Fuzzy scoring is pure CPU (no tokens); dream/reflection frequency and context caps are unchanged.
 
-> **0.34 isolated dream (`dream.isolated: true`, off by default)**: automatic dream runs in a **spawned empty-context child session**, so the main session gets no model-visible dream turn (only log-only catalog facts) → **zero main-context growth**; the child still spends tokens. The child receives the dream prompt slots + a digest of recent user/assistant text and tool names + entry lists (no tool results/plugin notices), so **consolidation quality is lower than the main-context path** (known trade-off). Manual `/dream` / `memory_dream` always use the main agent (visible/abortable); **isolated dream cannot be aborted from the UI**. If subagents/spawn is unavailable the plugin falls back to the main-agent dream.
+> **0.34 isolated dream (`dream.isolated: true`, off by default; usable on 0.2.1 since 0.34.1)**: automatic dream runs in a **spawned empty-context child session**, so the main session gets no model-visible dream turn (only log-only catalog facts) → **zero main-context growth**; the child still spends tokens. The child receives the dream prompt slots + a digest of recent user/assistant text and tool names + entry lists (no tool results/plugin notices), so **consolidation quality is lower than the main-context path** (known trade-off). The child **inherits the parent's agent preset**, so `memory_*` tool visibility depends on that preset's tool set (residual risk; otherwise it falls back to the main-agent dream). Manual `/dream` / `memory_dream` always use the main agent (visible/abortable); **isolated dream cannot be aborted from the UI**. If subagents/spawn is unavailable the plugin falls back to the main-agent dream; **a rejected child start (sync or async — depth/capacity/auth) also falls back to the main-agent dream in the same sweep** (log `isolated-dream rejection -> main-dream fallback`). The 0.34.0 build sent `maxDepth: 0` to spawn, which 0.2.1 interpreted as the child's own depth limit and rejected (`SubagentDepthError`), so no automatic consolidation ran; 0.34.1 sends **no `maxDepth`** (host default 1).
 
 ---
 
@@ -154,7 +154,7 @@ $DSH_HOME/storages/meow-memory*           # install-id, prompt overrides, switch
 - **Project-level memory is still workspace-scoped**: `project` / `fact` / `lesson` / `topic` / project rules follow the cwd (a new workspace starts with fresh project memory). Only `soul` / `user` / global rules are shared across workspaces (0.33 user-scope global store).
 - **No semantic retrieval**: 0.33's fuzzy layer is a character n-gram lexical floor (variants / inflections / word boundaries), not embeddings and not paraphrase understanding. `hit_count` affects ranking but never rewrites keywords automatically.
 - **Global store does not participate in dream**: dream's three rounds still consolidate the workspace DB only; global entries are maintained via tools/reflection.
-- **Isolated dream trade-offs**: with `dream.isolated: true` the main context stays flat, but the child only gets the dream prompt + a recent-conversation digest + entry lists (no tool results), so **consolidation quality is lower than the main-context path**; **isolated dream cannot be aborted from the UI**; if subagents/spawn is unavailable it falls back to the main-agent dream.
+- **Isolated dream trade-offs**: with `dream.isolated: true` the main context stays flat, but the child only gets the dream prompt + a recent-conversation digest + entry lists (no tool results), so **consolidation quality is lower than the main-context path**; **isolated dream cannot be aborted from the UI**; the child **inherits the parent's agent preset**, so `memory_*` tool visibility depends on that preset (residual risk); `isolatedArchiveChild` archives the child after it settles (**both success and failure**, leaving a plaintext child-session copy); if subagents/spawn is unavailable or the start is rejected, it falls back to the main-agent dream.
 - **Dream still keeps its instructions/responses/tool calls in the main session history (main-agent path)**: folding is visual only, tokens persist; the isolated path leaves only log-only catalog facts, no model-visible dream turn.
 - **Migration archives workspace copies**: after upgrading to 0.33 the original workspace soul/user/global-rule rows become archived (content retained); if the global store is lost they are not re-injected automatically — restore the global directory or `memory_forget mode=restore` per id.
 - **Forgetting is an exponential half-life, not an Ebbinghaus review curve**: `retrieval.halfLifeDays` default 30 days, `exp(-ln2 × days/30)` with an importance≥3 floor of 0.85. Dream stamps `updated_at` at consolidation time, so the decay input is itself affected by consolidation.
@@ -178,7 +178,7 @@ $DSH_HOME/storages/meow-memory*           # install-id, prompt overrides, switch
 
 2. Either:
    - **local directory**: GUI **Plugins → Add plugin**, enter the **absolute path** of this repository (the plugin manager accepts absolute local paths);
-   - **tarball**: `npm pack` produces `meow-memory-0.34.0.tgz`; enter the absolute path of that `.tgz`.
+   - **tarball**: `npm pack` produces `meow-memory-0.34.1.tgz`; enter the absolute path of that `.tgz`.
 3. Restart `dsh web` (or hot-reload the plugin). New sessions load it automatically.
 
 > Local `file:`/`link:` installs do not run `prepare`, so **build first**; a tarball already contains `lib/`.
@@ -232,7 +232,7 @@ The environment this fork was actually verified on (not a "backward compatible w
 |---|---|
 | Host | **DSH Desktop 0.2.1-rc.2** (Windows 11) |
 | Runtime | Electron 44.7.0 / Node **24.21.0**, `node:sqlite` available |
-| Verified | Isolated instance loads; 3 `/meow-memory/*` routes return 200 with auth / 401 without; settings namespace appears; no apply error. 0.34 also ran an isolated live load with a `dream.isolated: true` patch: loaded, no apply error. **Real model / child-session dream was not exercised in the isolated instance** (no credentials; isolated dream is covered by unit tests with fake subagents) |
+| Verified | Isolated instance loads; 3 `/meow-memory/*` routes return 200 with auth / 401 without; settings namespace appears; no apply error. 0.34 also ran an isolated live load with a `dream.isolated: true` patch: **loaded, no apply error** (load only — the child was not actually started); the 0.34.0 child-start bug (`maxDepth: 0`) was found by an independent re-audit and fixed in 0.34.1, covered by regression tests (fake provider enforcing real depth semantics + rejection→fallback path). **Real model / child-session dream was not exercised in the isolated instance** (no credentials) |
 | Not verified | **0.1.x hosts** (this fork has not tested them; the "supports dsh 0.1.5" claim is removed); other 0.2.x patch releases |
 
 Known compatibility risks (upstream findings, unchanged by this fork):
@@ -283,7 +283,7 @@ All fields are optional. **The new 0.32 `security` / `budget` / `retrieval` grou
       isolatedProvider: 'spawn'   # child provider (needs inheritsParentContext=false)
       isolatedTimeoutMinutes: 20  # timeout → dispose child, release lease, retry
       isolatedMaxPromptChars: 20000 # child single-prompt char cap
-      isolatedArchiveChild: true  # archive the child session on success (best-effort)
+      isolatedArchiveChild: true  # archive the child after it settles (success and failure; best-effort)
 ```
 
 **Every field, type, default and effect is in [docs/configuration-reference.md](docs/configuration-reference.md)** (including `titleMax` / `homeDir` / `disabledWorkspaces` / `backup` / `delegate`).
@@ -343,7 +343,7 @@ npm run test           # build + language-pack check + full assertions (host + c
 node scripts/check-lang.mjs en       # check one prompt language pack
 ```
 
-Test assertions: `npm test` **1148 all green** (host 788 + client 360), 0 failed; plus 29 in `node smoke.mjs`; `scripts/check-lang.mjs` validates the en/pt-br packs (11 slots aligned).
+Test assertions: `npm test` **1151 all green** (host 791 + client 360), 0 failed; plus 29 in `node smoke.mjs`; `scripts/check-lang.mjs` validates the en/pt-br packs (11 slots aligned).
 
 The `@deepseek-ai/*` packages live in the dsh-meow pnpm workspace, not in this package's `node_modules`. On Windows, `npm run link-workspace` creates junction mirrors so esbuild can resolve them (build-time only).
 
@@ -355,7 +355,7 @@ The `@deepseek-ai/*` packages live in the dsh-meow pnpm workspace, not in this p
 4. After a reflection turn, check the model selector: still the main model? (#71 can trigger only with `delegate.model` set.)
 5. Open a session in a cloned, untrusted repository: no long-term memory you did not write should appear (untrusted store + no auto-migration);
 6. Open a session in a different workspace: `soul` / `user` / global rules should still be there (user-scope global store), while `project` / `fact` are the new workspace's (verifies the two layers);
-7. With `dream.isolated: true`: after an automatic dream there should be no dream turn in the main session (only log-only catalog facts) and the child session should be archived; a manual `/dream` should still produce a main-agent dream turn.
+7. With `dream.isolated: true`: after an automatic dream there should be no dream turn in the main session (only log-only catalog facts) and the child session should be archived (after settle, success or failure); a manual `/dream` should still produce a main-agent dream turn. If the child start is rejected, the main-agent dream should continue (log `isolated-dream rejection -> main-dream fallback`; the 0.34.0 `maxDepth` bug is fixed in 0.34.1).
 
 ---
 
