@@ -25,7 +25,7 @@ import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
 import z from '@deepseek-ai/schemastery'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { backupGlobalDb, backupMemoryDb, closeAllDbs, closeGlobalDb, ensureGlobalStore, ensureMemoryStore, getDb, getGlobalDb, globalDbPath, memoryDbPath, storeTrustOf, type Level, type StoreTrust } from './db.js'
 import { migrateWorkspaceToGlobal } from './global-store.js'
 import { parseModelSpec, REFLECT_DELEGATE_MARKER, REFLECT_DONE_DELEGATE_MARKER, DREAM_DELEGATE_MARKER, type AgentOptionsSpec } from './delegate.js'
@@ -56,6 +56,7 @@ import { buildReflectMessage, checkReflectBudget, consecutiveToolSteps, PLUGIN_S
 import { isMeowSource } from './source.js'
 import { registerMemoryTools, setMemoryBudgetOptions, setMemoryGlobalDbProvider, setMemoryRetrievalOptions, setMemorySemanticOptions, setMemoryToolGate } from './tools.js'
 import { listGlobalMemory, saveGlobalMemory } from './global-edit.js'
+import { listWorkspaceMemory, saveWorkspaceMemory } from './workspace-edit.js'
 import { backfillEmbeddings, clearEmbeddingCache, embedTexts, semanticEnabled, semanticWeightOf } from './semantic.js'
 import { authGate, connectionAuthOf } from './auth-gate.js'
 import { resolveSlotText, setPromptLang } from './prompt-loader.js'
@@ -267,6 +268,19 @@ const config = z.object({
       autoGitignore: z.boolean().default(true),
       /** 详细诊断日志（settings-diag/apply-error/perf 等）。默认关，排障时再开。 */
       debugLogs: z.boolean().default(false),
+    })
+    .default({}),
+  /** 自动注入行为（0.38）：可分别关闭首轮快照与每消息命中注入。 */
+  inject: z
+    .object({
+      /** 首轮长期记忆快照（soul/user/全局 rules + 记忆导引 + 项目清单）。 */
+      firstTurn: z.boolean().default(true),
+      /** 每消息关键词命中注入。 */
+      hits: z.boolean().default(true),
+      /** 严格关键词命中：只注入用户消息里字面出现关键词的条目（关=允许 BM25/模糊相似度）。 */
+      strictKeywords: z.boolean().default(false),
+      /** 条目必须配置独立 trigger_keywords 才自动注入（空=不注入）。 */
+      requireTriggerKeywords: z.boolean().default(false),
     })
     .default({}),
   /** 注入/整理预算（0.32）：给默认自动行为设上限，避免 token 无界增长。 */
@@ -498,6 +512,8 @@ export function validateConfigUserLayer(value: unknown): void {
   const dv2 = group('dream', false)
   gBool(dv2, 'dream', ['requireLiveAgent', 'isolated', 'isolatedArchiveChild'])
   gStr(dv2, 'dream', ['isolatedProvider'])
+  const injv = group('inject', false)
+  gBool(injv, 'inject', ['firstTurn', 'hits', 'strictKeywords', 'requireTriggerKeywords'])
   gNum(dv2, 'dream', ['isolatedTimeoutMinutes', 'isolatedMaxPromptChars'])
 }
 
@@ -522,7 +538,7 @@ export function mergeConfigLayer(patch: unknown, user: Record<string, unknown> |
   // 0.37.1（review）：UI 可写的所有子对象组都做浅合并，避免"改一个字段把 patch 里同组
   // 其它键整组冲掉"（尤其 budget 上限被悄悄恢复默认 = 成本上升）。retrieval.semantic 还要
   // 再深一层合并。
-  const mergeGroups = new Set(['dream', 'delegate', 'security', 'budget', 'retrieval'])
+  const mergeGroups = new Set(['dream', 'delegate', 'security', 'budget', 'retrieval', 'inject'])
   for (const [key, value] of Object.entries(user)) {
     if (mergeGroups.has(key)) {
       const pv = (base[key] ?? {}) as Record<string, unknown>
@@ -564,6 +580,12 @@ interface ResolvedConfig {
     autoGitignore: boolean
     debugLogs: boolean
   }
+  /** 自动注入行为（0.38）：注册期消费（改需重载）。 */
+  inject: {
+    firstTurn: boolean
+    hits: boolean
+    strictKeywords: boolean
+  }
   /** 注入/整理预算（0.32）：注册期消费（改需重载）。 */
   budget: {
     snapshotMaxChars: number
@@ -600,6 +622,7 @@ function resolveConfig(config: unknown): ResolvedConfig {
   const dg = (c.delegate ?? {}) as { reflect?: boolean; model?: string }
   const bk = (c.backup ?? {}) as { enabled?: boolean }
   const sec = (c.security ?? {}) as Partial<ResolvedConfig['security']>
+  const inj = (c.inject ?? {}) as Partial<ResolvedConfig['inject']>
   const bud = (c.budget ?? {}) as Partial<ResolvedConfig['budget']>
   const ret = (c.retrieval ?? {}) as Partial<ResolvedConfig['retrieval']>
   const sem = (ret.semantic ?? {}) as Partial<ResolvedConfig['retrieval']['semantic']>
@@ -659,6 +682,12 @@ function resolveConfig(config: unknown): ResolvedConfig {
       allowHomeSwitch: asBool(sec.allowHomeSwitch, false),
       autoGitignore: asBool(sec.autoGitignore, true),
       debugLogs: asBool(sec.debugLogs, false),
+    },
+    inject: {
+      firstTurn: asBool(inj.firstTurn, true),
+      hits: asBool(inj.hits, true),
+      strictKeywords: asBool(inj.strictKeywords, false),
+      requireTriggerKeywords: asBool(inj.requireTriggerKeywords, false),
     },
     budget: {
       snapshotMaxChars: asNum(bud.snapshotMaxChars, 6000),
@@ -1775,6 +1804,11 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
     // 本轮不跑命中链路（等同新首轮：快照先行，命中从下一轮起）。待办置位但无可注入
     // 内容（库空且项目全空）也一并清除，避免每个用户消息轮空转重查。
     if (ws && isReinjectPending(ws, sid, resolved.projectDir)) {
+      // 0.38：首轮快照关闭时，压缩重注入也不注入（避免"关了还冒出来"）。
+      if (resolved.inject.firstTurn === false) {
+        clearReinjectPending(ws, sid, resolved.projectDir)
+        return decision
+      }
       const lastUser = userMsgs[userMsgs.length - 1]
       const db = getDb(ws, resolved.projectDir)
       const reinj = buildReinjection(db, ws, sid, readProjectQueried(ws, sid, resolved.projectDir), {
@@ -1803,7 +1837,7 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
         if (evt?.type === 'user/message' && evt.data?.source?.kind === 'user') priorUser++
       }
       if (ws) dreamLog(`pre-step first pid=${process.pid} sid=${shortSessionId(sid)} priorUser=${priorUser} userMsgs=${userMsgs.length}`)
-      if (priorUser === 0) {
+      if (priorUser === 0 && resolved.inject.firstTurn !== false) {
         // 会话首条消息：只注入长期记忆快照，不跑命中链路。
         if (ws) {
           const firstUser = userMsgs[0]
@@ -1875,8 +1909,8 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
 
     // 命中链路（从第二条用户消息起）：每条含真实用户消息的请求都跑关键词检索命中
     // （top-K）。工具轮/子步骤的请求消息不含真实用户消息 → 不触发；
-    // 命中 id 记入已见，不再重复。
-    if (ws) {
+    // 命中 id 记入已见，不再重复。0.38：可用 inject.hits=false 完全关闭命中注入。
+    if (ws && resolved.inject.hits !== false) {
       const lastUser = [...decision.messages].reverse().find((m: { source?: { kind?: string } }) => m.source?.kind === 'user')
       if (lastUser !== undefined) {
         const text = lastUser.content
@@ -1901,6 +1935,8 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
           globalDb: globalDb(),
           ...(queryEmbedding !== null ? { queryEmbedding, semanticWeight: semanticWeightOf(resolved.retrieval.semantic) } : {}),
           hitMaxChars: resolved.budget.hitMaxChars,
+          strictKeywords: resolved.inject.strictKeywords,
+          requireTriggerKeywords: resolved.inject.requireTriggerKeywords,
           minScore: resolved.retrieval.minScore,
           halfLifeDays: resolved.retrieval.halfLifeDays,
           hitBoost: resolved.retrieval.hitBoost,
@@ -2258,7 +2294,115 @@ async function applyInner(ctx: Context, config: unknown): Promise<void> {
           })()
         }),
       })
-      ctx.logger.info('meow-memory: dreamed-sessions snapshot + dream-events SSE + skip-dreams + global-memory routes registered (behind auth gate)')
+      // 工作区（项目级）记忆可视化编辑（0.39）：
+      //   GET  /meow-memory/workspaces → 已知工作区列表（windowIndex + persisted cwd）
+      //   GET  /meow-memory/workspace-memory?workspace=<abs> → 该工作区的项目级记忆
+      //   POST /meow-memory/workspace-memory → create/save/archive/restore（project 字段可选）
+      // 安全：workspace 必须属于已知集合（防路径穿越打开陌生库），且只操作已存在+受信库。
+      const knownWorkspacePaths = async (): Promise<string[]> => {
+        const set = new Set<string>()
+        for (const [, w] of windowIndex) {
+          if (typeof w === 'string' && w.length > 0 && existsSync(w)) set.add(resolve(w))
+        }
+        const persistence = (ctx as { get?: (name: string) => unknown }).get?.('sessionPersistence') as
+          | { list?: () => Promise<ReadonlyArray<PersistedSessionLike>> }
+          | undefined
+        const persisted = typeof persistence?.list === 'function' ? await persistence.list() : []
+        for (const s of persisted) {
+          const h = headerOf(s)
+          if (h.cwd !== undefined && existsSync(h.cwd)) set.add(resolve(h.cwd))
+        }
+        return [...set].sort()
+      }
+      const markWorkspaceSessionsForReinject = async (workspacePath: string): Promise<number> => {
+        const target = resolve(workspacePath)
+        let count = 0
+        for (const [sid, w] of windowIndex) {
+          if (typeof w !== 'string' || resolve(w) !== target) continue
+          try {
+            markReinjectPending(w, sid, resolved.projectDir)
+            count++
+          } catch { /* 单会话标记失败忽略 */ }
+        }
+        const persistence = (ctx as { get?: (name: string) => unknown }).get?.('sessionPersistence') as
+          | { list?: () => Promise<ReadonlyArray<PersistedSessionLike>> }
+          | undefined
+        const persisted = typeof persistence?.list === 'function' ? await persistence.list() : []
+        for (const s of persisted) {
+          const h = headerOf(s)
+          if (h.cwd === undefined || resolve(h.cwd) !== target || h.id.length === 0) continue
+          try {
+            markReinjectPending(target, h.id, resolved.projectDir)
+            count++
+          } catch { /* 忽略 */ }
+        }
+        return count
+      }
+      registerOne({
+        kind: 'exact',
+        path: '/meow-memory/workspaces',
+        handler: gated((_req, res) => {
+          void (async () => {
+            try {
+              const paths = await knownWorkspacePaths()
+              const items = paths.map((p) => ({
+                path: p,
+                name: p.split(/[\\/]/).filter(Boolean).pop() ?? p,
+                trusted: storeTrustOf(p, resolved.projectDir)?.trusted === true,
+                hasDb: existsSync(memoryDbPath(p, resolved.projectDir)),
+              }))
+              writeJson(res, 200, { workspaces: items })
+            } catch (e) {
+              writeJson(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) })
+            }
+          })()
+        }),
+      })
+      registerOne({
+        kind: 'exact',
+        path: '/meow-memory/workspace-memory',
+        handler: gated((req, res) => {
+          void (async () => {
+            try {
+              const known = await knownWorkspacePaths()
+              const isKnown = (p: unknown): p is string => typeof p === 'string' && known.includes(resolve(p))
+              const url = new URL(String((req as { url?: string }).url ?? '/'), 'http://127.0.0.1')
+              if ((req as { method?: string }).method === 'POST') {
+                const body = await readJsonBody(req) as Record<string, unknown>
+                const workspace = body.workspace
+                if (!isKnown(workspace)) return writeJson(res, 400, { ok: false, error: 'unknown workspace' })
+                const action = body.action
+                if (action !== 'create' && action !== 'save' && action !== 'archive' && action !== 'restore') {
+                  return writeJson(res, 400, { ok: false, error: 'action must be create|save|archive|restore' })
+                }
+                const saved = saveWorkspaceMemory(workspace, resolved.projectDir, {
+                  action,
+                  id: typeof body.id === 'string' ? body.id : undefined,
+                  level: typeof body.level === 'string' ? body.level : undefined,
+                  content: typeof body.content === 'string' ? body.content : undefined,
+                  project: typeof body.project === 'string' ? body.project : undefined,
+                  subcategory: typeof body.subcategory === 'string' ? body.subcategory : undefined,
+                  goal: typeof body.goal === 'string' ? body.goal : undefined,
+                  importance: typeof body.importance === 'number' ? body.importance : undefined,
+                  keywords: body.keywords as string | string[] | undefined,
+                  status: typeof body.status === 'string' ? body.status : undefined,
+                })
+                if (!saved.ok) return writeJson(res, 400, { ok: false, error: saved.error ?? 'save failed' })
+                const reinjected = await markWorkspaceSessionsForReinject(workspace)
+                ctx.logger.info(`meow-memory: workspace memory ${action} ${saved.entry?.level ?? ''}/${saved.entry?.id ?? ''} → ${reinjected} session(s) marked`)
+                return writeJson(res, 200, { ok: true, entry: saved.entry, reinjected })
+              }
+              const workspace = url.searchParams.get('workspace')
+              if (!isKnown(workspace)) return writeJson(res, 400, { ok: false, error: 'unknown workspace' })
+              const listed = listWorkspaceMemory(workspace, resolved.projectDir)
+              return writeJson(res, 200, { trusted: listed.trusted, entries: listed.entries })
+            } catch (e) {
+              writeJson(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) })
+            }
+          })()
+        }),
+      })
+      ctx.logger.info('meow-memory: dreamed-sessions snapshot + dream-events SSE + skip-dreams + global-memory + workspaces + workspace-memory routes registered (behind auth gate)')
       return
     }
     if (attempt < 20) {
@@ -2467,6 +2611,7 @@ export { collectDreamStates, headerOf, type PersistedSessionLike } from './dream
 export { MemoryDb, memoryDbPath, getDb, getGlobalDb, globalDbPath, closeAllDbs, closeGlobalDb, backupMemoryDb, backupGlobalDb, ensureMemoryStore, ensureGlobalStore, storeTrustOf, resetStoreTrustCache, type StoreTrust, LEVELS, newId, PROJECT_SUBCATEGORIES, projectList, projectCovers, projectLabel, relativeTime, isGlobalProject, isGlobalScope, globalProjectMarker, GLOBAL_PROJECT_CANON, GLOBAL_PROJECT_CANON_EN } from './db.js'
 export { migrateWorkspaceToGlobal, globalStoreRows } from './global-store.js'
 export { listGlobalMemory, saveGlobalMemory, GLOBAL_EDIT_LEVELS, GLOBAL_STORE_UNTRUSTED_ERROR, type GlobalMemoryEntry } from './global-edit.js'
+export { listWorkspaceMemory, saveWorkspaceMemory, WORKSPACE_EDIT_LEVELS, type WorkspaceMemoryEntry } from './workspace-edit.js'
 export { migrateLegacy } from './migrate.js'
 export { buildHitInjection, buildInjection, buildReinjection, buildProjectSectionText, readSeen, markSearched, markAccessed, readInjected, markInjected, markProjectQueried, readProjectQueried, markWritten, readWritten, markReinjectPending, clearReinjectPending, isReinjectPending, MAX_REINJECT_PROJECTS, MAX_REINJECT_WRITTEN, sessionsFile, getCurrentProject, setCurrentProject, releaseSeen } from './inject.js'
 export { buildReflectMessage, checkReflectBudget, consecutiveToolSteps, recordReflectSent, resetGlobalReflectCounter, scanTurn } from './reflect.js'

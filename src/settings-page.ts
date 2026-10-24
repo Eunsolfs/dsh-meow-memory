@@ -190,6 +190,15 @@ const FIELDS: GroupSpec[] = [
     ],
   },
   {
+    title: 'settings.group.inject',
+    fields: [
+      { key: 'firstTurn', sub: 'inject', label: 'settings.field.inject.firstTurn.label', type: 'bool' },
+      { key: 'hits', sub: 'inject', label: 'settings.field.inject.hits.label', type: 'bool' },
+      { key: 'strictKeywords', sub: 'inject', label: 'settings.field.inject.strictKeywords.label', type: 'bool' },
+      { key: 'requireTriggerKeywords', sub: 'inject', label: 'settings.field.inject.requireTriggerKeywords.label', type: 'bool' },
+    ],
+  },
+  {
     title: 'settings.group.dreamIsolated',
     fields: [
       { key: 'requireLiveAgent', sub: 'dream', label: 'settings.field.dream.requireLiveAgent.label', type: 'bool' },
@@ -288,6 +297,7 @@ interface GlobalEntryDraft {
   content: string
   keywords: string
   importance: string
+  triggerKeywords: string
 }
 
 function globalMemoryRequest(method: 'GET' | 'POST', body?: unknown): Promise<any> {
@@ -316,6 +326,7 @@ export function GlobalMemoryEditor(): any {
   const [newContent, setNewContent] = React.useState('')
   const [newKeywords, setNewKeywords] = React.useState('')
   const [newImportance, setNewImportance] = React.useState('2')
+  const [newTriggerKeywords, setNewTriggerKeywords] = React.useState('')
 
   const load = React.useCallback(async (): Promise<void> => {
     setLoading(true)
@@ -332,6 +343,7 @@ export function GlobalMemoryEditor(): any {
             content: String(e.content ?? ''),
             keywords: Array.isArray(e.keywords) ? e.keywords.join(', ') : String(e.keywords ?? ''),
             importance: String(e.importance ?? 2),
+            triggerKeywords: Array.isArray(e.trigger_keywords) ? e.trigger_keywords.join(', ') : '',
           }
         }
         return next
@@ -353,10 +365,11 @@ export function GlobalMemoryEditor(): any {
       content: String(entry.content ?? ''),
       keywords: Array.isArray(entry.keywords) ? entry.keywords.join(', ') : '',
       importance: String(entry.importance ?? 2),
+      triggerKeywords: Array.isArray(entry.trigger_keywords) ? entry.trigger_keywords.join(', ') : '',
     }
 
   const patchDraft = (id: string, patch: Partial<GlobalEntryDraft>): void => {
-    setDrafts((prev) => ({ ...prev, [id]: { ...(prev[id] ?? { content: '', keywords: '', importance: '2' }), ...patch } }))
+    setDrafts((prev) => ({ ...prev, [id]: { ...(prev[id] ?? { content: '', keywords: '', importance: '2', triggerKeywords: '' }), ...patch } }))
   }
 
   const submit = async (body: Record<string, unknown>): Promise<void> => {
@@ -383,6 +396,7 @@ export function GlobalMemoryEditor(): any {
       content: d.content,
       keywords: d.keywords,
       importance: Number(d.importance),
+      trigger_keywords: d.triggerKeywords,
     })
   }
 
@@ -391,9 +405,10 @@ export function GlobalMemoryEditor(): any {
   }
 
   const createEntry = (): void => {
-    void submit({ action: 'create', level: newLevel, content: newContent, keywords: newKeywords, importance: Number(newImportance) })
+    void submit({ action: 'create', level: newLevel, content: newContent, keywords: newKeywords, importance: Number(newImportance), trigger_keywords: newTriggerKeywords })
     setNewContent('')
     setNewKeywords('')
+    setNewTriggerKeywords('')
     setNewImportance('2')
   }
 
@@ -434,6 +449,13 @@ export function GlobalMemoryEditor(): any {
             value: d.keywords,
             placeholder: t('settings.global.keywords'),
             onChange: (e: any) => patchDraft(entry.id, { keywords: e.target.value }),
+          }),
+          el('input', {
+            className: 'meowmm_set_input meowmm_global_kw',
+            type: 'text',
+            value: d.triggerKeywords,
+            placeholder: t('settings.global.triggerKeywords'),
+            onChange: (e: any) => patchDraft(entry.id, { triggerKeywords: e.target.value }),
           }),
           el('input', {
             className: 'meowmm_set_input meowmm_global_imp',
@@ -488,6 +510,13 @@ export function GlobalMemoryEditor(): any {
             onChange: (e: any) => setNewKeywords(e.target.value),
           }),
           el('input', {
+            className: 'meowmm_set_input meowmm_global_kw',
+            type: 'text',
+            value: newTriggerKeywords,
+            placeholder: t('settings.global.triggerKeywords'),
+            onChange: (e: any) => setNewTriggerKeywords(e.target.value),
+          }),
+          el('input', {
             className: 'meowmm_set_input meowmm_global_imp',
             type: 'number',
             value: newImportance,
@@ -506,6 +535,336 @@ export function GlobalMemoryEditor(): any {
       )
       : null,
     el('span', { className: 'meowmm_set_muted' }, t('settings.global.reinjectNote')),
+  )
+}
+
+// ── 工作区（项目级）记忆编辑器（0.39）──────────────────────────────────────
+// 与全局编辑器同一套样式；区别是可选项目字段/层级（project/fact/lesson/topic/rules），
+// 数据走 /meow-memory/workspace-memory（host 侧只允许已知+受信工作区的库）。
+interface WorkspaceEntryDraft {
+  content: string
+  keywords: string
+  importance: string
+  project: string
+  subcategory: string
+  goal: string
+  triggerKeywords: string
+}
+
+function workspaceMemoryRequest(method: 'GET' | 'POST', body?: unknown, query?: string): Promise<any> {
+  if (typeof fetch !== 'function') return Promise.reject(new Error('fetch unavailable'))
+  const init: any = { method, headers: { accept: 'application/json' } }
+  let url = '/meow-memory/workspace-memory'
+  if (query !== undefined) url += `?workspace=${encodeURIComponent(query)}`
+  if (body !== undefined) {
+    init.headers['content-type'] = 'application/json'
+    init.body = JSON.stringify(body)
+  }
+  return fetch(url, init).then(async (res: any) => {
+    const json = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error((json && json.error) || `HTTP ${res.status}`)
+    return json
+  })
+}
+
+const WORKSPACE_LEVELS = ['project', 'fact', 'lesson', 'topic', 'rules'] as const
+const SUBCATEGORY_OPTIONS = ['overview', 'structure', 'decisions', 'quotes', 'ops', 'todo'] as const
+
+export function WorkspaceMemoryEditor(): any {
+  const [workspaces, setWorkspaces] = React.useState<any[]>([])
+  const [selected, setSelected] = React.useState('')
+  const [trusted, setTrusted] = React.useState(true)
+  const [entries, setEntries] = React.useState<any[]>([])
+  const [loading, setLoading] = React.useState(true)
+  const [status, setStatus] = React.useState<string | null>(null)
+  const [error, setError] = React.useState<string | null>(null)
+  const [drafts, setDrafts] = React.useState<Record<string, WorkspaceEntryDraft>>({})
+  const [newLevel, setNewLevel] = React.useState<string>('fact')
+  const [newContent, setNewContent] = React.useState('')
+  const [newKeywords, setNewKeywords] = React.useState('')
+  const [newImportance, setNewImportance] = React.useState('2')
+  const [newTriggerKeywords, setNewTriggerKeywords] = React.useState('')
+  const [newProject, setNewProject] = React.useState('')
+  const [newSubcategory, setNewSubcategory] = React.useState('overview')
+  const [newGoal, setNewGoal] = React.useState('')
+
+  const loadWorkspaces = React.useCallback(async (): Promise<void> => {
+    setLoading(true)
+    setError(null)
+    try {
+      const res = await fetch('/meow-memory/workspaces', { headers: { accept: 'application/json' } })
+      const data = await res.json().catch(() => ({}))
+      const list = Array.isArray(data?.workspaces) ? data.workspaces : []
+      setWorkspaces(list)
+      if (list.length > 0) setSelected((prev: string) => (prev !== '' && list.some((w: any) => w.path === prev) ? prev : list[0].path))
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  const loadEntries = React.useCallback(async (workspace: string): Promise<void> => {
+    if (workspace === '') {
+      setEntries([])
+      return
+    }
+    setLoading(true)
+    setError(null)
+    try {
+      const data = await workspaceMemoryRequest('GET', undefined, workspace)
+      const list: any[] = Array.isArray(data?.entries) ? data.entries : []
+      setTrusted(data?.trusted !== false)
+      setEntries(list)
+      setDrafts((prev) => {
+        const next: Record<string, WorkspaceEntryDraft> = {}
+        for (const e of list) {
+          next[e.id] = prev[e.id] ?? {
+            content: String(e.content ?? ''),
+            keywords: Array.isArray(e.keywords) ? e.keywords.join(', ') : String(e.keywords ?? ''),
+            importance: String(e.importance ?? 2),
+            project: String(e.project ?? ''),
+            subcategory: String(e.subcategory ?? ''),
+            goal: String(e.goal ?? ''),
+            triggerKeywords: Array.isArray(e.trigger_keywords) ? e.trigger_keywords.join(', ') : '',
+          }
+        }
+        return next
+      })
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  React.useEffect(() => {
+    void loadWorkspaces()
+  }, [loadWorkspaces])
+
+  React.useEffect(() => {
+    void loadEntries(selected)
+  }, [selected, loadEntries])
+
+  const draftOf = (entry: any): WorkspaceEntryDraft => drafts[entry.id] ?? {
+    content: String(entry.content ?? ''),
+    keywords: Array.isArray(entry.keywords) ? entry.keywords.join(', ') : '',
+    importance: String(entry.importance ?? 2),
+    project: String(entry.project ?? ''),
+    subcategory: String(entry.subcategory ?? ''),
+    goal: String(entry.goal ?? ''),
+    triggerKeywords: Array.isArray(entry.trigger_keywords) ? entry.trigger_keywords.join(', ') : '',
+  }
+  const patchDraft = (id: string, patch: Partial<WorkspaceEntryDraft>): void => {
+    setDrafts((prev) => ({ ...prev, [id]: { ...(prev[id] ?? { content: '', keywords: '', importance: '2', project: '', subcategory: '', goal: '', triggerKeywords: '' }), ...patch } }))
+  }
+
+  const submit = async (body: Record<string, unknown>): Promise<void> => {
+    setStatus(null)
+    setError(null)
+    try {
+      const data = await workspaceMemoryRequest('POST', body)
+      if (data?.ok !== true) throw new Error(data?.error ?? 'save failed')
+      const count = typeof data?.reinjected === 'number' ? data.reinjected : 0
+      setStatus(`${t('settings.global.saved')}${count > 0 ? ` · ${t('settings.global.reinjectCount', { count })}` : ''}`)
+      await loadEntries(selected)
+    } catch (e) {
+      setStatus(t('settings.global.saveFailed', { error: e instanceof Error ? e.message : String(e) }))
+    }
+  }
+
+  const saveEntry = (entry: any): void => {
+    const d = draftOf(entry)
+    void submit({
+      action: 'save',
+      workspace: selected,
+      id: entry.id,
+      content: d.content,
+      keywords: d.keywords,
+      importance: Number(d.importance),
+      project: d.project,
+      trigger_keywords: d.triggerKeywords,
+      ...(entry.level === 'project' ? { subcategory: d.subcategory } : {}),
+      ...(entry.level === 'topic' ? { goal: d.goal } : {}),
+    })
+  }
+
+  const levelLabel = (level: string): string => t(
+    level === 'project' ? 'settings.workspace.levelProject'
+      : level === 'fact' ? 'settings.workspace.levelFact'
+        : level === 'lesson' ? 'settings.workspace.levelLesson'
+          : level === 'topic' ? 'settings.workspace.levelTopic' : 'settings.workspace.levelRules',
+  )
+
+  const rows: any[] = []
+  if (loading && selected === '') {
+    rows.push(el('div', { key: 'loading', className: 'meowmm_set_muted' }, t('settings.global.loading')))
+  } else if (workspaces.length === 0) {
+    rows.push(el('div', { key: 'no-ws', className: 'meowmm_set_muted' }, t('settings.workspace.noWorkspace')))
+  } else if (!trusted) {
+    rows.push(el('div', { key: 'untrusted', className: 'meowmm_set_mirrornote' }, t('settings.global.untrusted')))
+  } else if (entries.length === 0) {
+    rows.push(el('div', { key: 'empty', className: 'meowmm_set_muted' }, t('settings.workspace.empty')))
+  } else {
+    for (const entry of entries) {
+      const d = draftOf(entry)
+      rows.push(el(
+        'div',
+        { key: entry.id, className: 'meowmm_global_entry' },
+        el(
+          'div',
+          { className: 'meowmm_global_head' },
+          el('span', { className: 'meowmm_set_label' }, `${levelLabel(String(entry.level))} · ${String(entry.project ?? '')}`),
+          el('span', { className: 'meowmm_set_muted' }, `${entry.id} · ${entry.status === 'active' ? '' : String(entry.status)}`),
+        ),
+        el('textarea', {
+          className: 'meowmm_global_content',
+          value: d.content,
+          rows: 3,
+          onChange: (e: any) => patchDraft(entry.id, { content: e.target.value }),
+        }),
+        el(
+          'div',
+          { className: 'meowmm_global_row' },
+          el('input', {
+            className: 'meowmm_set_input meowmm_global_kw',
+            type: 'text',
+            value: d.project,
+            placeholder: t('settings.workspace.project'),
+            onChange: (e: any) => patchDraft(entry.id, { project: e.target.value }),
+          }),
+          el('input', {
+            className: 'meowmm_set_input meowmm_global_kw',
+            type: 'text',
+            value: d.keywords,
+            placeholder: t('settings.global.keywords'),
+            onChange: (e: any) => patchDraft(entry.id, { keywords: e.target.value }),
+          }),
+          el('input', {
+            className: 'meowmm_set_input meowmm_global_kw',
+            type: 'text',
+            value: d.triggerKeywords,
+            placeholder: t('settings.global.triggerKeywords'),
+            onChange: (e: any) => patchDraft(entry.id, { triggerKeywords: e.target.value }),
+          }),
+          el('input', {
+            className: 'meowmm_set_input meowmm_global_imp',
+            type: 'number',
+            value: d.importance,
+            placeholder: t('settings.global.importance'),
+            onChange: (e: any) => patchDraft(entry.id, { importance: e.target.value }),
+          }),
+          el('button', { className: 'meowmm_set_reset', onClick: () => saveEntry(entry) }, t('settings.global.save')),
+          el('button', { className: 'meowmm_set_reset', onClick: () => void submit({ action: entry.status === 'active' ? 'archive' : 'restore', workspace: selected, id: entry.id }) },
+            t(entry.status === 'active' ? 'settings.global.archive' : 'settings.global.restore')),
+        ),
+      ))
+    }
+  }
+
+  return el(
+    'div',
+    { className: 'meowmm_set_card meowmm_global_card' },
+    el(
+      'div',
+      { className: 'meowmm_global_head' },
+      el('span', { className: 'meowmm_set_group' }, t('settings.workspace.title')),
+      el('button', { className: 'meowmm_set_reset', onClick: () => { void loadWorkspaces(); void loadEntries(selected) } }, t('settings.global.refresh')),
+    ),
+    el('span', { className: 'meowmm_set_hint' }, t('settings.workspace.hint')),
+    workspaces.length > 0
+      ? el('div', { className: 'meowmm_global_row' },
+        el('span', { className: 'meowmm_set_muted' }, t('settings.workspace.select')),
+        el('select', {
+          className: 'meowmm_set_input meowmm_global_level',
+          value: selected,
+          onChange: (e: any) => setSelected(e.target.value),
+        }, ...workspaces.map((w: any) => el('option', { key: w.path, value: w.path }, `${w.name}${w.trusted ? '' : ' (untagged)'}`))),
+      )
+      : null,
+    status !== null ? el('span', { className: 'meowmm_set_saved' }, status) : null,
+    error !== null ? el('div', { className: 'meowmm_set_err' }, error) : null,
+    ...rows,
+    selected !== '' && trusted
+      ? el(
+        'div',
+        { className: 'meowmm_global_new' },
+        el('span', { className: 'meowmm_set_group' }, t('settings.workspace.add')),
+        el(
+          'div',
+          { className: 'meowmm_global_row' },
+          el('select', {
+            className: 'meowmm_set_input meowmm_global_level',
+            value: newLevel,
+            onChange: (e: any) => setNewLevel(e.target.value),
+          }, ...WORKSPACE_LEVELS.map((lv) => el('option', { key: lv, value: lv }, levelLabel(lv)))),
+          el('input', {
+            className: 'meowmm_set_input meowmm_global_kw',
+            type: 'text',
+            value: newProject,
+            placeholder: t('settings.workspace.project'),
+            onChange: (e: any) => setNewProject(e.target.value),
+          }),
+          el('input', {
+            className: 'meowmm_set_input meowmm_global_kw',
+            type: 'text',
+            value: newKeywords,
+            placeholder: t('settings.global.keywords'),
+            onChange: (e: any) => setNewKeywords(e.target.value),
+          }),
+          el('input', {
+            className: 'meowmm_set_input meowmm_global_kw',
+            type: 'text',
+            value: newTriggerKeywords,
+            placeholder: t('settings.global.triggerKeywords'),
+            onChange: (e: any) => setNewTriggerKeywords(e.target.value),
+          }),
+          el('input', {
+            className: 'meowmm_set_input meowmm_global_imp',
+            type: 'number',
+            value: newImportance,
+            placeholder: t('settings.global.importance'),
+            onChange: (e: any) => setNewImportance(e.target.value),
+          }),
+        ),
+        newLevel === 'project'
+          ? el('div', { className: 'meowmm_global_row' },
+            el('span', { className: 'meowmm_set_muted' }, t('settings.workspace.subcategory')),
+            el('select', { className: 'meowmm_set_input meowmm_global_level', value: newSubcategory, onChange: (e: any) => setNewSubcategory(e.target.value) },
+              ...SUBCATEGORY_OPTIONS.map((s) => el('option', { key: s, value: s }, s))))
+          : null,
+        newLevel === 'topic'
+          ? el('input', { className: 'meowmm_set_input', type: 'text', value: newGoal, placeholder: t('settings.workspace.goal'), onChange: (e: any) => setNewGoal(e.target.value) })
+          : null,
+        el('textarea', {
+          className: 'meowmm_global_content',
+          rows: 2,
+          value: newContent,
+          placeholder: t('settings.global.content'),
+          onChange: (e: any) => setNewContent(e.target.value),
+        }),
+        el('button', {
+          className: 'meowmm_set_reset',
+          onClick: () => {
+            void submit({
+              action: 'create',
+              workspace: selected,
+              level: newLevel,
+              content: newContent,
+              project: newProject,
+              keywords: newKeywords,
+              importance: Number(newImportance),
+              trigger_keywords: newTriggerKeywords,
+              ...(newLevel === 'project' ? { subcategory: newSubcategory } : {}),
+              ...(newLevel === 'topic' ? { goal: newGoal } : {}),
+            })
+            setNewContent('')
+            setNewKeywords('')
+            setNewTriggerKeywords('')
+          },
+        }, t('settings.workspace.add')),
+      )
+      : null,
   )
 }
 
@@ -913,6 +1272,7 @@ export function MemorySettingsSection(props: { scope: any }): any {
       ),
     ),
     el(GlobalMemoryEditor, { key: 'global-memory-editor' }),
+    el(WorkspaceMemoryEditor, { key: 'workspace-memory-editor' }),
   )
 }
 

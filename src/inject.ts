@@ -57,6 +57,11 @@ export interface InjectOptions {
   queryEmbedding?: number[] | null
   /** 语义分混合权重（config semantic.weight，默认 0.8；只有 queryEmbedding 存在时生效）。 */
   semanticWeight?: number
+  /** 0.39：严格关键词命中（默认 true）——注入只认"用户消息里字面出现条目关键词"的条目，
+   *  不再仅凭 BM25/字符 n-gram 的模糊相似度注入（避免随便打几个字就触发无关记忆）。 */
+  strictKeywords?: boolean
+  /** 0.40：要求条目配置独立 trigger_keywords 才自动注入；空=不注入（默认 false 兼容旧行为）。 */
+  requireTriggerKeywords?: boolean
 }
 
 /** 预算契约默认值（与 src/defaults.ts 的 budget.* 一致；index.ts 显式传入时以传入为准）。 */
@@ -64,7 +69,43 @@ const BUDGET_DEFAULTS = { snapshotMaxChars: 6000, hitMaxChars: 1500, reinjectMax
 /** 检索契约默认值（与 src/defaults.ts 的 retrieval.* 一致）。 */
 const RETRIEVAL_DEFAULTS = { halfLifeDays: 30, minScore: 0.35, hitBoost: true, importanceWeight: true }
 
-const DEFAULT_OPTS: InjectOptions = { hitTopK: 2, titleMax: 40, ...BUDGET_DEFAULTS, ...RETRIEVAL_DEFAULTS }
+const DEFAULT_OPTS: InjectOptions = { hitTopK: 2, titleMax: 40, strictKeywords: false, ...BUDGET_DEFAULTS, ...RETRIEVAL_DEFAULTS }
+
+/** 0.40：关键词在用户消息里**字面**出现的个数（大小写不敏感；ASCII 词要求词边界，
+ *  CJK/其它字符用子串包含）。长度 < 2 的关键词不算，避免单字噪音。 */
+function keywordLiteralCount(keywords: ReadonlyArray<string>, text: string): number {
+  const hay = text.toLowerCase()
+  let count = 0
+  for (const raw of keywords) {
+    const kw = String(raw).trim().toLowerCase()
+    if (kw.length < 2) continue
+    const hit = /^[\x00-\x7f]+$/.test(kw)
+      ? new RegExp(`(^|[^a-z0-9_])${kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9_]|$)`, 'i').test(hay)
+      : hay.includes(kw)
+    if (hit) count++
+  }
+  return count
+}
+
+/** 条目级触发判定（0.40）：只认触发关键词的字面命中；模式 any/all/min 由条目配置。
+ *  触发词来源：条目自己的 trigger_keywords；requireTriggerKeywords=true 时为空即不注入，
+ *  否则回退到 keywords（兼容旧条目）。 */
+function rowTriggers(
+  row: { keywords: string[]; trigger_keywords?: string[] | null; trigger_mode?: string | null; trigger_min?: number | null },
+  text: string,
+  requireTriggerKeywords = false,
+): boolean {
+  const explicit = Array.isArray(row.trigger_keywords) ? row.trigger_keywords.filter((k) => String(k).trim().length >= 2) : []
+  const words = explicit.length > 0 ? explicit : (requireTriggerKeywords ? [] : row.keywords)
+  if (words.length === 0) return false
+  const countable = words.filter((k) => String(k).trim().length >= 2)
+  const count = keywordLiteralCount(words, text)
+  if (count === 0) return false
+  const mode = row.trigger_mode === 'all' || row.trigger_mode === 'min' ? row.trigger_mode : 'any'
+  if (mode === 'all') return count >= countable.length
+  if (mode === 'min') return count >= Math.max(1, Number(row.trigger_min ?? 1) || 1)
+  return true
+}
 
 /** 文本上限保护：超长截断并补 …（max <=0 视为不截断）。 */
 function capText(text: string, max: number | undefined): string {
@@ -771,9 +812,18 @@ function hitQuery(
       : {}),
   })
   const byId = new Map(hitRows.map((r) => [r.id, r]))
+  // 0.39：严格模式（默认开）只保留"用户消息里字面出现关键词"的命中；BM25/字符 n-gram
+  // 的模糊相似度仅用于排序，不再单独构成注入理由（用户反馈：随便打几个字就触发）。
+  const strict = o.strictKeywords !== false
+  const filtered = strict
+    ? hits.filter((h) => {
+      const row = byId.get(h.id)
+      return row !== undefined && rowTriggers(row, query, o.requireTriggerKeywords === true)
+    })
+    : hits
   // 展示/注入用原文 content（docs 的 content 只是 keywords 匹配面，不能当正文）。
   // 已注入的进入本函数前就排掉了（#67），这里不再二次过滤。
-  return hits
+  return filtered
     .map((h) => {
       const row = byId.get(h.id)
       return { id: h.id, level: h.level, content: row?.content ?? h.content, project: row?.project ?? null, updated_at: row?.updated_at ?? null }

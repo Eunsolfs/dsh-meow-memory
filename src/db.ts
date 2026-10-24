@@ -134,6 +134,12 @@ export interface MemoryRow {
   content: string
   importance: number // 数字即可不设上限（软引导 1-4；高 importance 豁免遗忘权重）
   keywords: string[] // JSON 数组，写入时 bigram 自动提取
+  /** 触发关键词匹配模式（0.40）：any=任一命中；all=全部命中；min=至少 trigger_min 个命中。 */
+  trigger_mode?: 'any' | 'all' | 'min'
+  /** min 模式的最少命中关键词数（>=1）。 */
+  trigger_min?: number
+  /** 独立触发关键词（0.40，JSON 数组）：非空时注入只认这些词；空=不自动注入（严格模式下）。 */
+  trigger_keywords?: string[]
   status: Status
   corrected: number // lesson 专用：来自用户纠正
   project: string | null // project 必填；fact/lesson 可选
@@ -154,6 +160,9 @@ export interface MemoryPatch {
   importance?: number
   keywords?: string[]
   status?: Status
+  trigger_mode?: 'any' | 'all' | 'min'
+  trigger_min?: number
+  trigger_keywords?: string[]
   corrected?: number
   project?: string | null
   subcategory?: ProjectSubcategory | null
@@ -200,6 +209,9 @@ const COMMON_COLS = `
   importance INTEGER NOT NULL DEFAULT 1,
   keywords TEXT NOT NULL DEFAULT '[]',
   status TEXT NOT NULL DEFAULT 'active',
+  trigger_mode TEXT NOT NULL DEFAULT 'any',
+  trigger_min INTEGER NOT NULL DEFAULT 1,
+  trigger_keywords TEXT NOT NULL DEFAULT '[]',
   source_session TEXT,
   hit_count INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
@@ -545,6 +557,16 @@ export class MemoryDb {
       if (!cols.has('embedding')) {
         this.db.exec(`ALTER TABLE ${level} ADD COLUMN embedding TEXT`)
       }
+      // 0.40：条目级触发关键词模式（any/all/min）+ 最少命中数。老库补列，存量行 any/1。
+      if (!cols.has('trigger_mode')) {
+        this.db.exec(`ALTER TABLE ${level} ADD COLUMN trigger_mode TEXT NOT NULL DEFAULT 'any'`)
+      }
+      if (!cols.has('trigger_min')) {
+        this.db.exec(`ALTER TABLE ${level} ADD COLUMN trigger_min INTEGER NOT NULL DEFAULT 1`)
+      }
+      if (!cols.has('trigger_keywords')) {
+        this.db.exec(`ALTER TABLE ${level} ADD COLUMN trigger_keywords TEXT NOT NULL DEFAULT '[]'`)
+      }
       // 旧 UUID（不以 9 位时间前缀开头）→ 按 created_at 重写 id
       const legacy = this.db.prepare(`SELECT id FROM ${level}`).all() as Array<{ id: string }>
       for (const { id } of legacy) {
@@ -627,6 +649,9 @@ export class MemoryDb {
       importance: row.importance ?? 1,
       keywords: row.keywords ?? [],
       status: row.status ?? 'active',
+      trigger_mode: row.trigger_mode ?? 'any',
+      trigger_min: row.trigger_min ?? 1,
+      trigger_keywords: row.trigger_keywords ?? [],
       corrected: row.corrected ?? 0,
       project: row.project ?? null,
       subcategory: row.subcategory ?? null,
@@ -655,12 +680,12 @@ export class MemoryDb {
   private writeInsert(full: MemoryRow): void {
     this.db
       .prepare(
-        `INSERT INTO ${full.level} (id, title, content, importance, keywords, status, source_session, hit_count, created_at, updated_at, last_accessed_at, embedding
+        `INSERT INTO ${full.level} (id, title, content, importance, keywords, status, trigger_mode, trigger_min, trigger_keywords, source_session, hit_count, created_at, updated_at, last_accessed_at, embedding
           ${full.level === 'project' ? ', project, subcategory' : ''}
           ${full.level === 'fact' || full.level === 'lesson' || full.level === 'rules' ? ', project' : ''}
           ${full.level === 'lesson' ? ', corrected' : ''}
           ${full.level === 'topic' ? ', goal, project' : ''}
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
           ${full.level === 'project' ? ', ?, ?' : ''}
           ${full.level === 'fact' || full.level === 'lesson' || full.level === 'rules' ? ', ?' : ''}
           ${full.level === 'lesson' ? ', ?' : ''}
@@ -674,6 +699,9 @@ export class MemoryDb {
         full.importance,
         JSON.stringify(full.keywords),
         full.status,
+        full.trigger_mode ?? 'any',
+        full.trigger_min ?? 1,
+        JSON.stringify(full.trigger_keywords ?? []),
         full.source_session,
         full.hit_count,
         full.created_at,
@@ -725,6 +753,9 @@ export class MemoryDb {
     if (patch.importance !== undefined) push('importance', patch.importance)
     if (patch.keywords !== undefined) push('keywords', JSON.stringify(patch.keywords))
     if (patch.status !== undefined) push('status', patch.status)
+    if (patch.trigger_mode !== undefined) push('trigger_mode', patch.trigger_mode)
+    if (patch.trigger_min !== undefined) push('trigger_min', patch.trigger_min)
+    if (patch.trigger_keywords !== undefined) push('trigger_keywords', JSON.stringify(patch.trigger_keywords))
     if (patch.corrected !== undefined && level === 'lesson') push('corrected', patch.corrected)
     if (patch.project !== undefined && (level === 'project' || level === 'fact' || level === 'lesson' || level === 'rules')) {
       push('project', patch.project)
@@ -1193,6 +1224,16 @@ export class MemoryDb {
       importance: Number(r.importance ?? 1),
       keywords,
       status: String(r.status) as Status,
+      trigger_mode: (String(r.trigger_mode ?? 'any') === 'all' || String(r.trigger_mode ?? 'any') === 'min' ? String(r.trigger_mode) : 'any') as 'any' | 'all' | 'min',
+      trigger_min: Math.max(1, Number(r.trigger_min ?? 1) || 1),
+      trigger_keywords: (() => {
+        try {
+          const parsed = JSON.parse(String(r.trigger_keywords ?? '[]'))
+          return Array.isArray(parsed) ? parsed.map((k) => String(k)) : []
+        } catch {
+          return []
+        }
+      })(),
       corrected: Number(r.corrected ?? 0),
       project: r.project == null ? null : String(r.project),
       subcategory: r.subcategory == null ? null : (String(r.subcategory) as ProjectSubcategory),

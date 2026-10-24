@@ -40,6 +40,14 @@ export const CONFIG_DEFAULTS = {
     autoGitignore: true,
     debugLogs: false,
   },
+  /** 自动注入行为（0.38）：firstTurn=首轮长期记忆快照（含记忆导引/项目清单）；
+   *  hits=每消息关键词命中注入。关掉对应项后只在显式 memory_* 工具调用时读记忆。 */
+  inject: {
+    firstTurn: true,
+    hits: true,
+    strictKeywords: false,
+    requireTriggerKeywords: false,
+  },
   /** 注入/整理预算（0.32）：把「默认自动花 token」限制在可解释的上限里。 */
   budget: {
     snapshotMaxChars: 6000,

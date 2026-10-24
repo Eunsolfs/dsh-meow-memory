@@ -53,6 +53,9 @@ export interface GlobalMemoryEntry {
   keywords: string[]
   importance: number
   status: Status
+  trigger_mode: 'any' | 'all' | 'min'
+  trigger_min: number
+  trigger_keywords: string[]
   /** 作用域展示值：全局标记（当前语言包写法，如「全局」/「global」）。 */
   project: string
   updated_at: number
@@ -80,6 +83,12 @@ export interface SaveGlobalMemoryInput {
   importance?: number
   /** 可选直接指定状态（create/save）；archive/restore 由 action 决定。 */
   status?: string
+  /** 触发关键词模式（0.40）：any/all/min；缺省 any。 */
+  trigger_mode?: string
+  /** min 模式最少命中数（1..30）。 */
+  trigger_min?: number
+  /** 独立触发关键词（0.40）：数组或逗号/顿号分隔；空/省略=不改（create 为空=不自动注入）。 */
+  trigger_keywords?: string | string[]
 }
 
 export interface SaveGlobalMemoryResult {
@@ -192,6 +201,9 @@ function toEntry(row: MemoryRow, level: GlobalEditLevel): GlobalMemoryEntry {
     keywords: Array.isArray(row.keywords) ? row.keywords : [],
     importance: Number(row.importance ?? DEFAULT_IMPORTANCE),
     status: row.status,
+    trigger_mode: row.trigger_mode === 'all' || row.trigger_mode === 'min' ? row.trigger_mode : 'any',
+    trigger_min: Math.max(1, Number(row.trigger_min ?? 1) || 1),
+    trigger_keywords: Array.isArray(row.trigger_keywords) ? row.trigger_keywords : [],
     project: globalMarker(),
     updated_at: Number(row.updated_at ?? 0),
   }
@@ -260,6 +272,8 @@ export function saveGlobalMemory(input: SaveGlobalMemoryInput): SaveGlobalMemory
       if (!keywordsRes.ok) return { ok: false, error: keywordsRes.error }
       const status = input.status === undefined || input.status === null ? 'active' : input.status
       if (!isStatus(status)) return { ok: false, error: 'invalid status' }
+      const triggerMode = input.trigger_mode === 'all' || input.trigger_mode === 'min' || input.trigger_mode === 'any' ? input.trigger_mode : 'any'
+      const triggerMin = Number.isInteger(input.trigger_min) ? Math.max(1, Math.min(30, input.trigger_min as number)) : 1
       const row = db.insert({
         level: level as Level,
         content: contentRes.content,
@@ -268,6 +282,9 @@ export function saveGlobalMemory(input: SaveGlobalMemoryInput): SaveGlobalMemory
         project: globalMarker(), // rules 落全局作用域；soul/user 表无 project 列（忽略）
         source_session: EDIT_SOURCE_SESSION,
         status,
+        trigger_mode: triggerMode,
+        trigger_min: triggerMin,
+        trigger_keywords: normalizeKeywordList(input.trigger_keywords),
       })
       return { ok: true, entry: toEntry(row, level) }
     }
@@ -310,12 +327,21 @@ export function saveGlobalMemory(input: SaveGlobalMemoryInput): SaveGlobalMemory
 
     const contentChanged = normalizedContent !== row.content
     const keywordsChanged = JSON.stringify(keywordsRes.keywords) !== JSON.stringify(row.keywords)
+    const triggerMode = input.trigger_mode === 'all' || input.trigger_mode === 'min' || input.trigger_mode === 'any'
+      ? input.trigger_mode
+      : (row.trigger_mode === 'all' || row.trigger_mode === 'min' ? row.trigger_mode : 'any')
+    const triggerMin = Number.isInteger(input.trigger_min)
+      ? Math.max(1, Math.min(30, input.trigger_min as number))
+      : Math.max(1, Number(row.trigger_min ?? 1) || 1)
     if (
       !db.update(level, row.id, {
         content: normalizedContent,
         keywords: keywordsRes.keywords,
         importance: importanceRes.importance,
         status,
+        trigger_mode: triggerMode,
+        trigger_min: triggerMin,
+        ...(input.trigger_keywords !== undefined ? { trigger_keywords: normalizeKeywordList(input.trigger_keywords) } : {}),
       })
     ) {
       return { ok: false, error: 'memory not found in global store' }
